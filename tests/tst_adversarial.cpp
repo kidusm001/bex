@@ -4560,15 +4560,33 @@ QString factText(const MainWindow& w, const char* id)
     return l ? l->text() : QStringLiteral("<missing fact %1>").arg(QLatin1String(id));
 }
 
-// y of the first and last drawn sparkline columns (series colour 0), or -1.
-std::pair<int, int> sparkEnds(MetricButton* b)
+// y of the first and last drawn sparkline columns, or -1. The sparkline is
+// found by its colour: by default series colour 0 (blue); pass the colour of
+// the page chart's series when the entry uses that chart's colour.
+std::pair<int, int> sparkEnds(MetricButton* b, std::optional<QColor> colour = std::nullopt)
 {
     QImage img(b->size(), QImage::Format_RGB32);
     img.fill(Qt::white);
     b->render(&img);
+    auto isSpark = [&](QRgb px) {
+        if (!colour)
+            return seriesPixel(px);
+        // At least half-way from white towards the colour, and near that blend.
+        const QColor c = *colour;
+        const double d[3] = {c.red() - 255.0, c.green() - 255.0, c.blue() - 255.0};
+        const double q[3] = {qRed(px) - 255.0, qGreen(px) - 255.0, qBlue(px) - 255.0};
+        const double dd = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        if (!(dd > 0))
+            return false;
+        const double a = (q[0] * d[0] + q[1] * d[1] + q[2] * d[2]) / dd;
+        double r2 = 0;
+        for (int k = 0; k < 3; ++k)
+            r2 += (q[k] - a * d[k]) * (q[k] - a * d[k]);
+        return a >= 0.45 && std::sqrt(r2) <= 40;
+    };
     auto columnTop = [&](int x) {
         for (int y = 0; y < img.height(); ++y)
-            if (seriesPixel(img.pixel(x, y)))
+            if (isSpark(img.pixel(x, y)))
                 return y;
         return -1;
     };
@@ -4927,8 +4945,15 @@ void TestAdversarial::mainWindowTemperatureNavSingleSource()
     QVERIFY2(nav->detailText().contains(QStringLiteral("nvme Composite")), qPrintable(what));
     QVERIFY2(nav->toolTip().contains(QStringLiteral("70")) && nav->toolTip().contains(QStringLiteral("nvme Composite")),
              qPrintable(nav->toolTip()));
-    const auto [first, last] = sparkEnds(nav);
-    QVERIFY2(first >= 0 && last >= 0, "temperature nav sparkline not drawn");
+    // The entry draws its trend in the stable temperature category colour
+    // (the colour the temperature chart gives its first plotted sensor), not
+    // series colour 0. Only the colour oracle changed: the trend must still
+    // follow the sensor the entry names.
+    const QColor sparkColour = seriesColor(chart->series().front().visual, nav->palette());
+    const auto [first, last] = sparkEnds(nav, sparkColour);
+    QVERIFY2(first >= 0 && last >= 0, qPrintable(QStringLiteral("temperature nav sparkline not drawn in the chart's "
+                                                                "colour %1")
+                                                     .arg(sparkColour.name())));
     QVERIFY2(last < first, qPrintable(QStringLiteral("nav trend does not follow the NVMe sensor it names: first y=%1 "
                                                      "last y=%2 (rising expected)")
                                           .arg(first)
@@ -5065,6 +5090,10 @@ void TestAdversarial::mainWindowFactGridsVisibleAboveCharts()
     }
     QTemporaryDir d;
     MainWindow w(uiOptions(d));
+    // The full fact rows belong to the Details view (the default glance view
+    // hides them on purpose); they must be fully on screen once it is on.
+    w.setDetailsVisible(true);
+    QVERIFY(w.detailsVisible());
     w.resize(width, height);
     w.show();
     QVERIFY(QTest::qWaitForWindowExposed(&w));

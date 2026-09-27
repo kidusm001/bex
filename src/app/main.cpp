@@ -6,22 +6,32 @@
 #include "app/appicon.h"
 #include "app/cli.h"
 #include "app/mainwindow.h"
+#include "app/metricbutton.h"
+#include "app/timechart.h"
 
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QDir>
+#include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
+#include <QIcon>
 #include <QMessageBox>
+#include <QPaintEvent>
 #include <QPixmap>
 #include <QSocketNotifier>
+#include <QStyle>
 #include <QTimer>
+#include <QWindow>
 
+#include <algorithm>
 #include <cerrno>
 #include <optional>
 #include <csignal>
 #include <cstdio>
 #include <fcntl.h>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 
@@ -56,16 +66,180 @@ void installSignalHandlers(QWidget* window)
     ::sigaction(SIGTERM, &sa, nullptr);
 }
 
+// Qt platform theme plugins mapped into this process, as evidence of which
+// one Qt really loaded.
+QStringList loadedThemePlugins()
+{
+    QStringList plugins;
+    QFile maps(QStringLiteral("/proc/self/maps"));
+    if (!maps.open(QIODevice::ReadOnly | QIODevice::Text))
+        return plugins;
+    const QStringList lines = QString::fromLocal8Bit(maps.readAll()).split(QLatin1Char('\n'));
+    for (const QString& line : lines) {
+        const qsizetype slash = line.indexOf(QLatin1Char('/'));
+        if (slash < 0)
+            continue;
+        const QString path = line.mid(slash);
+        if ((path.contains(QStringLiteral("/platformthemes/")) || path.contains(QStringLiteral("/styles/")))
+            && !plugins.contains(path))
+            plugins << path;
+    }
+    return plugins;
+}
+
+void printThemeInfo(const QString& note, const QString& styleName)
+{
+    const QPalette pal = QApplication::palette();
+    const QFont font = QApplication::font();
+    std::printf("platform: %s\n", qPrintable(QGuiApplication::platformName()));
+    std::printf("theme: %s\n", qPrintable(note));
+    std::printf("style: %s\n", qPrintable(styleName));
+    std::printf("font: %s\n", qPrintable(font.toString()));
+    std::printf("icon theme: %s\n", qPrintable(QIcon::themeName()));
+    std::printf("style sheet: %lld characters\n", static_cast<long long>(qApp->styleSheet().size()));
+    std::printf("palette: window %s, window text %s, base %s, text %s, button %s, highlight %s\n",
+                qPrintable(pal.color(QPalette::Window).name()), qPrintable(pal.color(QPalette::WindowText).name()),
+                qPrintable(pal.color(QPalette::Base).name()), qPrintable(pal.color(QPalette::Text).name()),
+                qPrintable(pal.color(QPalette::Button).name()), qPrintable(pal.color(QPalette::Highlight).name()));
+    for (const QString& plugin : loadedThemePlugins())
+        std::printf("loaded plugin: %s\n", qPrintable(plugin));
+}
+
+// --frame-stats: once a second, print how many frames the window really
+// painted (update requests handled), what each cost on the GUI thread, and
+// how often the charts and navigation entries painted and at what cost.
+// Frames are counted, never inferred from the animation timer's interval.
+class FrameStats : public QObject {
+public:
+    explicit FrameStats(QWidget* window)
+        : QObject(window)
+        , m_window(window)
+    {
+        m_window->installEventFilter(this);
+        if (auto* driver = m_window->findChild<QTimer*>(QStringLiteral("frameTimer")))
+            connect(driver, &QTimer::timeout, this, [this] {
+                ++m_ticks;
+                if (m_tick.isValid())
+                    m_maxTickGap = std::max(m_maxTickGap, m_tick.nsecsElapsed() / 1e6);
+                m_tick.start();
+            });
+        auto* timer = new QTimer(this);
+        connect(timer, &QTimer::timeout, this, &FrameStats::report);
+        timer->start(1000);
+        m_elapsed.start();
+    }
+
+protected:
+    bool eventFilter(QObject* object, QEvent* event) override
+    {
+        if (event->type() == QEvent::UpdateRequest && !m_inFrame) {
+            // Deliver it here to time the whole paint and flush.
+            m_inFrame = true;
+            QElapsedTimer t;
+            t.start();
+            QCoreApplication::sendEvent(object, event);
+            m_costs.push_back(t.nsecsElapsed() / 1e6);
+            m_inFrame = false;
+            return true;
+        }
+        if (event->type() == QEvent::Paint && !m_inPaint) {
+            // Chart and navigation entry paints are timed the same way.
+            const bool chart = qobject_cast<TimeChart*>(object) != nullptr;
+            if (!chart && !qobject_cast<MetricButton*>(object))
+                return false;
+            m_inPaint = true;
+            QElapsedTimer t;
+            t.start();
+            QCoreApplication::sendEvent(object, event);
+            const double ms = t.nsecsElapsed() / 1e6;
+            m_inPaint = false;
+            ++(chart ? m_chartPaints : m_navPaints);
+            if (chart)
+                for (const QRect& r : static_cast<QPaintEvent*>(event)->region())
+                    m_chartArea += double(r.width()) * r.height();
+            (chart ? m_chartMs : m_navMs) += ms;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    void report()
+    {
+        // Charts (per-core ones come and go) and the native window appear
+        // after start-up; installing a filter twice keeps one copy.
+        for (auto* chart : m_window->findChildren<TimeChart*>())
+            chart->installEventFilter(this);
+        for (auto* button : m_window->findChildren<MetricButton*>())
+            button->installEventFilter(this);
+        if (QWindow* handle = m_window->windowHandle())
+            handle->installEventFilter(this);
+        const double secs = m_elapsed.nsecsElapsed() / 1e9;
+        m_elapsed.restart();
+        std::sort(m_costs.begin(), m_costs.end());
+        auto at = [&](double q) { return m_costs.empty() ? 0.0 : m_costs[std::size_t(q * (m_costs.size() - 1))]; };
+        std::fprintf(stderr,
+                     "pulsescope: frames %.1f/s, frame cost median %.2f ms, p95 %.2f ms, max %.2f ms; chart paints "
+                     "%.1f/s (%.1f ms/s, %.0f kpx each); navigation paints %.1f/s (%.1f ms/s); animation ticks %.1f/s, longest gap "
+                     "%.1f ms\n",
+                     m_costs.size() / secs, at(0.5), at(0.95), m_costs.empty() ? 0.0 : m_costs.back(),
+                     m_chartPaints / secs, m_chartMs / secs,
+                     m_chartPaints ? m_chartArea / m_chartPaints / 1000 : 0.0, m_navPaints / secs, m_navMs / secs, m_ticks / secs,
+                     m_maxTickGap);
+        m_maxTickGap = 0;
+        m_costs.clear();
+        m_chartPaints = 0;
+        m_navPaints = 0;
+        m_chartMs = 0;
+        m_chartArea = 0;
+        m_navMs = 0;
+        m_ticks = 0;
+    }
+
+    QWidget* m_window;
+    QElapsedTimer m_elapsed;
+    std::vector<double> m_costs;
+    int m_chartPaints = 0;
+    int m_navPaints = 0;
+    double m_chartMs = 0;
+    double m_chartArea = 0;
+    double m_navMs = 0;
+    bool m_inPaint = false;
+    int m_ticks = 0;
+    QElapsedTimer m_tick;
+    double m_maxTickGap = 0;
+    bool m_inFrame = false;
+};
+
 } // namespace
 
 int main(int argc, char* argv[])
 {
-    QApplication app(argc, argv);
+    // Decide the platform theme before QApplication reads the command line.
+    // Requesting qt6ct affects this process only (see cli::chooseTheme).
+    const cli::ThemeDecision theme = cli::chooseTheme(cli::probeThemeEnvironment(argc, argv));
+    static char themeFlag[] = "-platformtheme";
+    static char themeName[] = "qt6ct";
+    std::vector<char*> args(argv, argv + argc);
+    if (theme.requestQt6ct) {
+        args.insert(args.begin() + 1, themeName);
+        args.insert(args.begin() + 1, themeFlag);
+    }
+    int appArgc = static_cast<int>(args.size());
+    args.push_back(nullptr);
+    QApplication app(appArgc, args.data());
+    if (theme.pluginMissing)
+        std::fprintf(stderr, "pulsescope: %s\n", qPrintable(theme.note));
     QApplication::setApplicationName(QStringLiteral("PulseScope"));
     QApplication::setOrganizationName(QStringLiteral("PulseScope"));
     QApplication::setApplicationVersion(QStringLiteral(PULSESCOPE_VERSION));
     QApplication::setDesktopFileName(QStringLiteral(PULSESCOPE_APP_ID));
     QApplication::setWindowIcon(pulseScopeIcon());
+    // The style Qt chose; a style sheet applied later (qt6ct applies its own)
+    // wraps it in an unnamed QStyleSheetStyle.
+    const QStyle* startStyle = QApplication::style();
+    const QString styleName =
+        QStringLiteral("%1 (%2)").arg(startStyle->name(), QString::fromLatin1(startStyle->metaObject()->className()));
 
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("Native Linux performance monitor"));
@@ -97,12 +271,29 @@ int main(int argc, char* argv[])
     parser.addOption(screenshotOpt);
     parser.addOption(delayOpt);
     parser.addOption(quitOpt);
+    const QCommandLineOption themeInfoOpt(QStringLiteral("theme-info"),
+                                          QStringLiteral("Print the Qt platform theme, style, font and palette in use, "
+                                                         "then exit."));
+    const QCommandLineOption frameStatsOpt(QStringLiteral("frame-stats"),
+                                           QStringLiteral("Print painted frames per second and their cost once a "
+                                                          "second (for testing)."));
     parser.addOption(sizeOpt);
+    parser.addOption(themeInfoOpt);
+    parser.addOption(frameStatsOpt);
     parser.process(app);
+    if (parser.isSet(themeInfoOpt)) {
+        // Platform themes such as qt6ct apply fonts, palette and style sheets
+        // from a queued call: report what the running app gets.
+        QCoreApplication::processEvents();
+        printThemeInfo(theme.note, styleName);
+        return 0;
+    }
 
     // Validate every option before anything starts; bad values are errors,
     // never silently replaced by a default.
     MainWindowOptions options;
+    options.themeNote = theme.note;
+    options.styleName = styleName;
     if (parser.isSet(intervalOpt)) {
         const auto ms = cli::parseIntervalMs(parser.value(intervalOpt));
         if (!ms) {
@@ -164,6 +355,8 @@ int main(int argc, char* argv[])
     if (size)
         window.resize(*size);
     installSignalHandlers(&window);
+    if (parser.isSet(frameStatsOpt))
+        new FrameStats(&window);
     window.show();
 
     if (parser.isSet(screenshotOpt)) {

@@ -8,8 +8,11 @@
 #include "core/snapshot.h"
 
 #include <QMainWindow>
+#include <QPointer>
 #include <QStringList>
+#include <array>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -24,8 +27,11 @@ class QSettings;
 class QStackedWidget;
 class QTableView;
 class QTimer;
+class QSplitter;
 class QTreeWidget;
+class QWindow;
 class CoreGrid;
+class HeadRow;
 class MetricButton;
 class ProcessFilterModel;
 class ProcessModel;
@@ -43,6 +49,10 @@ struct MainWindowOptions {
     // collector runs; with neither, injected snapshots count as current and
     // charts end at the newest sample (tests).
     std::function<double()> clock;
+    // How the Qt platform theme was chosen at startup (shown in About).
+    QString themeNote;
+    // The Qt style chosen at startup, for About: a style sheet wraps it later.
+    QString styleName;
 };
 
 class MainWindow : public QMainWindow {
@@ -64,6 +74,21 @@ public:
     int intervalMs() const { return m_intervalMs; }
     void setWindowSeconds(int seconds);
     int windowSeconds() const { return m_windowSeconds; }
+    // Details off (the default) shows each page at a glance: the main value,
+    // the main chart and the controls needed to choose what it shows. On, it
+    // adds the full facts, secondary series and charts, tables and notes.
+    // Only visibility and chart series change; nothing is collected
+    // differently. Saved as the "details" setting.
+    void setDetailsVisible(bool on);
+    bool detailsVisible() const { return m_details; }
+    // Smooth graphs (default on): between samples the visible charts scroll
+    // with the clock at up to 60 frames per second; off, they move once per
+    // sample. Saved as the "smoothGraphs" setting.
+    void setSmoothGraphs(bool on);
+    bool smoothGraphs() const { return m_smooth; }
+    // Whether the frame clock is running right now (smooth graphs on, live,
+    // and the window shown, exposed and not minimized).
+    bool isAnimating() const;
     // Starts saving a copy of the retained history as CSV on the export
     // worker. Returns false (with a reason) if nothing can be exported yet
     // or an export is already running; csvExportFinished() reports the end.
@@ -90,6 +115,9 @@ Q_SIGNALS:
 
 protected:
     void closeEvent(QCloseEvent* event) override;
+    bool event(QEvent* event) override;
+    bool eventFilter(QObject* watched, QEvent* event) override;
+    void changeEvent(QEvent* event) override;
 
 private:
     void buildActions();
@@ -125,10 +153,20 @@ private:
     void applyDiskSelection();
     void applyNetSelection();
     void applySensorSelection();
+    int sensorSlot(const QString& sensor);
     void exportCsvInteractive();
     void onCsvExportFinished(bool ok, const QString& path, const QString& error, qulonglong samples);
     void updateProcessCount();
     void showAbout();
+    void updateHeadlines();
+    void applyDetails();
+    void applyCpuSeries();
+    void applyMemorySeries();
+    void applyScaledFonts();
+    void updateFrameDriver();
+    void advanceFrame();
+    HeadRow* buildHeadline(Page page, const QString& prefix, QWidget* parent);
+    QWidget* detailOnly(QWidget* widget);
 
     QString selectedDisk() const;
     QString selectedNet() const;
@@ -158,16 +196,24 @@ private:
     QString m_wantedNet;
     QStringList m_wantedSensors;
     bool m_sensorsChosen = false;
+    // Colour and line style slot of each sensor that was plotted or shown in
+    // the navigation, by sensor key, kept while the sensor is listed: a
+    // sensor keeps its look when others are checked or unchecked.
+    std::map<QString, int> m_sensorSlots;
+    QString m_navSensor;
 
     QAction* m_pauseAction = nullptr;
     QAction* m_exportAction = nullptr;
     QAction* m_quitAction = nullptr;
     QAction* m_aboutAction = nullptr;
+    QAction* m_detailsAction = nullptr;
+    QAction* m_smoothAction = nullptr;
     std::vector<QAction*> m_pageActions;
     QComboBox* m_intervalCombo = nullptr;
     QComboBox* m_rangeCombo = nullptr;
 
     std::vector<MetricButton*> m_nav;
+    QWidget* m_navPanel = nullptr;
     QStackedWidget* m_stack = nullptr;
     QLabel* m_statusLabel = nullptr;
     QLabel* m_timingLabel = nullptr;
@@ -195,4 +241,17 @@ private:
     // Fact labels by page, keyed by a stable id.
     std::vector<std::pair<std::string, QLabel*>> m_facts;
     QLabel* fact(const std::string& id) const;
+
+    // Glance view and animation.
+    bool m_details = false;
+    int m_appliedDetails = -1; // state last applied: -1 none, 0 glance, 1 details
+    bool m_smooth = true;
+    QTimer* m_frameTimer = nullptr;
+    QPointer<QWindow> m_watchedWindow;
+    std::vector<QWidget*> m_detailWidgets; // shown only with Details
+    std::vector<QWidget*> m_simpleWidgets; // shown only without Details
+    std::array<HeadRow*, PageCount> m_head {};
+    QSplitter* m_tempSplit = nullptr;
+    QList<int> m_tempSplitSizes;
+    bool m_shutdown = false;
 };

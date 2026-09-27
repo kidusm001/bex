@@ -3,10 +3,11 @@
 #include "app/timechart.h"
 
 #include <QEvent>
+#include <QPaintEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QStyle>
-#include <QStyleOptionFocusRect>
+#include <QStyleOptionViewItem>
 
 #include <algorithm>
 #include <cmath>
@@ -104,9 +105,44 @@ void MetricButton::setSparklineMax(double maxValue)
     update();
 }
 
+void MetricButton::setSparklineVisuals(std::vector<std::pair<int, Qt::PenStyle>> visuals)
+{
+    if (visuals == m_visuals)
+        return;
+    m_visuals = std::move(visuals);
+    update();
+}
+
 void MetricButton::setViewEnd(double time)
 {
     m_viewEnd = std::isfinite(time) ? time : ps::kNaN;
+}
+
+QRect MetricButton::sparkUpdateRect() const
+{
+    return m_sparkRect.adjusted(-2, -2, 2, 2).toAlignedRect().intersected(rect());
+}
+
+void MetricButton::advanceView(double time)
+{
+    if (!std::isfinite(time))
+        return;
+    m_viewEnd = time;
+    if (!isVisible() || !m_history || m_keys.empty() || m_history->empty())
+        return;
+    if (!(m_sparkRect.width() > 0) || !std::isfinite(m_paintedEnd)) {
+        update();
+        return;
+    }
+    const double tEnd = std::max(m_viewEnd, m_history->latestTime());
+    if (m_history->lowerBound(tEnd - m_seconds) != m_paintedFirst) {
+        update(sparkUpdateRect());
+        return;
+    }
+    // A fifth of a device pixel is the smallest step worth a frame.
+    const double moved = std::fabs(tEnd - m_paintedEnd) / m_seconds * m_sparkRect.width() * devicePixelRatioF();
+    if (moved >= 0.2)
+        update(sparkUpdateRect());
 }
 
 void MetricButton::setStale(bool stale)
@@ -151,42 +187,56 @@ QSize MetricButton::minimumSizeHint() const
 
 void MetricButton::changeEvent(QEvent* event)
 {
-    if (event->type() == QEvent::PaletteChange || event->type() == QEvent::FontChange)
+    if (event->type() == QEvent::PaletteChange || event->type() == QEvent::FontChange ||
+        event->type() == QEvent::StyleChange) {
         updateGeometry();
+        update();
+    }
     QAbstractButton::changeEvent(event);
 }
 
-void MetricButton::paintEvent(QPaintEvent*)
+void MetricButton::paintEvent(QPaintEvent* event)
 {
     QPainter p(this);
-    p.setRenderHint(QPainter::Antialiasing, true);
+    // Frames between samples repaint only the sparkline; text elsewhere is
+    // skipped when it is not in the repainted area.
+    const QRect dirty = event->rect();
+    ++m_paintCount;
     const QPalette pal = palette();
-    const QColor text = pal.color(QPalette::WindowText);
-    QColor muted = pal.color(QPalette::PlaceholderText);
-    if (!muted.isValid() || muted == text)
-        muted = pal.color(QPalette::Disabled, QPalette::WindowText);
-    const QColor highlight = pal.color(QPalette::Highlight);
-    const QRectF r = QRectF(rect()).adjusted(1.5, 1.5, -1.5, -1.5);
+    const bool selected = isChecked();
 
-    // Selection is a tinted fill plus a full outline, hover a lighter tint.
-    if (isChecked() || isDown() || underMouse()) {
-        QColor fill = highlight;
-        fill.setAlphaF(isChecked() ? 0.16f : 0.07f);
-        p.setPen(Qt::NoPen);
-        p.setBrush(fill);
-        p.drawRoundedRect(r, 5, 5);
+    // Selection and hover are drawn by the style as a selected list item, so
+    // the entry follows the desktop's Qt theme like the rest of the window.
+    QStyleOptionViewItem opt;
+    opt.initFrom(this);
+    opt.rect = rect();
+    opt.showDecorationSelected = true;
+    opt.viewItemPosition = QStyleOptionViewItem::OnlyOne;
+    opt.features = QStyleOptionViewItem::HasDisplay;
+    opt.state &= ~QStyle::State_HasFocus; // the focus ring below is stronger
+    if (selected || isDown())
+        opt.state |= QStyle::State_Selected;
+    if (underMouse())
+        opt.state |= QStyle::State_MouseOver;
+    if (isActiveWindow())
+        opt.state |= QStyle::State_Active;
+    style()->drawPrimitive(QStyle::PE_PanelItemViewItem, &opt, &p, this);
+
+    const QPalette::ColorGroup group = !isEnabled() ? QPalette::Disabled
+                                                    : (isActiveWindow() ? QPalette::Active : QPalette::Inactive);
+    const QColor text = selected ? pal.color(group, QPalette::HighlightedText) : pal.color(QPalette::WindowText);
+    QColor muted = pal.color(QPalette::PlaceholderText);
+    if (selected) {
+        muted = text;
+        muted.setAlphaF(0.78f);
+    } else if (!muted.isValid() || muted == text) {
+        muted = pal.color(QPalette::Disabled, QPalette::WindowText);
     }
-    if (isChecked()) {
-        QColor edge = highlight;
-        edge.setAlphaF(0.55f);
-        p.setPen(QPen(edge, 1));
+    if (hasFocus() && !QRectF(rect()).adjusted(4, 4, -4, -4).contains(dirty)) {
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setPen(QPen(selected ? text : pal.color(QPalette::Highlight), 2));
         p.setBrush(Qt::NoBrush);
-        p.drawRoundedRect(r, 5, 5);
-    }
-    if (hasFocus()) {
-        p.setPen(QPen(highlight, 2));
-        p.setBrush(Qt::NoBrush);
-        p.drawRoundedRect(QRectF(rect()).adjusted(1, 1, -1, -1), 6, 6);
+        p.drawRoundedRect(QRectF(rect()).adjusted(2, 2, -2, -2), 4, 4);
     }
 
     const QFont base = font();
@@ -215,24 +265,35 @@ void MetricButton::paintEvent(QPaintEvent*)
     const QFontMetrics valueFm(valueDrawFont);
     const int valueW = sparkBesideValue && hasSpark ? besideW : textW;
 
-    p.setPen(text);
-    p.setFont(base);
-    p.drawText(QRect(x, y, textW - kSparkW - 6, fm.height()), Qt::AlignLeft | Qt::AlignVCenter,
-               fm.elidedText(this->text(), Qt::ElideRight, textW - kSparkW - 6));
+    const QRect titleRect(x, y, textW - kSparkW - 6, fm.height());
+    if (dirty.intersects(titleRect)) {
+        p.setPen(text);
+        p.setFont(base);
+        p.drawText(titleRect, Qt::AlignLeft | Qt::AlignVCenter,
+                   fm.elidedText(this->text(), Qt::ElideRight, titleRect.width()));
+    }
     y += fm.height();
 
-    p.setFont(valueDrawFont);
-    p.setPen(m_stale ? muted : text);
-    p.drawText(QRect(x, y, valueW, vfm.height()), Qt::AlignLeft | Qt::AlignVCenter,
-               valueFm.elidedText(m_value, Qt::ElideRight, valueW));
+    const QRect valueRect(x, y, valueW, vfm.height());
+    if (dirty.intersects(valueRect)) {
+        p.setFont(valueDrawFont);
+        p.setPen(m_stale ? muted : text);
+        p.drawText(valueRect, Qt::AlignLeft | Qt::AlignVCenter, valueFm.elidedText(m_value, Qt::ElideRight, valueW));
+    }
     y += vfm.height() + 2;
 
-    p.setFont(sf);
-    p.setPen(muted);
-    p.drawText(QRect(x, y, textW, sfm.height()), Qt::AlignLeft | Qt::AlignVCenter,
-               sfm.elidedText(m_stale ? QStringLiteral("No recent samples") : m_detail, Qt::ElideRight, textW));
+    const QRect detailRect(x, y, textW, sfm.height());
+    if (dirty.intersects(detailRect)) {
+        p.setFont(sf);
+        p.setPen(muted);
+        p.drawText(detailRect, Qt::AlignLeft | Qt::AlignVCenter,
+                   sfm.elidedText(m_stale ? QStringLiteral("No recent samples") : m_detail, Qt::ElideRight, textW));
+    }
 
     // Sparkline in the right-hand corner of the title (and value) rows.
+    m_sparkRect = QRectF(width() - kPadX - kSparkW, kPadY + 2, kSparkW,
+                         sparkBesideValue ? fm.height() + vfm.height() - 6 : fm.height() - 3);
+    m_paintedEnd = ps::kNaN;
     if (!hasSpark || m_history->empty())
         return;
     std::vector<const ps::History::Series*> series;
@@ -243,8 +304,12 @@ void MetricButton::paintEvent(QPaintEvent*)
     const double tStart = tEnd - m_seconds;
     const std::size_t first = m_history->lowerBound(tStart);
     const std::size_t n = m_history->size();
+    m_paintedEnd = tEnd;
+    m_paintedFirst = first;
     if (first >= n)
         return;
+    // The sample before the window enters it along its measured segment.
+    const std::size_t from = first > 0 ? first - 1 : first;
     // Non-negative units (percent, bytes, rates) keep a zero baseline.
     // Temperatures can be negative, so they use the visible signed range.
     bool signedUnit = false;
@@ -280,37 +345,79 @@ void MetricButton::paintEvent(QPaintEvent*)
             hi = vmax > 0 ? vmax * 1.1 : 1;
         }
     }
-    const QRectF spark(width() - kPadX - kSparkW, kPadY + 2, kSparkW,
-                       sparkBesideValue ? fm.height() + vfm.height() - 6 : fm.height() - 3);
+    const QRectF spark = m_sparkRect;
+    // Points keep their measured geometry: a value off the scale (such as the
+    // off-window predecessor, which the scale does not include) is clipped
+    // where its segment crosses the sparkline's edge, never pulled onto the
+    // edge, which would bend the segment. Screen y is only bounded far
+    // outside to keep extreme values finite.
+    const double yLimit = 1e7 * std::max(1.0, spark.height());
+    auto yOf = [&](double v) {
+        // Halved operands keep the fraction finite for any finite bounds.
+        const double py = spark.bottom() - (v * 0.5 - lo * 0.5) / (hi * 0.5 - lo * 0.5) * spark.height();
+        return std::clamp(py, spark.top() - yLimit, spark.bottom() + yLimit);
+    };
     QColor baseline = muted;
     baseline.setAlphaF(0.35f);
+    p.setRenderHint(QPainter::Antialiasing, false);
     p.setPen(QPen(baseline, 1));
     p.drawLine(spark.bottomLeft(), spark.bottomRight());
+    p.setClipRect(spark.adjusted(0, -2, 0, 1));
+    const bool dark = isDarkPalette(pal);
     for (std::size_t si = 0; si < series.size(); ++si) {
         const auto* s = series[si];
         if (!s)
             continue;
-        QPainterPath path;
-        bool drawing = false;
-        for (std::size_t i = first; i < n; ++i) {
+        const auto [visual, style] = si < m_visuals.size()
+            ? m_visuals[si]
+            : std::pair {static_cast<int>(si), seriesStyle(static_cast<int>(si))};
+        // On the selection the line takes the selected text colour so it
+        // stays legible on any theme's highlight.
+        const QColor line = m_stale ? muted : (selected ? text : seriesColor(visual, pal));
+        // Runs of consecutive valid samples; areas under them first. Dashes
+        // restart at fixed times (anchors) so they move with the data.
+        const double quantum = m_seconds / 8;
+        std::vector<std::pair<QPolygonF, std::vector<char>>> runs;
+        std::pair<QPolygonF, std::vector<char>> run;
+        auto endRun = [&] {
+            if (!run.first.isEmpty())
+                runs.push_back(std::move(run));
+            run = {};
+        };
+        for (std::size_t i = from; i < n; ++i) {
             const double v = m_history->value(*s, i);
-            if (!ps::isValid(v) || !m_history->continuous(i))
-                drawing = false;
+            if (!ps::isValid(v) || (i > from && !m_history->continuous(i)))
+                endRun();
             if (!ps::isValid(v))
                 continue;
-            const double px = spark.left() + (m_history->time(i) - tStart) / m_seconds * spark.width();
-            const double py = spark.bottom() - std::clamp((v - lo) / (hi - lo), 0.0, 1.0) * spark.height();
-            if (drawing)
-                path.lineTo(px, py);
-            else
-                path.moveTo(px, py);
-            drawing = true;
+            const double t = m_history->time(i);
+            const double px = spark.left() + (t - tStart) / m_seconds * spark.width();
+            run.first.append(QPointF(px, yOf(v)));
+            run.second.push_back(i > 0 && std::floor(t / quantum) != std::floor(m_history->time(i - 1) / quantum));
         }
-        const QColor line = m_stale ? muted : seriesColor(static_cast<int>(si), pal);
-        QPen pen(line, 1.5);
-        pen.setStyle(seriesStyle(static_cast<int>(si)));
-        p.setPen(pen);
-        p.setBrush(Qt::NoBrush);
-        p.drawPath(path);
+        endRun();
+        if (!m_stale && si == 0) {
+            QColor area = line;
+            area.setAlphaF(selected ? 0.22f : (dark ? 0.24f : 0.16f));
+            // Aliased: the line covers its top edge.
+            p.setRenderHint(QPainter::Antialiasing, false);
+            p.setPen(Qt::NoPen);
+            p.setBrush(area);
+            for (const auto& [r, anchors] : runs) {
+                if (r.size() < 2)
+                    continue;
+                QPolygonF poly = r;
+                poly.append(QPointF(r.back().x(), spark.bottom()));
+                poly.append(QPointF(r.front().x(), spark.bottom()));
+                // The area is clipped exactly like its line: above the scale
+                // it fills the whole height, below it nothing.
+                poly = clipPolygon(poly, spark);
+                if (poly.size() >= 3)
+                    p.drawPolygon(poly);
+            }
+        }
+        const QRectF lineClip = spark.adjusted(-2, -3, 2, 2);
+        for (const auto& [r, anchors] : runs)
+            strokeTrace(p, r, anchors, line, 1.5, style, lineClip);
     }
 }

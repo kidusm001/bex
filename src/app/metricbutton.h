@@ -6,6 +6,7 @@
 
 #include <QAbstractButton>
 #include <string>
+#include <utility>
 #include <vector>
 
 class MetricButton : public QAbstractButton {
@@ -23,13 +24,24 @@ public:
     void setValueTemplate(const QString& widest);
     QString valueText() const { return m_value; }
     QString detailText() const { return m_detail; }
-    // Sparkline sources (up to two series, drawn in the chart colours 0 and 1);
-    // no keys hides the sparkline. maxValue <= 0 scales to the visible data.
+    // Sparkline sources (up to two series, drawn by default in the chart
+    // colours and pen styles 0 and 1); no keys hides the sparkline.
+    // maxValue <= 0 scales to the visible data.
     void setSparkline(const ps::History* history, std::vector<std::string> keys, double maxValue = 0,
                       double seconds = 60);
     void setSparklineMax(double maxValue);
+    // Colour index (seriesColor) and pen style per sparkline series, so the
+    // entry uses the same colours as its page's chart.
+    void setSparklineVisuals(std::vector<std::pair<int, Qt::PenStyle>> visuals);
     // Right edge of the sparkline ("now"), as TimeChart::setViewEnd().
     void setViewEnd(double time);
+    // Frame-driven scrolling, as TimeChart::advanceView(): repaints only the
+    // sparkline, and only when it moved by a visible amount.
+    void advanceView(double time);
+    int paintCount() const { return m_paintCount; }
+    // Sparkline rectangle of the last paint, for tests.
+    QRectF sparklineArea() const { return m_sparkRect; }
+    std::vector<std::pair<int, Qt::PenStyle>> sparklineVisuals() const { return m_visuals; }
     void setStale(bool stale);
 
     QSize sizeHint() const override;
@@ -41,6 +53,7 @@ protected:
 
 private:
     void updateAccessibleText();
+    QRect sparkUpdateRect() const;
 
     QString m_value;
     QString m_accessibleValue;
@@ -52,4 +65,10 @@ private:
     double m_seconds = 60;
     double m_viewEnd = ps::kNaN;
     bool m_stale = false;
+    std::vector<std::pair<int, Qt::PenStyle>> m_visuals;
+    // What the last paint showed.
+    mutable QRectF m_sparkRect;
+    double m_paintedEnd = ps::kNaN;
+    std::size_t m_paintedFirst = 0;
+    int m_paintCount = 0;
 };

@@ -14,6 +14,10 @@ graphs and current values for:
 - **Processes**: a filterable, sortable, read-only table of PID, name, user,
   CPU, resident memory, threads, state, nice, disk I/O, age and command line.
 
+Each page opens in a Simple view that reads at a glance: the main value, one
+filled graph and a short summary. **Details** (Ctrl+D) adds every other
+reading. Graphs scroll smoothly between samples.
+
 It reads `/proc` and `/sys` directly. It needs no root, no daemon, no helper
 processes, no network access and no dependencies beyond Qt.
 
@@ -72,7 +76,8 @@ The test suites:
 | `tst_adversarial` | Parsers, delta math, history, the sampler over synthetic `/proc` and `/sys` trees, the collector thread, chart and widget rendering |
 | `tst_core` | Identity, escaping and overflow guarantees |
 | `tst_live` | Read-only invariants against this host's real `/proc` and `/sys`. It never assumes the host has any particular sensor, disk or interface. |
-| `tst_ui` | The main window, process model and CSV export, run offscreen with isolated settings |
+| `tst_ui` | The main window, Simple and Details views, process model, CSV export, frame driver, cached graph drawing and theme selection, run offscreen with isolated settings |
+| `tst_graph_upgrade` | Smooth scrolling between samples, area fills, gaps and signed temperatures in the drawn pixels, and that animation never changes measurements |
 | `desktop_entry` | Escaping of the installed desktop entry's `Exec` line |
 
 - CTest runs the Qt tests with `QT_QPA_PLATFORM=offscreen`, so they need no
@@ -123,7 +128,8 @@ Controls, left to right:
 - **Navigation list**: pick a page. Each entry shows the current value and a
   small sparkline.
 - **Toolbar**: pause/resume, the sampling interval (0.5, 1, 2 or 5 s), the
-  graph window (1, 5 or 15 minutes) and CSV export.
+  graph window (1, 5 or 15 minutes), **Details** and CSV export.
+- **View menu**: **Details** and **Smooth Graphs**.
 
 The status bar shows the last sample time, the collector's own cost per
 sample, and any problem reading a source.
@@ -134,6 +140,7 @@ Keyboard shortcuts:
 | --- | --- |
 | Ctrl+1 … Ctrl+6 | CPU, Memory, Disks, Network, Temperatures, Processes |
 | P or Pause | Pause or resume |
+| Ctrl+D | Show or hide details |
 | Ctrl+E | Export history to CSV |
 | Ctrl+F | Filter processes (switches to the Processes page) |
 | Ctrl+Q | Quit |
@@ -144,8 +151,83 @@ Hovering over a graph shows the exact values at that moment. With a graph
 focused, the arrow keys do the same.
 
 Your choices are remembered in `~/.config/PulseScope/PulseScope.conf`: page,
-interval, graph window, selected disk, interface and sensors, process sort
-order, and window geometry.
+interval, graph window, Details and Smooth Graphs, selected disk, interface
+and sensors, process sort order, and window geometry.
+
+### Simple view and Details
+
+PulseScope starts in the Simple view: each page shows its main reading in
+large type, one graph with a filled area under its line, and a short summary.
+Turn on **Details** (toolbar, View menu or Ctrl+D) for everything else:
+
+| Page | Simple | Details adds |
+| --- | --- | --- |
+| CPU | Total utilization | User, system and I/O wait lines, per-CPU graphs, load average and the other facts |
+| Memory | Used of total, available, and the used area | Buff/cache, the swap graph and all memory facts |
+| Disks | Read and write, with the disk picker | The local filesystem table, more I/O facts and notes |
+| Network | Receive and transmit, with the interface picker | More interface facts and notes |
+| Temperatures | The checked sensors, each named exactly in the legend and keeping its colour and line style (also in the navigation sparkline of the hottest sensor) | The sensor list for choosing what to plot, and notes |
+| Processes | PID, name, CPU and memory (RSS), with filter and sort | User, threads, state, nice, disk I/O, age and command line |
+
+Both views show the same live data. Switching never discards history,
+selections or anything CSV export writes, and does not change how often
+PulseScope samples. Warnings such as paused, stale, warming up or a missing
+sensor are shown in both.
+
+### Smooth graphs
+
+Sampling and drawing are separate. The kernel is read once per sampling
+interval; between samples the graphs scroll continuously with real time, at
+up to 60 frames per second, so each point moves steadily to the left instead
+of jumping once per sample.
+
+- A new sample is drawn in along the straight line from the previous one,
+  over at most 0.3 s (never more than half the interval). Nothing is drawn
+  beyond the newest sample, lines are never smoothed, and peaks keep their
+  height. A pause, suspend or outage is never bridged by a line or fill.
+- Values, the hover readout and CSV export always use the measured
+  timestamps and values. Animation only changes where the view ends.
+- Animation runs only while the window can be seen and the view is live: it
+  stops while the window is hidden, minimized or not exposed, and while
+  paused. Frames copy cached images of the graphs and repaint only what
+  moved; the graphs are redrawn from the data only when a sample arrives or
+  the view changes.
+- Turn off **View > Smooth Graphs** for less power use and less motion: the
+  graphs then move once per sample. Smooth graphs on a visible window cost a
+  few percent of one core; see [Design notes](#design-notes) for
+  measurements. Qt 6 offers no system "reduce motion" preference for
+  PulseScope to follow, so this switch is the way to choose.
+
+### Look and theme
+
+PulseScope uses your Qt style, palette, fonts and icons; graph colours are
+chosen to suit the palette's lightness.
+
+- An explicit choice always wins. `-platformtheme` or `QT_QPA_PLATFORMTHEME`
+  selects the platform theme (the argument overrides the variable), and
+  `-style` or `QT_STYLE_OVERRIDE` the style, exactly as for any Qt app. An
+  empty `-platformtheme ''` also counts: Qt then ignores the variable and
+  picks the theme itself. Arguments are read as Qt reads them, so on the xcb
+  platform `-title`, `-geometry` and `-icon` take the next argument as their
+  value. If that matters and the platform is not known before start-up (no
+  `QT_QPA_PLATFORM`, `DISPLAY` or `WAYLAND_DISPLAY`), PulseScope leaves the
+  theme to Qt and says the choice is not known. On desktops that integrate Qt
+  themselves (KDE, GNOME, Xfce, LXQt and others) Qt's own choice is used.
+- Some compositor sessions, such as Hyprland or Sway, leave
+  `QT_QPA_PLATFORMTHEME` unset even when Qt apps are configured with qt6ct,
+  so Qt apps started from a launcher get Qt's built-in look. When
+  `~/.config/qt6ct/qt6ct.conf` exists and the qt6ct Qt 6 plugin is installed,
+  PulseScope then asks for the qt6ct platform theme for itself only, by adding
+  `-platformtheme qt6ct` to its own arguments. That brings in the style (for
+  example Kvantum), palette, fonts, icon theme and style sheets configured in
+  qt6ct. Nothing global changes: no environment of other programs and no
+  configuration file is touched.
+- If qt6ct is configured but its plugin is missing, PulseScope uses Qt's
+  default look and says so on standard error, in **Help > About** and in
+  `--theme-info`.
+- `pulsescope --theme-info` prints the platform, how the theme was chosen,
+  and the style, font, icon theme, style sheet size, main palette colours and
+  platform theme plugin actually loaded.
 
 ### Choosing devices
 
@@ -295,12 +377,20 @@ pulsescope [--interval 0.5|1|2|5]
            [--size WIDTHxHEIGHT]
            [--screenshot FILE.png [--screenshot-delay SECONDS]]
            [--quit-after SECONDS]
+           [--theme-info]
+           [--frame-stats]
 ```
 
 - `--interval` replaces the saved interval at startup. Like a change made in
   the toolbar, it is saved and used on the next start.
 - `--page`, `--size`, `--screenshot` and `--quit-after` mainly exist for
   testing and documentation screenshots.
+- `--theme-info` prints the Qt theme, style, font, icon theme and palette in
+  use, then exits (see [Look and theme](#look-and-theme)).
+- `--frame-stats` prints, once a second, the frames the window actually
+  painted, what they cost on the UI thread, and how often the graphs and
+  navigation entries repainted. It counts real paints; it does not infer a
+  frame rate from the animation timer.
 - Invalid values are rejected with exit status 2 instead of being silently
   replaced.
 
@@ -363,6 +453,44 @@ pulsescope [--interval 0.5|1|2|5]
 - **Look**: the interface follows the system palette, fonts and light/dark
   preference. It uses plain native controls and custom `QPainter` graphs, with
   no web view, QML or chart library.
+- **Graph drawing**:
+  - One shared timer drives animation for the visible page and the navigation
+    list, at about 60 Hz (15 Hz on the Processes page, whose only moving parts
+    are the sparklines). It never samples, sorts, rebuilds widgets or updates
+    screen-reader text; those happen once per sample.
+  - Each graph keeps its plot, grid and data rasterized in a few opaque
+    images, one per sub-pixel phase (quarter or eighth pixel). A frame copies
+    the right image at a whole-pixel offset and draws the lines that stay
+    fixed on screen (time grid, frame) over it. The images are redrawn only
+    when a sample arrives, the value range or size changes, or the palette,
+    font or style changes.
+  - A frame repaints only what scrolling can change. Above the data nothing
+    does. Below lines that stay in a narrow band, only the columns where a
+    filled area, outage shading or a sample being drawn in has a vertical
+    edge change, so a frame repaints that band and those columns; otherwise
+    it repaints the rows from the highest drawn point down. A hover or
+    keyboard readout adds its line and box, at their old and new places.
+    Each repainted rectangle is copied on its own: copying through a clip of
+    several rectangles makes Qt's raster engine blend row by row, spread
+    over its thread pool, which costs more than it saves.
+  - A frame is painted only when a graph moved by at least a sub-pixel
+    step, so a 5-minute window at the default size paints about 35 to 40
+    frames per second and a 1-minute window about 60.
+  - Measured on this project's 8-core development machine, Release build,
+    1 s sampling, all threads, one core = 100%, while the desktop was in use
+    (load average 1.2 to 2.4):
+    - Offscreen platform, 1180×780 window: Simple CPU page 3.5% with the
+      default 5-minute window, 3.7% with a 1-minute window; Simple Memory
+      page 4.0% (1 minute); Details CPU page with eight per-core graphs 4.6%
+      (1 minute); smooth graphs off 1.3%. 56 to 68 MiB resident.
+    - A visible native Wayland window (Hyprland, 1.2 scale factor, tiled at
+      788×858): Simple CPU page about 5.5% with the 5-minute window (about 35
+      painted frames per second) and 6 to 8% with a 1-minute window (about
+      64). The extra over offscreen is spent handing frames to the
+      compositor, on the UI thread and Qt's Wayland event threads. With the
+      window on a hidden workspace, painting stops and the app uses about
+      1.1%, mostly the collector thread's sampling and process scan.
+    - The cost grows with how much of the plot the data fills.
 - **Accessibility**: data series are told apart by legend, line style and
   colour, never colour alone. Every control has a tooltip and an accessible
   name, and graphs expose their current values to screen readers.

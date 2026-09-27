@@ -143,9 +143,15 @@ if(PULSESCOPE_BUILD_TESTS)
     pulsescope_add_test(tst_live)
     # Main window, process model and export, offscreen.
     pulsescope_add_test(tst_ui)
+    # Graph animation, area fills, Details view and theme, written by
+    # independent QA.
+    pulsescope_add_test(tst_graph_upgrade)
     add_test(NAME desktop_entry
         COMMAND ${CMAKE_COMMAND} -DPS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
             -DPS_WORK_DIR=${CMAKE_CURRENT_BINARY_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/desktopentry_test.cmake)
     set_tests_properties(tst_live PROPERTIES LABELS "live")
     set_tests_properties(tst_ui PROPERTIES LABELS "ui")
+    # Runs its frame-timing cases again at several device pixel ratios in
+    # child processes, several minutes in all.
+    set_tests_properties(tst_graph_upgrade PROPERTIES LABELS "ui" TIMEOUT 1800)
 endif()

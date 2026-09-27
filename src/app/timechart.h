@@ -1,15 +1,20 @@
 // QPainter time-series chart reading directly from a ps::History. Lines break
 // at unavailable samples and at discontinuities (pause, suspend, outages), so
-// a gap is never drawn as data.
+// a gap is never drawn as data; area fills follow exactly the same runs.
 #pragma once
 
 #include "core/history.h"
 
 #include <QColor>
+#include <QImage>
 #include <QPointF>
+#include <QPolygonF>
 #include <QRectF>
+#include <QRegion>
 #include <QString>
+#include <QTransform>
 #include <QWidget>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <utility>
@@ -21,6 +26,12 @@ struct ChartSeries {
     // Index into the colour/pen-style cycle; -1 uses the series position.
     // Colours are resolved at paint time so palette changes apply live.
     int visual = -1;
+    // Translucent area in the line colour between the line and the baseline
+    // (zero, or the plot bottom for temperatures). Areas overlap; they are
+    // never stacked into totals.
+    bool fill = true;
+    // Overrides the pen style of the visual (seriesStyle()).
+    std::optional<Qt::PenStyle> style {};
 };
 
 // Colour-blind-friendly series colours tuned for the palette's lightness, and
@@ -31,6 +42,17 @@ bool isDarkPalette(const QPalette& palette);
 // Clips segment a-b to rect in place (Liang-Barsky); false if none of it is
 // inside. Charts draw measured geometry through this instead of clamping.
 bool clipSegment(QPointF& a, QPointF& b, const QRectF& rect);
+// Sutherland-Hodgman clip of a polygon to rect, in double precision, so areas
+// end exactly at the rectangle's edges whatever the (finite) coordinates.
+QPolygonF clipPolygon(const QPolygonF& polygon, const QRectF& rect);
+// Strokes a run of measured points as one antialiased batch of straight
+// segments (Qt's fast path for thick lines), clipped to clip first so
+// off-scale values cost nothing. A solid run ends exactly at its first and
+// last points. Dash patterns restart at points flagged in anchors (empty: at
+// the first point); anchors that move with the data keep dashes from
+// crawling while the view scrolls.
+void strokeTrace(QPainter& painter, const QPolygonF& run, const std::vector<char>& anchors, const QColor& color,
+                 double width, Qt::PenStyle style, const QRectF& clip);
 
 class TimeChart : public QWidget {
     Q_OBJECT
@@ -69,6 +91,26 @@ public:
     // an old sample as current; invalid (the default) follows the newest sample.
     void setViewEnd(double time);
     double viewEnd() const { return endTime(); }
+    // Frame-driven scrolling between samples: moves the axis end to time and
+    // repaints only the plot, and only when the chart is visible and the data
+    // lands on a new sub-pixel step (a quarter or an eighth of a device pixel,
+    // whichever gives smooth motion at that speed); identical frames are not
+    // repainted. Samples, values and the accessible text are not touched.
+    void advanceView(double time);
+    // While enabled, a new sample continuous with its predecessor is revealed
+    // along the measured segment between the two over a short ease-out (never
+    // beyond the newest sample); legend, readout and export use the sample at
+    // once. Disabling completes a reveal in progress. Off by default.
+    void setRevealEnabled(bool enabled);
+    bool revealEnabled() const { return m_revealEnabled; }
+    bool isRevealing() const;
+
+    // Glance mode: fewer grid lines and time labels.
+    void setSimple(bool simple);
+    bool isSimple() const { return m_simple; }
+    // Legend rows with current values under the title (Full mode).
+    void setLegendVisible(bool visible);
+    bool isLegendVisible() const { return m_legendVisible; }
 
     // Call after the history changed.
     void refresh();
@@ -79,6 +121,10 @@ public:
     QString readoutText() const;
     // Number of valid points drawn in the last paint, for tests.
     int lastPaintedPoints() const { return m_lastPainted; }
+    // Paint events handled so far (frame-rate measurement).
+    int paintCount() const { return m_paintCount; }
+    // Plot rectangle of the last paint, for tests.
+    QRectF plotArea() const { return m_lastPlot; }
     bool hasVisibleData() const;
 
     QSize sizeHint() const override;
@@ -91,6 +137,7 @@ protected:
     void keyPressEvent(QKeyEvent* event) override;
     void focusOutEvent(QFocusEvent* event) override;
     void changeEvent(QEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
 
 private:
     struct Range {
@@ -103,9 +150,63 @@ private:
         QRectF plot;
         QRectF header;
         int legendRows = 0;
+        double tickLabelWidth = 0; // widest whole-minute relative-time label
+        double compoundLabelWidth = 0; // widest "minutes and seconds" label
+    };
+    // The plot (background, horizontal grid, top and bottom frame lines and
+    // the data: outage shading, areas and lines) rasterized on an opaque
+    // image at a few sub-pixel phases whenever the data, value range,
+    // geometry or palette change, so frames that only scroll the view copy
+    // pixels. Phase j is drawn shifted right by j / phases device pixels
+    // and copied at a whole-pixel offset: every frame shows the measured
+    // geometry within half a phase step of its exact position.
+    // Where what paintData draws inside the plot lies, logical, for the axis
+    // ending at a given time or later.
+    struct Extent {
+        double top = 0; // top of the drawn data, or the plot top
+        // Rows of the lines and dots, and the areas' baseline. Outside those
+        // rows the data is uniform along the time axis except at the
+        // vertical edges of areas and outage shading.
+        double bandTop = 0, bandBottom = 0, base = 0;
+        struct Edge {
+            double time; // sample time the edge is at
+            bool full;   // spans the plot height (shading), else the band to the baseline
+        };
+        std::vector<Edge> edges;
+        bool banded = false; // band and edges are known and few
+    };
+    struct DataLayer {
+        std::vector<QImage> images; // per phase, allocated when first used
+        std::vector<char> drawn;
+        int phases = 0;
+        // Paint-device transform (scale and offset), logical plot and its
+        // device-pixel bounds; the image adds a scrolling margin on the right.
+        double sx = 0, sy = 0, ox = 0, oy = 0;
+        QRectF plot;
+        int left = 0, right = 0, top = 0, bottom = 0;
+        int width = 0;
+        double pxPerSecond = 0; // device pixels per second of history
+        double end = 0;         // axis end the images are drawn for
+        std::size_t start = 0;  // first history index drawn
+        double lo = 0, hi = 0;  // value range drawn
+        double window = 0;
+        const ps::History* history = nullptr;
+        uint64_t samples = 0;
+        std::size_t size = 0;
+        double latest = 0;
+        std::vector<double> gridYs; // horizontal grid rows, logical
+        Extent extent;
+        std::size_t extentStart = 0; // first history index extent was computed from
+        uint64_t content = 0; // serial of what the images show
+        bool valid = false;
     };
 
     Layout computeLayout(const QFontMetrics& fm) const;
+    const Layout& layout(const QFontMetrics& fm);
+    // Draws outage shading, areas and lines for samples start..last with the
+    // axis ending at tEnd. Areas are clipped to area, lines to lineClip.
+    void paintData(QPainter& painter, const QRectF& plot, double lo, double hi, double tEnd, std::size_t start,
+                   const QRectF& area, const QRectF& lineClip) const;
     Range computeRange(std::size_t first, std::size_t last) const;
     QString axisLabel(double value, const Range& range) const;
     QString formatValue(double value) const;
@@ -119,6 +220,32 @@ private:
     double cursorTime() const;
     void updateAccessibleDescription();
     QString emptyMessage() const; // what an empty plot says (and is announced as)
+    void noteLatestSample();      // starts a reveal when a new continuous sample arrived
+    double revealFraction() const; // eased 0..1 progress of the reveal, 1 when none
+    // The layer is valid for the current plot and history.
+    bool layerMatchesHistory() const;
+    // What a frame that only scrolls the view repaints: the plot from the
+    // drawn data down, or all of it when the layer is stale.
+    QRect plotUpdateRect() const;
+    // Less than that when the lines lie in a narrow band: that band, and the
+    // columns the vertical edges below it swept since the layer's content
+    // was first painted.
+    QRegion plotUpdateRegion() const;
+    // Where the readout cursor is drawn for the current axis end: its line
+    // with the sample markers and its box. Empty when there is none.
+    QRegion cursorFootprint() const;
+    void invalidateLayer();
+    // Makes m_layer match this device transform, plot, range, grid and data,
+    // and cover axis end tEnd (drawing nothing yet); false if it cannot.
+    bool prepareLayer(const QTransform& device, const QRectF& plot, const Range& range,
+                      const std::vector<double>& gridYs, double tEnd, std::size_t start);
+    void drawLayerPhase(int phase);
+    // Where paintData draws inside the plot for samples start..last with the
+    // axis ending at tEnd or later.
+    Extent dataExtent(const QRectF& plot, double lo, double hi, double tEnd, std::size_t start) const;
+    // Offset of the layer for axis end tEnd, in 1/phases device pixels.
+    long long layerKey(double tEnd) const;
+    bool layerCovers(long long key) const;
 
     QString m_title;
     ps::Unit m_unit;
@@ -137,4 +264,35 @@ private:
     double m_mouseX = 0;
     mutable QRectF m_lastPlot;
     int m_lastPainted = 0;
+    int m_paintCount = 0;
+    bool m_simple = false;
+    bool m_legendVisible = true;
+
+    // What the last paint showed, to decide whether a frame needs a repaint.
+    double m_paintedEnd = ps::kNaN;
+    std::size_t m_paintedFirst = 0;
+    bool m_paintedInWindow = false;
+    bool m_paintedMoving = false; // anything drawn scrolls with the view
+    long long m_paintedKey = 0;
+    bool m_paintedLayer = false;
+    double m_paintedReveal = 1;
+    DataLayer m_layer;
+    uint64_t m_contentSerial = 0;
+    // The axis ends painted with layer content m_sweepContent: the screen
+    // shows that content at ends within them.
+    uint64_t m_sweepContent = 0;
+    double m_sweepFrom = ps::kNaN;
+    double m_sweepTo = ps::kNaN;
+    // Where the screen may still show a readout cursor.
+    QRegion m_paintedCursor;
+    Layout m_layoutCache;
+    QSize m_layoutSize;
+    bool m_layoutValid = false;
+
+    bool m_revealEnabled = false;
+    double m_seenLatest = ps::kNaN; // newest sample time already known
+    double m_revealFrom = ps::kNaN; // predecessor time of the sample being revealed
+    double m_revealTo = ps::kNaN;   // time of that sample; NaN: no reveal
+    double m_revealStart = ps::kNaN; // axis end when it arrived
+    double m_revealDuration = 0;
 };
