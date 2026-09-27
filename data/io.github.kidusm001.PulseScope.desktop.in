@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=PulseScope
+GenericName=Performance Monitor
+Comment=Live CPU, memory, disk, network, temperature and process monitor
+Exec=@PULSESCOPE_EXEC@
+Icon=io.github.kidusm001.PulseScope
+Terminal=false
+Categories=System;Monitor;Qt;
+Keywords=cpu;memory;ram;swap;disk;network;temperature;sensor;process;performance;monitor;
+StartupNotify=true

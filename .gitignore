@@ -1,0 +1,16 @@
+# Build trees and generated artifacts
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+CMakeUserPresets.json
+compile_commands.json
+Testing/
+
+# Editor and tool state
+.cache/
+.vscode/
+.idea/
+*.user
+*.swp
+*~

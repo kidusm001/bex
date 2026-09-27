@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.kidusm001.PulseScope</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <name>PulseScope</name>
+  <summary>Live Linux performance monitor</summary>
+  <developer id="io.github.kidusm001">
+    <name>Kidus Mesfin</name>
+  </developer>
+  <description>
+    <p>
+      PulseScope shows total and per-core CPU utilization, memory and swap,
+      disk throughput and filesystem capacity, network throughput, hardware
+      temperatures and a sortable, filterable process table, with up to
+      fifteen minutes of history. It reads /proc and /sys locally, needs no
+      special privileges and never sends data anywhere.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.kidusm001.PulseScope.desktop</launchable>
+  <categories>
+    <category>System</category>
+    <category>Monitor</category>
+  </categories>
+  <provides>
+    <binary>pulsescope</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.0.0" date="2026-09-27"/>
+  </releases>
+</component>

@@ -1,0 +1,198 @@
+// Main window: toolbar, metric navigation with live summaries, and one page
+// per metric category. Owns the collector and the bounded history.
+#pragma once
+
+#include "app/collector.h"
+#include "app/csvexporter.h"
+#include "core/history.h"
+#include "core/snapshot.h"
+
+#include <QMainWindow>
+#include <QStringList>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+class QAction;
+class QCheckBox;
+class QComboBox;
+class QGridLayout;
+class QLabel;
+class QLineEdit;
+class QSettings;
+class QStackedWidget;
+class QTableView;
+class QTimer;
+class QTreeWidget;
+class CoreGrid;
+class MetricButton;
+class ProcessFilterModel;
+class ProcessModel;
+class TimeChart;
+
+struct MainWindowOptions {
+    ps::SamplerOptions sampler;
+    bool startCollector = true; // false: snapshots only arrive via applySnapshot()
+    QString settingsFile;       // empty: the default per-user QSettings location
+    int initialIntervalMs = 0;  // one of intervalChoicesMs(); 0: the saved setting
+    CsvExporter::Writer csvWriter; // empty: atomic file save (tests may inject a writer)
+    // Current time on the Snapshot::time clock (CLOCK_BOOTTIME seconds). A
+    // snapshot is current only while its acquisition time is recent on this
+    // clock, and charts end at it. Empty: ps::monotonicSeconds() when the
+    // collector runs; with neither, injected snapshots count as current and
+    // charts end at the newest sample (tests).
+    std::function<double()> clock;
+};
+
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    enum Page { CpuPage, MemoryPage, DiskPage, NetworkPage, TemperaturePage, ProcessPage, PageCount };
+
+    static const std::vector<int>& intervalChoicesMs(); // 500, 1000, 2000, 5000
+    static const std::vector<int>& windowChoices();     // 60, 300, 900 seconds
+
+    explicit MainWindow(MainWindowOptions options = {}, QWidget* parent = nullptr);
+    ~MainWindow() override;
+
+    void showPage(Page page);
+    Page currentPage() const;
+    void setPaused(bool paused);
+    bool isPaused() const { return m_paused; }
+    void setIntervalMs(int ms);
+    int intervalMs() const { return m_intervalMs; }
+    void setWindowSeconds(int seconds);
+    int windowSeconds() const { return m_windowSeconds; }
+    // Starts saving a copy of the retained history as CSV on the export
+    // worker. Returns false (with a reason) if nothing can be exported yet
+    // or an export is already running; csvExportFinished() reports the end.
+    bool startCsvExport(const QString& path, QString* error = nullptr);
+    bool isExporting() const { return m_exporter && m_exporter->isBusy(); }
+
+    const ps::History& history() const { return m_history; }
+    Collector* collector() const { return m_collector; }
+    ps::SnapshotPtr latestSnapshot() const { return m_latest; }
+    int snapshotsApplied() const { return m_applied; }
+    bool isStale() const { return m_stale; }
+    QString statusText() const;
+
+    // Feeds one snapshot as if the collector delivered it (tests, and the
+    // collector connection itself). Ignored while paused.
+    void applySnapshot(ps::SnapshotPtr snapshot);
+    // Stops the collector thread and waits (within the same budget, at most
+    // one second) for a running export; false if either had to be abandoned.
+    bool shutdown(int timeoutMs = 2000);
+
+Q_SIGNALS:
+    void snapshotApplied();
+    void csvExportFinished(bool ok, const QString& path, const QString& error);
+
+protected:
+    void closeEvent(QCloseEvent* event) override;
+
+private:
+    void buildActions();
+    void buildToolbar();
+    void buildMenus();
+    QWidget* buildNavigation();
+    QWidget* buildCpuPage();
+    QWidget* buildMemoryPage();
+    QWidget* buildDiskPage();
+    QWidget* buildNetworkPage();
+    QWidget* buildTemperaturePage();
+    QWidget* buildProcessPage();
+    void loadSettings();
+    void saveSettings();
+
+    void updateSelectors(const ps::Snapshot& s);
+    void updateDiskSelector(const ps::Snapshot& s);
+    void updateNetSelector(const ps::Snapshot& s);
+    void updateSensorList(const ps::Snapshot& s);
+    void updateSummaries();
+    void updateFacts();
+    void updateFilesystems(const ps::Snapshot& s);
+    void updateProcesses();
+    void updateStatus();
+    void updateChartNotices();
+    void refreshCharts();
+    void checkStale();
+    void setStale(bool stale);
+    double now() const;
+    double staleLimitSeconds() const;
+    bool isCurrent(const ps::Snapshot& s) const;
+    bool isFromFuture(const ps::Snapshot& s) const;
+    void applyDiskSelection();
+    void applyNetSelection();
+    void applySensorSelection();
+    void exportCsvInteractive();
+    void onCsvExportFinished(bool ok, const QString& path, const QString& error, qulonglong samples);
+    void updateProcessCount();
+    void showAbout();
+
+    QString selectedDisk() const;
+    QString selectedNet() const;
+    std::vector<TimeChart*> allCharts() const;
+
+    MainWindowOptions m_options;
+    std::unique_ptr<QSettings> m_settings;
+    Collector* m_collector = nullptr;
+    CsvExporter* m_exporter = nullptr;
+    ps::History m_history;
+    ps::SnapshotPtr m_latest;
+    int m_applied = 0;
+    int m_intervalMs = 1000;
+    int m_windowSeconds = 300;
+    bool m_paused = false;
+    bool m_stale = false;
+    // Freshness, on the options.clock timeline: when the newest applied
+    // sample of this run was acquired, and since when this run has waited
+    // for its first one.
+    double m_lastAcquired = ps::kNaN;
+    double m_waitingSince = ps::kNaN;
+    int m_graceIntervalMs = 1000; // longest interval in effect since the last sample
+    QTimer* m_staleTimer = nullptr;
+
+    // Selections requested by settings, applied once the device appears.
+    QString m_wantedDisk;
+    QString m_wantedNet;
+    QStringList m_wantedSensors;
+    bool m_sensorsChosen = false;
+
+    QAction* m_pauseAction = nullptr;
+    QAction* m_exportAction = nullptr;
+    QAction* m_quitAction = nullptr;
+    QAction* m_aboutAction = nullptr;
+    std::vector<QAction*> m_pageActions;
+    QComboBox* m_intervalCombo = nullptr;
+    QComboBox* m_rangeCombo = nullptr;
+
+    std::vector<MetricButton*> m_nav;
+    QStackedWidget* m_stack = nullptr;
+    QLabel* m_statusLabel = nullptr;
+    QLabel* m_timingLabel = nullptr;
+
+    TimeChart* m_cpuChart = nullptr;
+    CoreGrid* m_coreGrid = nullptr;
+    QLabel* m_coreNote = nullptr;
+    TimeChart* m_memChart = nullptr;
+    TimeChart* m_swapChart = nullptr;
+    TimeChart* m_diskChart = nullptr;
+    QComboBox* m_diskCombo = nullptr;
+    QTreeWidget* m_fsTable = nullptr;
+    TimeChart* m_netChart = nullptr;
+    QComboBox* m_netCombo = nullptr;
+    TimeChart* m_tempChart = nullptr;
+    QTreeWidget* m_sensorList = nullptr;
+    QLabel* m_tempNote = nullptr;
+    QLineEdit* m_procFilter = nullptr;
+    QCheckBox* m_kernelCheck = nullptr;
+    QLabel* m_procCount = nullptr;
+    QTableView* m_procTable = nullptr;
+    ProcessModel* m_procModel = nullptr;
+    ProcessFilterModel* m_procProxy = nullptr;
+
+    // Fact labels by page, keyed by a stable id.
+    std::vector<std::pair<std::string, QLabel*>> m_facts;
+    QLabel* fact(const std::string& id) const;
+};
