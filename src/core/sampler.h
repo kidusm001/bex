@@ -6,6 +6,7 @@
 #include "core/snapshot.h"
 
 #include <cstdint>
+#include <limits>
 #include <functional>
 #include <map>
 #include <memory>
@@ -83,6 +84,9 @@ public:
     // starved thread, a stalled kernel read), the sample's time-based rates
     // (transfer, disk busy, per-process CPU and I/O) are reported unavailable
     // instead of as a spike or dip; the next sample is judged the same way.
+    // Each process's stat and io reads are also timed individually against
+    // the same point in its previous sample, so a delay inside the process
+    // scan withholds just the affected processes' rates.
     Snapshot sample(double now, double expectedInterval);
     static double readSkewLimit(double expectedInterval);
     void resetBaselines();
@@ -101,8 +105,16 @@ private:
         uint64_t rx = 0, tx = 0;
         bool hasPrev = false;
     };
+    // When a read happened: the middle of the read call, in seconds after the
+    // sample's start, and half the call's duration.
+    struct ReadTime {
+        double at = std::numeric_limits<double>::quiet_NaN();
+        double spread = 0;
+    };
     struct ProcState {
         uint64_t startTicks = 0;
+        ReadTime statTime, ioTime; // of the readings in cpuTicks and ioRead/ioWrite
+        double metaDueAt = 0;      // sample time at which uid/command are read again
         uint64_t cpuTicks = 0;
         bool hasCpu = false; // cpuTicks is a usable baseline
         uint64_t ioRead = 0, ioWrite = 0;
@@ -156,6 +168,9 @@ private:
     void closeSensorDirs();
     void sampleProcesses(Snapshot& s, bool baseline, double elapsed, double uptime, double now);
     std::string userFor(uint32_t uid);
+    double stopwatch() const;
+    ReadTime readTime(double before, double after) const;
+    bool sameTiming(const ReadTime& a, const ReadTime& b) const;
 
     SamplerOptions m_opt;
     long m_clockTicks = 100;
@@ -166,6 +181,8 @@ private:
     bool m_forceReset = false;
     double m_prevTime = 0;
     double m_prevReadOffset = 0; // seconds from sample start to the last counter read
+    double m_sampleStarted = 0;  // stopwatch() at the start of the current sample
+    double m_skewLimit = 0.1;    // readSkewLimit() of the current sample
     uint64_t m_sequence = 0;
 
     std::optional<parse::CpuTimes> m_prevCpuAggregate;

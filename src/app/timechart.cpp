@@ -497,6 +497,7 @@ void TimeChart::setMode(Mode mode)
     setFocusPolicy(mode == Mode::Full ? Qt::TabFocus : Qt::NoFocus);
     invalidateLayer();
     m_layoutValid = false;
+    updateAccessibleDescription();
     updateGeometry();
     update();
 }
@@ -523,14 +524,16 @@ void TimeChart::setNotice(const QString& notice)
     if (notice == m_notice)
         return;
     m_notice = notice;
+    // Without a cursor the description announces the notice with the latest
+    // value; a cursor readout gives the selected sample's own age instead.
+    updateAccessibleDescription();
     update();
 }
 
 void TimeChart::refresh()
 {
     noteLatestSample();
-    if (m_mode == Mode::Full)
-        updateAccessibleDescription();
+    updateAccessibleDescription();
     update();
 }
 
@@ -798,8 +801,7 @@ void TimeChart::setCursorTime(double time)
 {
     m_cursorFollowsMouse = false;
     m_cursorTime = time;
-    if (m_mode == Mode::Full)
-        updateAccessibleDescription();
+    updateAccessibleDescription();
     update();
 }
 
@@ -807,8 +809,7 @@ void TimeChart::clearCursor()
 {
     m_cursorFollowsMouse = false;
     m_cursorTime = ps::kNaN;
-    if (m_mode == Mode::Full)
-        updateAccessibleDescription();
+    updateAccessibleDescription();
     update();
 }
 
@@ -872,8 +873,13 @@ QString TimeChart::readoutText() const
 void TimeChart::updateAccessibleDescription()
 {
     // While a cursor selects a sample, assistive technology hears that
-    // sample, recomputed on every refresh, exactly as the readout shows it.
-    QString d = readoutText();
+    // sample, recomputed on every refresh, exactly as the readout shows it,
+    // age included. Otherwise (no cursor, or a compact chart, which has
+    // none) it hears the latest value, after the notice ("No recent
+    // samples", "Paused") when there is one, so an old value is never heard
+    // as current. This runs at sample cadence (refresh, cursor, notice and
+    // mode changes), never from the frame loop.
+    QString d = m_mode == Mode::Full ? readoutText() : QString();
     if (d.isEmpty() && !hasVisibleData()) {
         // Nothing is plotted: announce the same explanation the plot shows.
         d = emptyMessage();
@@ -886,6 +892,8 @@ void TimeChart::updateAccessibleDescription()
         }
         if (d.isEmpty() && !m_emptyText.isEmpty())
             d = m_emptyText;
+        else if (!m_notice.isEmpty())
+            d = m_notice + QStringLiteral(", last ") + d;
     }
     if (d != accessibleDescription())
         setAccessibleDescription(d);
@@ -1774,8 +1782,7 @@ void TimeChart::focusOutEvent(QFocusEvent* event)
 {
     if (!m_cursorFollowsMouse) {
         m_cursorTime = ps::kNaN;
-        if (m_mode == Mode::Full)
-            updateAccessibleDescription();
+        updateAccessibleDescription();
     }
     QWidget::focusOutEvent(event);
     update();

@@ -7,6 +7,7 @@
 
 #include <QObject>
 #include <QPointer>
+#include <QString>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -78,6 +79,10 @@ public:
     bool isPaused() const { return m_paused; }
     bool isStopped() const { return m_stopped; }
     bool isRunning() const;
+    // Why the collector thread is not running, e.g. the system refused to
+    // create it; empty while it runs. Creation is retried automatically
+    // (backing off from 1 s to 30 s) and on resume.
+    QString startError() const { return m_startError; }
     int intervalMs() const { return m_intervalMs; }
     quint64 generation() const { return m_generation; }
     // Sequence of the snapshot currently in flight to this facade, 0 if none.
@@ -93,13 +98,20 @@ public:
 
 Q_SIGNALS:
     void snapshotReady(ps::SnapshotPtr snapshot);
+    void startErrorChanged();
 
 private:
     void onWorkerSnapshot(ps::SnapshotPtr snapshot);
+    bool startThread();
+    void retryStart();
+    void activateWorker();
 
     std::shared_ptr<CollectorLink> m_link;
     QThread* m_thread = nullptr;
     QPointer<CollectorWorker> m_worker;
+    QTimer* m_retryTimer = nullptr;
+    QString m_startError;
+    int m_startFailures = 0;
     int m_intervalMs = 1000;
     bool m_paused = false;
     bool m_started = false;

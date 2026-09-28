@@ -9,13 +9,13 @@
 #include <QAction>
 #include <QApplication>
 #include <QButtonGroup>
-#include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -36,9 +36,9 @@
 #include <QStatusBar>
 #include <QStyle>
 #include <QStyledItemDelegate>
-#include <QTableView>
 #include <QTimer>
 #include <QToolBar>
+#include <QTreeView>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 #include <QWindow>
@@ -319,6 +319,10 @@ int sensorListMinimumWidth(const QWidget* list)
 
 // Draws "used" as a proportional bar with the percentage beside it, so the
 // fill level is readable without relying on the bar colour.
+// Filesystem use from which the usage bar turns to the warning colour and
+// the row's tooltip says "Nearly full".
+constexpr double kNearlyFull = 0.9;
+
 class UsageDelegate : public QStyledItemDelegate {
 public:
     using QStyledItemDelegate::QStyledItemDelegate;
@@ -350,8 +354,9 @@ public:
             p->setPen(Qt::NoPen);
             p->setBrush(trackColor);
             p->drawRoundedRect(track, 2, 2);
-            const bool nearlyFull = fraction >= 0.9;
-            QColor fill = nearlyFull ? seriesColor(5, opt.palette) : opt.palette.color(QPalette::Highlight);
+            // The red of the series palette, in its light or dark variant.
+            const bool nearlyFull = fraction >= kNearlyFull;
+            QColor fill = nearlyFull ? seriesColor(6, opt.palette) : opt.palette.color(QPalette::Highlight);
             p->setBrush(fill);
             QRectF bar = track;
             bar.setWidth(track.width() * std::clamp(fraction, 0.0, 1.0));
@@ -754,8 +759,20 @@ MainWindow::MainWindow(MainWindowOptions options, QWidget* parent)
     if (m_options.startCollector) {
         m_collector = new Collector(m_options.sampler, this);
         connect(m_collector, &Collector::snapshotReady, this, &MainWindow::applySnapshot);
+        connect(m_collector, &Collector::startErrorChanged, this, &MainWindow::updateStatus);
         m_collector->start(m_intervalMs);
     }
+    if (m_options.windowProbe.enabled && (m_options.startCollector || m_options.windowProbe.query)) {
+        windows::ProbeOptions probe = m_options.windowProbe;
+        if (!probe.clock && m_options.clock)
+            probe.clock = m_options.clock;
+        m_probe = new windows::WindowProbe(std::move(probe), this);
+        connect(m_probe, &windows::WindowProbe::resultReady, this, &MainWindow::applyWindowOwners);
+        m_ownersAwaiting = true;
+        m_ownersAwaitingSince = now();
+        m_probe->start(processListShown());
+    }
+    updateGrouping();
     if (m_options.clock)
         m_staleTimer->start();
     updateStatus();
@@ -780,12 +797,25 @@ bool MainWindow::shutdown(int timeoutMs)
     bool clean = true;
     if (m_collector)
         clean = m_collector->stop(timeoutMs);
+    if (m_probe) {
+        const int remaining = static_cast<int>(std::max<qint64>(0, timeoutMs - clock.elapsed()));
+        clean = m_probe->stop(std::min(remaining, 1000)) && clean;
+    }
     if (m_exporter && m_exporter->isBusy()) {
         // A local export normally finishes in milliseconds; one stuck on a
         // stalled mount is abandoned like the capacity probe (atomic save:
         // the destination is either complete or untouched).
         const int remaining = static_cast<int>(std::max<qint64>(0, timeoutMs - clock.elapsed()));
-        clean = m_exporter->shutdown(std::min(remaining, 1000)) && clean;
+        const QString path = m_exporter->currentPath();
+        if (!m_exporter->shutdown(std::min(remaining, 1000))) {
+            clean = false;
+            // The worker cannot be cancelled inside a blocked write; say so
+            // rather than let the export vanish silently.
+            qWarning("PulseScope: the CSV export to \"%s\" was still blocked at exit and was abandoned. That file is "
+                     "either complete or unchanged; on a filesystem without unnamed temporary files a leftover "
+                     "\"%s.XXXXXX\" temporary may remain beside it.",
+                     qUtf8Printable(path), qUtf8Printable(QFileInfo(path).fileName()));
+        }
     }
     return clean;
 }
@@ -811,6 +841,8 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event)
     // Wayland) no longer given frames by the compositor.
     if (watched == m_watchedWindow && event->type() == QEvent::Expose)
         updateFrameDriver();
+    else if (m_procTable && watched == m_procTable->viewport() && event->type() == QEvent::Resize)
+        fitProcessNameColumn();
     return QMainWindow::eventFilter(watched, event);
 }
 
@@ -852,9 +884,9 @@ void MainWindow::saveSettings()
     m_settings->setValue(QStringLiteral("interface"), m_wantedNet);
     if (m_sensorsChosen)
         m_settings->setValue(QStringLiteral("sensors"), m_wantedSensors);
-    m_settings->setValue(QStringLiteral("showKernelThreads"), m_kernelCheck->isChecked());
-    m_settings->setValue(QStringLiteral("processSortColumn"), m_procProxy->sortColumn());
-    m_settings->setValue(QStringLiteral("processSortOrder"), static_cast<int>(m_procProxy->sortOrder()));
+    m_settings->setValue(QStringLiteral("processView/sortColumn"), m_procProxy->sortColumn());
+    m_settings->setValue(QStringLiteral("processView/sortOrder"), static_cast<int>(m_procProxy->sortOrder()));
+    saveGroupExpansion();
     m_settings->setValue(QStringLiteral("details"), m_details);
     m_settings->setValue(QStringLiteral("smoothGraphs"), m_smooth);
     m_settings->setValue(QStringLiteral("geometry"), saveGeometry());
@@ -1364,15 +1396,16 @@ QWidget* MainWindow::buildProcessPage()
     m_procFilter->setClearButtonEnabled(true);
     m_procFilter->setMinimumWidth(200);
     header->addWidget(m_procFilter, 1);
-    m_kernelCheck = new QCheckBox(QStringLiteral("Show kernel threads"), page);
-    m_kernelCheck->setObjectName(QStringLiteral("kernelThreadsCheck"));
-    m_kernelCheck->setChecked(m_settings->value(QStringLiteral("showKernelThreads"), false).toBool());
-    header->addWidget(m_kernelCheck);
     m_procCount = new QLabel(page);
     m_procCount->setObjectName(QStringLiteral("processCount"));
     m_procCount->setForegroundRole(QPalette::PlaceholderText);
     v->addLayout(header);
     v->addWidget(m_procCount);
+    m_groupNote = makeNote(QString(), page);
+    m_groupNote->setObjectName(QStringLiteral("processGroupNote"));
+    m_groupNote->setAccessibleName(QStringLiteral("App detection"));
+    m_groupNote->hide();
+    v->addWidget(m_groupNote);
 
     auto* find = new QAction(this);
     find->setShortcut(QKeySequence::Find);
@@ -1386,19 +1419,39 @@ QWidget* MainWindow::buildProcessPage()
     m_procModel = new ProcessModel(this);
     m_procProxy = new ProcessFilterModel(this);
     m_procProxy->setSourceModel(m_procModel);
-    m_procProxy->setShowKernelThreads(m_kernelCheck->isChecked());
     connect(m_procFilter, &QLineEdit::textChanged, this, [this](const QString& text) {
+        const bool was = m_procProxy->isFiltering();
         m_procProxy->setFilterString(text);
-        updateProcessCount();
-    });
-    connect(m_kernelCheck, &QCheckBox::toggled, this, [this](bool on) {
-        m_procProxy->setShowKernelThreads(on);
+        // Every filter starts with all groups open; clearing it brings back
+        // the groups as the user left them.
+        if (was && !m_procProxy->isFiltering())
+            m_filterExpanded = {true, true, true};
+        syncGroupExpansion();
         updateProcessCount();
     });
 
-    m_procTable = new QTableView(page);
+    // Groups: saved expansion; a showKernelThreads=true from before groups
+    // existed opens the kernel group.
+    const auto expandKey = [](int g) {
+        switch (g) {
+        case ProcessModel::Apps: return QStringLiteral("processView/expandApps");
+        case ProcessModel::Background: return QStringLiteral("processView/expandBackground");
+        default: return QStringLiteral("processView/expandKernel");
+        }
+    };
+    for (int g = 0; g < ProcessModel::GroupCount; ++g) {
+        const QString key = expandKey(g);
+        if (m_settings->contains(key))
+            m_groupExpanded[static_cast<std::size_t>(g)] = m_settings->value(key).toBool();
+        else if (g == ProcessModel::Kernel)
+            m_groupExpanded[static_cast<std::size_t>(g)] =
+                m_settings->value(QStringLiteral("showKernelThreads"), false).toBool();
+    }
+
+    m_procTable = new QTreeView(page);
     m_procTable->setObjectName(QStringLiteral("processTable"));
     m_procTable->setAccessibleName(QStringLiteral("Processes"));
+    m_procTable->setAccessibleDescription(QStringLiteral("Grouped as apps, background processes and kernel processes"));
     m_procTable->setModel(m_procProxy);
     m_procTable->setSortingEnabled(true);
     m_procTable->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -1407,14 +1460,15 @@ QWidget* MainWindow::buildProcessPage()
     m_procTable->setAlternatingRowColors(true);
     m_procTable->setWordWrap(false);
     m_procTable->setTextElideMode(Qt::ElideRight);
-    m_procTable->verticalHeader()->hide();
-    m_procTable->verticalHeader()->setDefaultSectionSize(QFontMetrics(font()).height() + 6);
-    m_procTable->horizontalHeader()->setStretchLastSection(true);
-    m_procTable->horizontalHeader()->setSectionsMovable(false);
+    m_procTable->setUniformRowHeights(true);
+    m_procTable->setAllColumnsShowFocus(true);
+    m_procTable->header()->setStretchLastSection(true);
+    m_procTable->header()->setSectionsMovable(false);
     const QFontMetrics fm(font());
     const auto width = [&](const char* sample) { return fm.horizontalAdvance(QString::fromLatin1(sample)) + 28; };
     m_procTable->setColumnWidth(ProcessModel::Pid, width("4194304"));
-    m_procTable->setColumnWidth(ProcessModel::Name, width("gnome-shell-calen"));
+    // The name column also holds the group branch indicator and indent.
+    m_procTable->setColumnWidth(ProcessModel::Name, width("gnome-shell-calen") + m_procTable->indentation());
     m_procTable->setColumnWidth(ProcessModel::User, width("username"));
     m_procTable->setColumnWidth(ProcessModel::Cpu, width("1000.0 %"));
     m_procTable->setColumnWidth(ProcessModel::Memory, width("Memory (RSS)"));
@@ -1424,18 +1478,51 @@ QWidget* MainWindow::buildProcessPage()
     m_procTable->setColumnWidth(ProcessModel::IoRead, width("1000 KiB/s"));
     m_procTable->setColumnWidth(ProcessModel::IoWrite, width("1000 KiB/s"));
     m_procTable->setColumnWidth(ProcessModel::Age, width("12m 05s"));
-    const int sortColumn =
-        std::clamp(m_settings->value(QStringLiteral("processSortColumn"), int(ProcessModel::Cpu)).toInt(), 0,
-                   ProcessModel::ColumnCount - 1);
-    const auto sortOrder = m_settings->value(QStringLiteral("processSortOrder"), int(Qt::DescendingOrder)).toInt() == 0
-        ? Qt::AscendingOrder
-        : Qt::DescendingOrder;
+    // In Simple, the name fills what the numbers leave, but never shrinks
+    // below a readable name under a group (two indentation steps): a narrow
+    // window scrolls sideways instead.
+    m_procNameMinWidth = 2 * m_procTable->indentation() + width("gnome-shell");
+    m_procTable->viewport()->installEventFilter(this);
+    connect(m_procTable->header(), &QHeaderView::sectionResized, this, [this](int section) {
+        if (section != ProcessModel::Name)
+            fitProcessNameColumn();
+    });
+    // Sorting: saved under new keys since PID and Name swapped places; the
+    // old keys are read once.
+    int sortColumn = ProcessModel::Cpu;
+    if (m_settings->contains(QStringLiteral("processView/sortColumn"))) {
+        sortColumn = m_settings->value(QStringLiteral("processView/sortColumn")).toInt();
+    } else if (m_settings->contains(QStringLiteral("processSortColumn"))) {
+        sortColumn = m_settings->value(QStringLiteral("processSortColumn")).toInt();
+        if (sortColumn == 0 || sortColumn == 1)
+            sortColumn = 1 - sortColumn;
+    }
+    sortColumn = std::clamp(sortColumn, 0, ProcessModel::ColumnCount - 1);
+    const QVariant order = m_settings->contains(QStringLiteral("processView/sortOrder"))
+        ? m_settings->value(QStringLiteral("processView/sortOrder"))
+        : m_settings->value(QStringLiteral("processSortOrder"), int(Qt::DescendingOrder));
+    const auto sortOrder = order.toInt() == 0 ? Qt::AscendingOrder : Qt::DescendingOrder;
     m_procTable->sortByColumn(sortColumn, sortOrder);
+    const auto spanGroups = [this] {
+        for (int row = 0; row < m_procProxy->rowCount(); ++row)
+            m_procTable->setFirstColumnSpanned(row, QModelIndex(), true);
+    };
+    spanGroups();
+    connect(m_procProxy, &QAbstractItemModel::modelReset, this, [this, spanGroups] {
+        spanGroups();
+        syncGroupExpansion();
+    });
+    connect(m_procTable, &QTreeView::expanded, this, [this](const QModelIndex& index) { onGroupExpansion(index, true); });
+    connect(m_procTable, &QTreeView::collapsed, this,
+            [this](const QModelIndex& index) { onGroupExpansion(index, false); });
+    syncGroupExpansion();
     v->addWidget(m_procTable, 1);
     v->addWidget(detailOnly(makeNote(
         QStringLiteral("CPU %: 100% is one logical CPU fully busy, so a multithreaded process can exceed 100% "
                        "(up to 100% \u00d7 the number of logical CPUs). Memory is the resident set size, which includes "
-                       "shared pages. Disk I/O is only readable for your own processes. This view is read-only."),
+                       "shared pages. Disk I/O is only readable for your own processes. Apps are processes that own "
+                       "a window, even a minimized or hidden one; helpers without a window of their own are "
+                       "background processes. This view is read-only."),
         page)));
     auto* shortNote = makeNote(QStringLiteral("CPU %: 100% is one logical CPU fully busy, so a multithreaded process "
                                               "can exceed 100%. Memory is the resident set size (RSS). Read-only."),
@@ -1481,6 +1568,18 @@ void MainWindow::setPaused(bool paused)
                                      : QStringLiteral("Pause collection and freeze the view (P)"));
     if (m_collector)
         m_collector->setPaused(paused);
+    // The window list is frozen with the view. On resume anything asked
+    // before the pause is dropped and a fresh list is asked for at once;
+    // meanwhile a list that expired during the pause no longer counts.
+    if (m_probe) {
+        m_probe->setPaused(paused);
+        if (!paused) {
+            m_ownersAwaiting = true;
+            m_ownersAwaitingSince = now();
+        }
+    }
+    if (!paused)
+        updateGrouping();
     // Pausing freezes the view but does not make old values fresh: staleness
     // is cleared only by a new, current snapshot. On resume the overdue clock
     // restarts with the collector.
@@ -1672,6 +1771,21 @@ void MainWindow::applyDetails()
             c == ProcessModel::Pid || c == ProcessModel::Name || c == ProcessModel::Cpu || c == ProcessModel::Memory;
         m_procTable->setColumnHidden(c, !essential && !m_details);
     }
+    // Simple: the name takes the spare width and the numbers stay compact.
+    // Details: the command line does, and the name gets back the width it had.
+    QHeaderView* procHeader = m_procTable->header();
+    if (m_details) {
+        if (m_procNameFitted)
+            m_procTable->setColumnWidth(ProcessModel::Name, m_procNameWidth);
+        m_procNameFitted = false;
+        procHeader->setStretchLastSection(true);
+    } else {
+        if (!m_procNameFitted)
+            m_procNameWidth = procHeader->sectionSize(ProcessModel::Name);
+        m_procNameFitted = true;
+        procHeader->setStretchLastSection(false);
+        fitProcessNameColumn();
+    }
     if (m_detailsAction && m_detailsAction->isChecked() != m_details) {
         const QSignalBlocker block(m_detailsAction);
         m_detailsAction->setChecked(m_details);
@@ -1709,6 +1823,7 @@ void MainWindow::updateFrameDriver()
     }
     for (auto* chart : allCharts())
         chart->setRevealEnabled(run);
+    updateProbeVisibility();
 }
 
 void MainWindow::advanceFrame()
@@ -1753,8 +1868,6 @@ void MainWindow::applyScaledFonts()
         navWidth = std::max(navWidth, b->sizeHint().width());
     if (m_navPanel)
         m_navPanel->setFixedWidth(navWidth);
-    const QFontMetrics fm(base);
-    m_procTable->verticalHeader()->setDefaultSectionSize(fm.height() + 6);
     m_sensorList->setMinimumWidth(sensorListMinimumWidth(m_sensorList));
     for (auto* head : m_head)
         if (head)
@@ -2627,6 +2740,8 @@ void MainWindow::updateFilesystems(const ps::Snapshot& s)
             tip += QStringLiteral("\nNo recent samples: capacity values are out of date");
         else if (!fs.error.empty())
             tip += QStringLiteral("\nCapacity unavailable: ") + q(fs.error);
+        else if (fraction >= kNearlyFull)
+            tip += QStringLiteral("\nNearly full: %1 used").arg(cols[6]);
         if (item->toolTip(0) != tip)
             for (int c = 0; c < 7; ++c)
                 item->setToolTip(c, tip);
@@ -2635,12 +2750,15 @@ void MainWindow::updateFilesystems(const ps::Snapshot& s)
 
 void MainWindow::updateProcesses()
 {
+    updateGrouping(); // judged now, not at the last stale check
+    m_procModel->setGrouping(m_grouping);
     if (const ps::Snapshot* s = m_latest.get()) {
         if (s->processesScanned)
             m_procModel->setProcesses(s->processes);
         else
             m_procModel->clear();
     }
+    syncGroupExpansion();
     updateProcessCount();
 }
 
@@ -2653,10 +2771,12 @@ void MainWindow::updateProcessCount()
     } else if (!s->processesScanned) {
         text = QStringLiteral("Process list unavailable: /proc could not be read");
     } else {
-        text = QStringLiteral("Showing %1 of %2 processes, %3 threads")
-                   .arg(m_procProxy->rowCount())
-                   .arg(s->processes.size())
-                   .arg(s->threadCount);
+        // Processes only; group rows are not counted.
+        const int total = m_procModel->processCount();
+        text = m_procProxy->isFiltering()
+            ? QStringLiteral("%1 of %2 processes match, %3 threads").arg(m_procProxy->visibleProcessCount()).arg(total)
+            : QStringLiteral("%1 processes, %2 threads").arg(total);
+        text = text.arg(s->threadCount);
         if (m_stale)
             text += QStringLiteral(". No recent samples: values are out of date and shown as unavailable");
         else if (m_paused)
@@ -2664,6 +2784,162 @@ void MainWindow::updateProcessCount()
     }
     if (m_procCount->text() != text)
         m_procCount->setText(text);
+}
+
+void MainWindow::applyWindowOwners(windows::ResultPtr result)
+{
+    if (!result || m_paused || m_shutdown)
+        return;
+    if (m_options.clock) {
+        // A result that cannot be placed on the clock, or claims to come
+        // from the future, cannot be judged for freshness.
+        if (!std::isfinite(result->time) || result->time - now() > 1.0)
+            return;
+    }
+    if (ps::isValid(m_ownersNewest) && std::isfinite(result->time) && result->time <= m_ownersNewest)
+        return; // no newer than one already applied
+    if (std::isfinite(result->time))
+        m_ownersNewest = result->time;
+    m_ownersAwaiting = false;
+    // An incomplete list cannot tell which processes own no window, so it
+    // counts as a failure: it neither replaces a complete list nor extends
+    // its validity.
+    if (result->complete())
+        m_ownersOk = std::move(result);
+    else
+        m_ownersFailure = std::move(result);
+    updateGrouping();
+    Q_EMIT windowOwnersApplied();
+}
+
+bool MainWindow::updateGrouping()
+{
+    if (m_paused)
+        return false; // frozen with the view
+    using State = ProcessGrouping::State;
+    ProcessGrouping g;
+    const double t = now();
+    const auto fresh = [&](const windows::Result& r) {
+        return !m_options.clock || (std::isfinite(r.time) && t <= r.time + r.validFor);
+    };
+    // No answer for this long after starting or resuming: stop saying
+    // "detecting".
+    constexpr double kPendingLimit = 5.0;
+    const bool awaiting = m_ownersAwaiting
+        && (!m_options.clock || !std::isfinite(m_ownersAwaitingSince) || t - m_ownersAwaitingSince <= kPendingLimit);
+    if (m_ownersOk && fresh(*m_ownersOk)) {
+        // A failure after a success does not cancel it while it is valid:
+        // one missed request should not reshuffle the list.
+        g.state = State::Detected;
+        g.source = windows::backendName(m_ownersOk->backend);
+        g.apps.reserve(m_ownersOk->owners.size());
+        for (const auto& o : m_ownersOk->owners)
+            g.apps.insert({o.pid, o.startTicks});
+    } else if (awaiting) {
+        g.state = State::Pending;
+    } else if (m_ownersFailure && (!m_ownersOk || !(m_ownersFailure->time <= m_ownersOk->time))) {
+        g.state = State::Unavailable;
+        g.reason = windows::describe(*m_ownersFailure);
+    } else if (m_ownersOk) {
+        g.state = State::Unavailable;
+        g.reason = QStringLiteral("The window list from %1 is out of date").arg(windows::backendName(m_ownersOk->backend));
+    } else {
+        g.state = State::Unavailable;
+        g.reason = m_probe ? QStringLiteral("The desktop has not answered") : QStringLiteral("App detection is off");
+    }
+    if (g == m_grouping)
+        return false;
+    m_grouping = std::move(g);
+    if (m_procModel && currentPage() == ProcessPage) {
+        m_procModel->setGrouping(m_grouping);
+        syncGroupExpansion();
+    }
+    updateGroupNote();
+    if (m_procCount)
+        updateProcessCount();
+    return true;
+}
+
+void MainWindow::updateGroupNote()
+{
+    if (!m_groupNote)
+        return;
+    const bool show = m_grouping.state == ProcessGrouping::State::Unavailable;
+    if (show) {
+        const QString text = QStringLiteral("App detection unavailable: %1. User processes are listed together "
+                                            "without deciding which are apps; kernel processes are still separate.")
+                                 .arg(m_grouping.reason.isEmpty() ? QStringLiteral("no window list") : m_grouping.reason);
+        if (m_groupNote->text() != text)
+            m_groupNote->setText(text);
+    }
+    if (m_groupNote->isVisibleTo(m_groupNote->parentWidget()) != show)
+        m_groupNote->setVisible(show);
+}
+
+void MainWindow::syncGroupExpansion()
+{
+    if (!m_procTable || !m_procProxy)
+        return;
+    const auto& want = m_procProxy->isFiltering() ? m_filterExpanded : m_groupExpanded;
+    m_syncingExpansion = true;
+    for (int g = 0; g < ProcessModel::GroupCount; ++g) {
+        const QModelIndex index = m_procProxy->groupIndex(static_cast<ProcessModel::Group>(g));
+        const bool expand = want[static_cast<std::size_t>(g)];
+        if (index.isValid() && m_procTable->isExpanded(index) != expand)
+            m_procTable->setExpanded(index, expand);
+    }
+    m_syncingExpansion = false;
+}
+
+void MainWindow::onGroupExpansion(const QModelIndex& index, bool expanded)
+{
+    if (m_syncingExpansion || !index.isValid() || index.parent().isValid()
+        || !index.data(ProcessModel::IsGroupRole).toBool())
+        return;
+    const int g = index.data(ProcessModel::GroupRole).toInt();
+    if (g < 0 || g >= ProcessModel::GroupCount)
+        return;
+    // While filtering, opening or closing a group only lasts until the
+    // filter is cleared.
+    if (m_procProxy->isFiltering()) {
+        m_filterExpanded[static_cast<std::size_t>(g)] = expanded;
+    } else {
+        m_groupExpanded[static_cast<std::size_t>(g)] = expanded;
+        saveGroupExpansion();
+    }
+}
+
+void MainWindow::saveGroupExpansion()
+{
+    m_settings->setValue(QStringLiteral("processView/expandApps"), m_groupExpanded[ProcessModel::Apps]);
+    m_settings->setValue(QStringLiteral("processView/expandBackground"), m_groupExpanded[ProcessModel::Background]);
+    m_settings->setValue(QStringLiteral("processView/expandKernel"), m_groupExpanded[ProcessModel::Kernel]);
+}
+
+void MainWindow::fitProcessNameColumn()
+{
+    if (!m_procTable || !m_procNameFitted)
+        return;
+    const QHeaderView* header = m_procTable->header();
+    int others = 0;
+    for (int c = 0; c < ProcessModel::ColumnCount; ++c)
+        if (c != ProcessModel::Name && !m_procTable->isColumnHidden(c))
+            others += header->sectionSize(c);
+    const int width = std::max(m_procNameMinWidth, m_procTable->viewport()->width() - others);
+    if (header->sectionSize(ProcessModel::Name) != width)
+        m_procTable->setColumnWidth(ProcessModel::Name, width);
+}
+
+bool MainWindow::processListShown() const
+{
+    const QWindow* handle = windowHandle();
+    return currentPage() == ProcessPage && isVisible() && !isMinimized() && handle && handle->isExposed();
+}
+
+void MainWindow::updateProbeVisibility()
+{
+    if (m_probe)
+        m_probe->setVisible(processListShown());
 }
 
 // ---------------------------------------------------------------------------
@@ -2707,6 +2983,7 @@ void MainWindow::checkStale()
     // Only a new, current snapshot (applySnapshot) clears staleness.
     if (overdue && !m_stale)
         setStale(true);
+    updateGrouping(); // a window list expires like a sample
     if (m_stale) {
         refreshCharts(); // the time axes keep moving, so the outage shows as a growing gap
         updateStatus();
@@ -2756,6 +3033,8 @@ void MainWindow::updateStatus()
         if (m_stale)
             text += QStringLiteral(" Samples had already stopped arriving before the pause, so current values stay "
                                    "unavailable.");
+    } else if (m_collector && !m_collector->startError().isEmpty()) {
+        text = m_collector->startError() + QStringLiteral(". Nothing is being collected; retrying automatically.");
     } else if (m_stale) {
         const double age = now() - m_lastAcquired;
         const double waited = now() - m_waitingSince;

@@ -34,7 +34,7 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QSignalSpy>
-#include <QTableView>
+#include <QTreeView>
 #include <QToolBar>
 #include <QTreeWidget>
 #include <QApplication>
@@ -1368,7 +1368,7 @@ QStringList checkDetailState(MainWindow& w, bool details)
     }
     w.showPage(MainWindow::ProcessPage);
     settle(10);
-    if (auto* table = w.findChild<QTableView*>(QStringLiteral("processTable"))) {
+    if (auto* table = w.findChild<QTreeView*>(QStringLiteral("processTable"))) {
         for (int c = 0; c < ProcessModel::ColumnCount; ++c) {
             const bool essential = c == ProcessModel::Pid || c == ProcessModel::Name || c == ProcessModel::Cpu ||
                                    c == ProcessModel::Memory;
@@ -1548,7 +1548,7 @@ void TestGraphUpgrade::mainWindowDetailsToggleKeepsSelectionsHistoryAndWarnings(
     auto* net = w.findChild<QComboBox*>(QStringLiteral("netSelector"));
     auto* list = w.findChild<QTreeWidget*>(QStringLiteral("sensorList"));
     auto* filter = w.findChild<QLineEdit*>(QStringLiteral("processFilter"));
-    auto* table = w.findChild<QTableView*>(QStringLiteral("processTable"));
+    auto* table = w.findChild<QTreeView*>(QStringLiteral("processTable"));
     auto* range = w.findChild<QComboBox*>(QStringLiteral("rangeCombo"));
     auto* temp = w.findChild<TimeChart*>(QStringLiteral("temperatureChart"));
     auto* cpu = w.findChild<TimeChart*>(QStringLiteral("cpuChart"));
@@ -1592,14 +1592,17 @@ void TestGraphUpgrade::mainWindowDetailsToggleKeepsSelectionsHistoryAndWarnings(
         s.net = net->currentData();
         s.range = range->currentData();
         s.filter = filter->text();
-        s.sortColumn = table->horizontalHeader()->sortIndicatorSection();
-        s.sortOrder = table->horizontalHeader()->sortIndicatorOrder();
+        s.sortColumn = table->header()->sortIndicatorSection();
+        s.sortOrder = table->header()->sortIndicatorOrder();
         s.temps = seriesKeys(temp);
         for (const auto& x : temp->series())
             s.tempVisuals.push_back(x.visual);
         s.samples = w.history().size();
         s.total = w.history().totalSamples();
-        s.rows = table->model()->rowCount();
+        // Process rows: the children of the three group rows.
+        s.rows = 0;
+        for (int g = 0; g < table->model()->rowCount(); ++g)
+            s.rows += table->model()->rowCount(table->model()->index(g, 0));
         s.window = cpu->windowSeconds();
         s.page = w.currentPage();
         s.legend = temp->isLegendVisible();

@@ -23,6 +23,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(PULSESCOPE_BUILD_TESTS "Build the Qt Test suites" ON)
 option(PULSESCOPE_WERROR "Treat compiler warnings as errors" OFF)
 set(PULSESCOPE_SANITIZE "" CACHE STRING "Semicolon separated sanitizers, e.g. address;undefined")
+set(PULSESCOPE_X11 AUTO CACHE STRING "X11 window-owner detection for the Apps group: AUTO, ON or OFF")
+set_property(CACHE PULSESCOPE_X11 PROPERTY STRINGS AUTO ON OFF)
+string(TOUPPER "${PULSESCOPE_X11}" pulsescope_x11_mode)
+if(NOT pulsescope_x11_mode MATCHES "^(AUTO|ON|OFF)$")
+    message(FATAL_ERROR "PULSESCOPE_X11 must be AUTO, ON or OFF, not '${PULSESCOPE_X11}'")
+endif()
+set(PULSESCOPE_X11 "${pulsescope_x11_mode}")
 
 find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Widgets)
 find_package(Threads REQUIRED)
@@ -42,8 +49,11 @@ if(PULSESCOPE_WERROR)
 endif()
 if(PULSESCOPE_SANITIZE)
     list(JOIN PULSESCOPE_SANITIZE "," _ps_sanitizers)
-    target_compile_options(pulsescope_flags INTERFACE -fsanitize=${_ps_sanitizers} -fno-omit-frame-pointer)
-    target_link_options(pulsescope_flags INTERFACE -fsanitize=${_ps_sanitizers})
+    # No recovery: a sanitizer report ends the process with an error, so a
+    # test run cannot pass while printing "runtime error:" lines.
+    target_compile_options(pulsescope_flags INTERFACE
+        -fsanitize=${_ps_sanitizers} -fno-sanitize-recover=all -fno-omit-frame-pointer)
+    target_link_options(pulsescope_flags INTERFACE -fsanitize=${_ps_sanitizers} -fno-sanitize-recover=all)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -82,12 +92,35 @@ add_library(pulsescope_ui STATIC
     src/app/processmodel.cpp
     src/app/processmodel.h
     src/app/timechart.cpp
-    src/app/timechart.h)
+    src/app/timechart.h
+    src/app/windowowners.cpp
+    src/app/windowowners.h)
 target_link_libraries(pulsescope_ui PUBLIC pulsescope_core Qt6::Widgets)
 target_compile_definitions(pulsescope_ui PUBLIC
     PULSESCOPE_VERSION="${PROJECT_VERSION}"
     PULSESCOPE_APP_ID="${PULSESCOPE_APP_ID}"
     QT_NO_KEYWORDS)
+
+# Optional: on an X11 session, window owners come from the window manager's
+# _NET_CLIENT_LIST and the X server's XRes client IDs (libxcb, libxcb-res).
+# Hyprland support needs no extra library.
+if(NOT PULSESCOPE_X11 STREQUAL "OFF")
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(PULSESCOPE_XCB IMPORTED_TARGET xcb xcb-res)
+    endif()
+    if(PULSESCOPE_XCB_FOUND)
+        target_link_libraries(pulsescope_ui PRIVATE PkgConfig::PULSESCOPE_XCB)
+        target_compile_definitions(pulsescope_ui PRIVATE PULSESCOPE_HAVE_X11)
+        message(STATUS "PulseScope: X11 window-owner detection enabled")
+    elseif(PULSESCOPE_X11 STREQUAL "ON")
+        message(FATAL_ERROR "PULSESCOPE_X11=ON needs pkg-config and the xcb and xcb-res development files")
+    else()
+        message(STATUS "PulseScope: X11 window-owner detection disabled (xcb or xcb-res not found)")
+    endif()
+else()
+    message(STATUS "PulseScope: X11 window-owner detection disabled (PULSESCOPE_X11=OFF)")
+endif()
 
 qt_add_executable(pulsescope src/app/main.cpp)
 target_link_libraries(pulsescope PRIVATE pulsescope_ui)
@@ -124,6 +157,16 @@ if(PULSESCOPE_BUILD_TESTS)
     find_package(Qt6 REQUIRED COMPONENTS Test)
     enable_testing()
     set(PULSESCOPE_ARTIFACT_DIR "${CMAKE_CURRENT_BINARY_DIR}/artifacts")
+    # The graph suite's fractional-scale children take several times longer
+    # under sanitizers (one alone can pass Qt Test's default 300 s limit for
+    # a test function, while the suite waits up to 1500 s for it); the other
+    # suites stay well inside 120 s either way.
+    if(PULSESCOPE_SANITIZE)
+        set(_ps_slow_test_timeout 3600)
+        set(_ps_slow_function_timeout_ms 1800000)
+    else()
+        set(_ps_slow_test_timeout 1800)
+    endif()
 
     function(pulsescope_add_test name)
         qt_add_executable(${name} tests/${name}.cpp ${ARGN})
@@ -134,24 +177,61 @@ if(PULSESCOPE_BUILD_TESTS)
             TIMEOUT 120)
     endfunction()
 
+    # Labels, per test binary:
+    #   unit     synthetic /proc and /sys trees, injected clocks, local test
+    #            sockets and at most the test's own /proc entries
+    #   ui       widgets, offscreen
+    #   host     also depends on this machine or session (its mount table, the
+    #            real /proc and /sys, process limits and privileges, the
+    #            user's Qt theme files), so results can differ between machines
+    #   live     only this host's real /proc and /sys
+    #   slow     several minutes
+    #   install  install-time files
+    # `-L unit -LE host` is the deterministic subset.
+
     # Core regression suite (parsers, metrics, history, sampler, collector,
-    # chart rendering), written and maintained by independent QA.
+    # chart rendering), written and maintained by independent QA. The
+    # official build has every widget header, so its widget and main-window
+    # cases must not compile away into skips.
     pulsescope_add_test(tst_adversarial)
+    target_compile_definitions(tst_adversarial PRIVATE PS_ADV_REQUIRE_FULL_UI=1)
+    set_tests_properties(tst_adversarial PROPERTIES LABELS "unit;host")
     # Focused cases for identity, escaping and overflow guarantees.
     pulsescope_add_test(tst_core)
+    set_tests_properties(tst_core PROPERTIES LABELS "unit;host")
     # Read-only checks against this host's real /proc and /sys.
     pulsescope_add_test(tst_live)
-    # Main window, process model and export, offscreen.
+    set_tests_properties(tst_live PROPERTIES LABELS "live;host")
+    # Main window, grouped process model, window-owner probe and export,
+    # offscreen.
     pulsescope_add_test(tst_ui)
+    set_tests_properties(tst_ui PROPERTIES LABELS "ui;host")
     # Graph animation, area fills, Details view and theme, written by
-    # independent QA.
+    # independent QA. It runs its frame-timing cases again at several device
+    # pixel ratios in child processes, and starts the application built here
+    # for its theme cases.
     pulsescope_add_test(tst_graph_upgrade)
+    add_dependencies(tst_graph_upgrade pulsescope)
+    set_property(TEST tst_graph_upgrade APPEND PROPERTY ENVIRONMENT "PS_GU_APP=$<TARGET_FILE:pulsescope>")
+    if(DEFINED _ps_slow_function_timeout_ms)
+        set_property(TEST tst_graph_upgrade APPEND PROPERTY ENVIRONMENT
+            "QTEST_FUNCTION_TIMEOUT=${_ps_slow_function_timeout_ms}")
+    endif()
+    set_tests_properties(tst_graph_upgrade PROPERTIES
+        LABELS "ui;host;slow"
+        TIMEOUT ${_ps_slow_test_timeout}
+        FAIL_REGULAR_EXPRESSION "application binary not found")
     add_test(NAME desktop_entry
         COMMAND ${CMAKE_COMMAND} -DPS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
             -DPS_WORK_DIR=${CMAKE_CURRENT_BINARY_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/desktopentry_test.cmake)
-    set_tests_properties(tst_live PROPERTIES LABELS "live")
-    set_tests_properties(tst_ui PROPERTIES LABELS "ui")
-    # Runs its frame-timing cases again at several device pixel ratios in
-    # child processes, several minutes in all.
-    set_tests_properties(tst_graph_upgrade PROPERTIES LABELS "ui" TIMEOUT 1800)
+    set_tests_properties(desktop_entry PROPERTIES LABELS "unit;install")
+    # Process groups, window-owner parsing, probe and grouped model, written
+    # by independent QA.
+    pulsescope_add_test(tst_process_groups)
+    set_tests_properties(tst_process_groups PROPERTIES LABELS "ui;unit")
+    # Read-cap, process timing, metadata refresh and thread-start failure
+    # (in child processes that lower their own RLIMIT_NPROC), written by
+    # independent QA.
+    pulsescope_add_test(tst_council)
+    set_tests_properties(tst_council PROPERTIES LABELS "unit;host")
 endif()

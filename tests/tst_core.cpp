@@ -8,6 +8,8 @@
 #include <QTemporaryDir>
 #include <QtTest/QtTest>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -98,6 +100,8 @@ private Q_SLOTS:
     void skewedCounterReadsGiveNoRates();
     void injectedProbeMountIdIsVerified();
     void productionProbeVerifiesMountIdentity();
+    void readCapsAreExact();
+    void processMetadataRefreshIsBoundedAndHonest();
 };
 
 void TestCore::escapeNameIsInjectiveAndPrintable()
@@ -272,22 +276,28 @@ void TestCore::skewedCounterReadsGiveNoRates()
     f.write("proc/42/cmdline", "app"s + '\0');
 
     // sample() reads the stopwatch at its start, right after the last
-    // counter read and at its end; readOffset is the middle reading.
+    // counter read, around each process read and at its end. Everything
+    // after the start is delayed by readOffset, as if the first counter read
+    // had been slow.
     int calls = 0;
+    int sampleNo = 0;
+    bool atStart = true;
     double readOffset = 0;
     auto o = f.options(true);
     o.stopwatch = [&] {
-        const int k = calls++;
-        const double base = 100.0 * (k / 3);
-        switch (k % 3) {
-        case 0: return base;
-        case 1: return base + readOffset;
-        default: return base + readOffset + 0.002;
+        ++calls;
+        const double base = 100.0 * sampleNo;
+        if (atStart) {
+            atStart = false;
+            return base;
         }
+        return base + readOffset;
     };
     ps::Sampler smp(o);
     auto sampleAt = [&](int step, double offset) {
         readOffset = offset;
+        sampleNo = step;
+        atStart = true;
         const auto n = static_cast<uint64_t>(step);
         f.write("proc/stat", "cpu " + std::to_string(10 * n) + " 0 0 " + std::to_string(100 + 90 * n)
                                  + " 0 0 0 0 0 0\ncpu0 " + std::to_string(10 * n) + " 0 0 "
@@ -346,7 +356,7 @@ void TestCore::skewedCounterReadsGiveNoRates()
     expectRates(sampleAt(4, 0.330), true, "consistently late reads"); // both ends shifted alike
     expectRates(sampleAt(5, 0.030), false, "early reads");
     expectRates(sampleAt(6, 0.030), true, "recovered");
-    QCOMPARE(calls, 18);
+    QVERIFY(calls >= 6 * 3);
 }
 
 void TestCore::injectedProbeMountIdIsVerified()
@@ -432,6 +442,114 @@ void TestCore::productionProbeVerifiesMountIdentity()
                      qPrintable(QStringLiteral("%1: \"%2\"").arg(v.name, QString::fromStdString(fsys.error))));
         }
     }
+}
+
+void TestCore::readCapsAreExact()
+{
+    // Small files (4096-byte cap): exactly the cap is the whole file; one
+    // byte more makes it unreadable rather than a prefix.
+    Fixture f;
+    f.writeBase();
+    ps::Sampler smp(f.options());
+    const std::string load = "0.50 0.20 0.30 1/10 99\n";
+    f.write("proc/loadavg", load + std::string(4096 - load.size(), ' '));
+    auto s = smp.sample(1, 1);
+    QCOMPARE(s.load1, 0.5);
+    f.write("proc/loadavg", load + std::string(4097 - load.size(), ' '));
+    s = smp.sample(2, 1);
+    QVERIFY2(std::isnan(s.load1), qPrintable(QString::number(s.load1)));
+    // A table past the 8 MiB cap is reported as such, not parsed; one of
+    // exactly 8 MiB is read.
+    const auto has = [&](const std::string& text) {
+        return std::find(s.problems.begin(), s.problems.end(), text) != s.problems.end();
+    };
+    const std::string header = "Inter-|\n face |\n";
+    f.write("proc/loadavg", load);
+    f.write("proc/net/dev", header + std::string((std::size_t(8) << 20) + 1 - header.size(), ' '));
+    s = smp.sample(3, 1);
+    QCOMPARE(s.load1, 0.5);
+    QVERIFY(has("/proc/net/dev larger than 8 MiB; not read"));
+    f.write("proc/net/dev", header + std::string((std::size_t(8) << 20) - header.size(), ' '));
+    s = smp.sample(4, 1);
+    QVERIFY(!has("/proc/net/dev larger than 8 MiB; not read"));
+    QVERIFY(!has("/proc/net/dev unreadable"));
+}
+
+void TestCore::processMetadataRefreshIsBoundedAndHonest()
+{
+    Fixture f;
+    f.writeBase();
+    const auto writeMeta = [&](uint32_t uid, const std::string& arg) {
+        f.write("proc/42/status", "Name:\tapp\nUid:\t" + std::to_string(uid) + "\t0\t0\t0\n");
+        f.write("proc/42/cmdline", "app"s + '\0' + arg + '\0');
+    };
+    ps::Sampler smp(f.options(true));
+    const auto sampleAt = [&](int k) {
+        const auto n = static_cast<uint64_t>(k);
+        f.write("proc/stat", "cpu " + std::to_string(50 * n) + " 0 0 " + std::to_string(100 + 50 * n)
+                                 + " 0 0 0 0 0 0\ncpu0 " + std::to_string(50 * n) + " 0 0 "
+                                 + std::to_string(100 + 50 * n) + " 0 0 0 0 0 0\n");
+        f.write("proc/42/stat", pidStat(42, 50 * n, 0));
+        return smp.sample(k, 1);
+    };
+    const auto app = [](const ps::Snapshot& s) -> const ps::ProcessInfo* {
+        for (const auto& p : s.processes)
+            if (p.pid == 42)
+                return &p;
+        return nullptr;
+    };
+
+    writeMeta(1000, "--old");
+    auto s = sampleAt(1);
+    QVERIFY(app(s) && app(s)->uidKnown);
+    QCOMPARE(app(s)->user, "1000"s);
+    QCOMPARE(app(s)->command, "app --old"s);
+
+    // setuid() plus an argv rewrite: same PID, start time and name. The
+    // change shows within two refresh periods (5 s each, staggered), and
+    // until then the previous reading is kept rather than blanked.
+    writeMeta(1001, "--new");
+    int refreshedAt = 0;
+    for (int k = 2; k <= 12 && !refreshedAt; ++k) {
+        s = sampleAt(k);
+        const auto* p = app(s);
+        QVERIFY(p && p->uidKnown);
+        QCOMPARE(p->cpuPercent, 50.0); // the identity and its baseline continue
+        if (p->user == "1001") {
+            QCOMPARE(p->command, "app --new"s);
+            refreshedAt = k;
+        } else {
+            QCOMPARE(p->user, "1000"s);
+            QCOMPARE(p->command, "app --old"s);
+        }
+    }
+    QVERIFY2(refreshedAt > 0 && refreshedAt <= 11, qPrintable(QString::number(refreshedAt)));
+
+    // A refresh that fails is shown as unknown, not as the old values, and
+    // is retried at the next scan.
+    fs::remove(f.path("proc/42/status"));
+    fs::remove(f.path("proc/42/cmdline"));
+    int failedAt = 0;
+    for (int k = refreshedAt + 1; k <= refreshedAt + 6 && !failedAt; ++k) {
+        s = sampleAt(k);
+        const auto* p = app(s);
+        QVERIFY(p);
+        QCOMPARE(p->cpuPercent, 50.0);
+        if (!p->uidKnown) {
+            QCOMPARE(p->user, ""s);
+            QCOMPARE(p->command, "[app]"s);
+            failedAt = k;
+        } else {
+            QCOMPARE(p->user, "1001"s);
+        }
+    }
+    QVERIFY2(failedAt > 0, "the due refresh never happened");
+    writeMeta(1002, "--again");
+    s = sampleAt(failedAt + 1);
+    QVERIFY(app(s) && app(s)->uidKnown);
+    QCOMPARE(app(s)->user, "1002"s);
+    QCOMPARE(app(s)->command, "app --again"s);
+    QCOMPARE(app(s)->cpuPercent, 50.0);
 }
 
 QTEST_APPLESS_MAIN(TestCore)

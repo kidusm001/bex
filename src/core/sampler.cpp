@@ -17,6 +17,7 @@
 #include <cstring>
 #include <ctime>
 #include <mutex>
+#include <system_error>
 #include <thread>
 
 #include <dirent.h>
@@ -31,9 +32,13 @@ namespace ps {
 
 namespace {
 
-// Reads a whole (small) file. Returns false with errOut set on failure.
+constexpr std::size_t kTableReadCap = std::size_t(8) << 20;
+
+// Reads a whole (small) file of at most maxBytes. Returns false with errOut
+// set on failure, including EFBIG for a longer file: a prefix is never
+// passed off as the whole file. At most maxBytes + 1 bytes are kept.
 bool readFile(const std::string& path, std::string& out, int* errOut = nullptr,
-              std::size_t maxBytes = 8u << 20)
+              std::size_t maxBytes = kTableReadCap)
 {
     out.clear();
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOCTTY);
@@ -42,23 +47,40 @@ bool readFile(const std::string& path, std::string& out, int* errOut = nullptr,
             *errOut = errno;
         return false;
     }
+    const auto failWith = [&](int err) {
+        ::close(fd);
+        out.clear();
+        if (errOut)
+            *errOut = err;
+        return false;
+    };
     char buf[16384];
-    while (out.size() < maxBytes) {
-        const ssize_t n = ::read(fd, buf, sizeof buf);
+    for (;;) {
+        // One byte past the cap tells a file of exactly maxBytes from a
+        // longer one.
+        const std::size_t want = std::min(sizeof buf, maxBytes + 1 - out.size());
+        const ssize_t n = ::read(fd, buf, want);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            if (errOut)
-                *errOut = errno;
-            ::close(fd);
-            return false;
+            return failWith(errno);
         }
         if (n == 0)
             break;
         out.append(buf, static_cast<std::size_t>(n));
+        if (out.size() > maxBytes)
+            return failWith(EFBIG);
     }
     ::close(fd);
     return true;
+}
+
+// "/proc/diskstats unreadable", or why not for an oversized table.
+std::string tableProblem(const std::string& name, int err)
+{
+    if (err == EFBIG)
+        return name + " larger than " + std::to_string(kTableReadCap >> 20) + " MiB; not read";
+    return name + " unreadable";
 }
 
 std::string readTrimmed(const std::string& path, int* errOut = nullptr)
@@ -322,9 +344,26 @@ public:
         return m_state->pending || m_state->running;
     }
 
-    // Queues a batch unless one is outstanding. Returns false when busy.
+    // Queues a batch unless one is outstanding. Returns false when busy or
+    // when the thread cannot be created (startError() then says why; creation
+    // is retried on later calls, backing off from 1 s to 30 s).
     bool submit(std::vector<Job> jobs, double time)
     {
+        if (!m_thread.joinable()) {
+            if (m_startError != 0 && time < m_retryAt)
+                return false;
+            try {
+                m_thread = std::thread(&FsProber::run, m_state);
+            } catch (const std::system_error& e) {
+                // e.g. EAGAIN at RLIMIT_NPROC or the cgroup's pids.max
+                m_startError = e.code().value() != 0 ? e.code().value() : EAGAIN;
+                m_startFailures = std::min(m_startFailures + 1, 6);
+                m_retryAt = time + std::min(30.0, double(1 << (m_startFailures - 1)));
+                return false;
+            }
+            m_startError = 0;
+            m_startFailures = 0;
+        }
         {
             std::lock_guard lock(m_state->mutex);
             if (m_state->pending || m_state->running)
@@ -333,11 +372,12 @@ public:
             m_state->jobTime = time;
             m_state->pending = true;
         }
-        if (!m_thread.joinable())
-            m_thread = std::thread(&FsProber::run, m_state);
         m_state->cv.notify_all();
         return true;
     }
+
+    // errno of the last failed thread creation, 0 once the thread runs.
+    int startError() const { return m_startError; }
 
     void waitIdle(int ms)
     {
@@ -487,6 +527,9 @@ private:
 
     std::shared_ptr<State> m_state;
     std::thread m_thread;
+    int m_startError = 0;
+    int m_startFailures = 0;
+    double m_retryAt = 0;
 };
 
 double monotonicSeconds()
@@ -527,14 +570,30 @@ double Sampler::readSkewLimit(double expectedInterval)
     return std::max(0.05, 0.1 * e);
 }
 
+double Sampler::stopwatch() const
+{
+    if (m_opt.stopwatch)
+        return m_opt.stopwatch();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+Sampler::ReadTime Sampler::readTime(double before, double after) const
+{
+    return {(before + after) / 2.0 - m_sampleStarted, (after - before) / 2.0};
+}
+
+bool Sampler::sameTiming(const ReadTime& a, const ReadTime& b) const
+{
+    // Where within each call the kernel took its reading is unknown, so the
+    // calls' half-widths count against the limit too. NaN fails.
+    return std::fabs(a.at - b.at) + a.spread + b.spread <= m_skewLimit;
+}
+
 Snapshot Sampler::sample(double now, double expectedInterval)
 {
-    const auto stopwatch = [this] {
-        if (m_opt.stopwatch)
-            return m_opt.stopwatch();
-        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    };
     const double started = stopwatch();
+    m_sampleStarted = started;
+    m_skewLimit = readSkewLimit(expectedInterval);
     Snapshot s;
     s.sequence = ++m_sequence;
     s.time = now;
@@ -560,7 +619,7 @@ Snapshot Sampler::sample(double now, double expectedInterval)
     const double skew = std::fabs(readOffset - m_prevReadOffset);
     m_prevReadOffset = readOffset;
     bool rateBaseline = baseline;
-    if (baseline && !(skew <= readSkewLimit(expectedInterval))) {
+    if (baseline && !(skew <= m_skewLimit)) {
         rateBaseline = false;
         for (auto& d : s.disks)
             d.readBps = d.writeBps = d.busyPercent = kNaN;
@@ -596,8 +655,9 @@ Snapshot Sampler::sample(double now, double expectedInterval)
 void Sampler::sampleCpu(Snapshot& s, bool baseline)
 {
     std::string text;
-    if (!readFile(m_opt.procRoot + "/stat", text)) {
-        s.problems.emplace_back("/proc/stat unreadable");
+    int err = 0;
+    if (!readFile(m_opt.procRoot + "/stat", text, &err)) {
+        s.problems.push_back(tableProblem("/proc/stat", err));
         m_prevCpuAggregate.reset();
         m_prevCores.clear();
         for (int idx : m_knownCores)
@@ -660,8 +720,9 @@ void Sampler::sampleCpu(Snapshot& s, bool baseline)
 void Sampler::sampleMemory(Snapshot& s)
 {
     std::string text;
-    if (!readFile(m_opt.procRoot + "/meminfo", text)) {
-        s.problems.emplace_back("/proc/meminfo unreadable");
+    int err = 0;
+    if (!readFile(m_opt.procRoot + "/meminfo", text, &err)) {
+        s.problems.push_back(tableProblem("/proc/meminfo", err));
         return;
     }
     s.memory = metrics::memoryFromRaw(parse::parseMeminfo(text));
@@ -686,8 +747,9 @@ void Sampler::sampleLoad(Snapshot& s)
 void Sampler::sampleDisks(Snapshot& s, bool baseline, double elapsed)
 {
     std::string text;
-    if (!readFile(m_opt.procRoot + "/diskstats", text)) {
-        s.problems.emplace_back("/proc/diskstats unreadable");
+    int err = 0;
+    if (!readFile(m_opt.procRoot + "/diskstats", text, &err)) {
+        s.problems.push_back(tableProblem("/proc/diskstats", err));
         m_disks.clear();
         return;
     }
@@ -773,8 +835,9 @@ void Sampler::sampleDisks(Snapshot& s, bool baseline, double elapsed)
 void Sampler::sampleNetwork(Snapshot& s, bool baseline, double elapsed)
 {
     std::string text;
-    if (!readFile(m_opt.procRoot + "/net/dev", text)) {
-        s.problems.emplace_back("/proc/net/dev unreadable");
+    int err = 0;
+    if (!readFile(m_opt.procRoot + "/net/dev", text, &err)) {
+        s.problems.push_back(tableProblem("/proc/net/dev", err));
         m_nets.clear();
         return;
     }
@@ -844,8 +907,9 @@ void Sampler::prepareFilesystems(Snapshot& s, double now)
     m_fsGroups.clear();
     m_fsTargets.clear();
     std::string text;
-    if (!readFile(m_opt.procRoot + "/self/mountinfo", text)) {
-        s.problems.emplace_back("/proc/self/mountinfo unreadable");
+    int err = 0;
+    if (!readFile(m_opt.procRoot + "/self/mountinfo", text, &err)) {
+        s.problems.push_back(tableProblem("/proc/self/mountinfo", err));
         return;
     }
     const auto table = parse::parseMountInfo(text);
@@ -963,7 +1027,12 @@ void Sampler::finishFilesystems(Snapshot& s, double now, double expectedInterval
         const bool usable = it != m_fsCache.end() && it->second.id == t.id && now - it->second.time <= staleAfter
             && now >= it->second.time;
         if (!usable) {
-            fs.error = stuck ? "not responding (capacity check blocked)" : "measuring";
+            if (stuck)
+                fs.error = "not responding (capacity check blocked)";
+            else if (const int err = m_prober->startError())
+                fs.error = std::string("capacity check could not start (") + std::strerror(err) + ")";
+            else
+                fs.error = "measuring";
             continue;
         }
         const auto& c = it->second;
@@ -1206,7 +1275,11 @@ void Sampler::sampleProcesses(Snapshot& s, bool baseline, double elapsed, double
 
     char buf[4097];
     constexpr double kIoRetrySeconds = 15.0;
+    constexpr double kMetadataRefreshSeconds = 5.0;
+    constexpr double kInf = std::numeric_limits<double>::infinity();
     const int cpus = std::max(1, s.logicalCpus);
+    int driftedCount = 0;
+    double maxDrift = 0;
     while (const dirent* e = ::readdir(dir)) {
         const char* name = e->d_name;
         bool numeric = name[0] != '\0';
@@ -1225,7 +1298,9 @@ void Sampler::sampleProcesses(Snapshot& s, bool baseline, double elapsed, double
             int fd;
             ~FdCloser() { ::close(fd); }
         } closer {pidfd};
+        const double statBefore = stopwatch();
         ssize_t len = readAt(pidfd, "stat", buf, sizeof buf - 1, nullptr);
+        const ReadTime statTime = readTime(statBefore, stopwatch());
         if (len <= 0)
             continue;
         const auto st = parse::parsePidStat(std::string_view(buf, static_cast<std::size_t>(len)));
@@ -1237,25 +1312,43 @@ void Sampler::sampleProcesses(Snapshot& s, bool baseline, double elapsed, double
         // if its counters happen to be larger than the old process's.
         const bool fresh = ps.seenScan == 0 || ps.startTicks != st->startTime;
         const bool execed = !fresh && ps.comm != st->comm;
+        const bool kernel = (st->flags & parse::kPfKthread) != 0;
         if (fresh)
             ps = ProcState{};
         if (fresh || execed) {
             ps.startTicks = st->startTime;
             ps.comm = st->comm;
             ps.ioDenied = false;
+        }
+        // The real UID (setuid) and the command line (setproctitle, an exec
+        // keeping the name) can change without a new identity, so they are
+        // re-read on a staggered cadence. A failed read is shown as unknown,
+        // not as the previous value, and is retried at the next scan.
+        if (fresh || execed || !(now < ps.metaDueAt)) {
+            bool ok = false;
             len = readAt(pidfd, "status", buf, sizeof buf - 1, nullptr);
             ps.uidKnown = false;
             if (len > 0) {
                 if (const auto uid = parse::parseStatusRealUid(std::string_view(buf, static_cast<std::size_t>(len)))) {
                     ps.uid = *uid;
                     ps.uidKnown = true;
+                    ok = true;
                 }
             }
             ps.user = ps.uidKnown ? userFor(ps.uid) : std::string();
             len = readAt(pidfd, "cmdline", buf, sizeof buf - 1, nullptr);
+            ok = ok && len >= 0; // empty is valid: kernel threads and zombies
             ps.command = len > 0 ? parse::parseCmdline(std::string_view(buf, static_cast<std::size_t>(len))) : std::string();
             if (ps.command.empty())
                 ps.command = "[" + st->comm + "]";
+            if (!ok)
+                ps.metaDueAt = now;
+            else if (kernel)
+                ps.metaDueAt = kInf; // no UID or command line of their own to change
+            else if (fresh)
+                ps.metaDueAt = now + kMetadataRefreshSeconds * (1.0 + static_cast<double>(st->pid % 16) / 16.0);
+            else
+                ps.metaDueAt = now + kMetadataRefreshSeconds;
         }
         ps.seenScan = m_scanNo;
 
@@ -1264,7 +1357,7 @@ void Sampler::sampleProcesses(Snapshot& s, bool baseline, double elapsed, double
         p.ppid = st->ppid;
         p.startTicks = st->startTime;
         p.state = st->state;
-        p.kernelThread = (st->flags & parse::kPfKthread) != 0;
+        p.kernelThread = kernel;
         p.threads = static_cast<int>(std::min<int64_t>(st->numThreads, INT32_MAX));
         p.nice = static_cast<int>(std::clamp<int64_t>(st->nice, -100, 100));
         p.name = st->comm;
@@ -1285,16 +1378,36 @@ void Sampler::sampleProcesses(Snapshot& s, bool baseline, double elapsed, double
         // clears the baseline so the next sample cannot delta against it.
         const bool ticksOk = st->utime <= UINT64_MAX - st->stime;
         const uint64_t ticks = ticksOk ? st->utime + st->stime : 0;
-        if (baseline && ps.hasPrev && ps.hasCpu && ticksOk && !fresh)
-            p.cpuPercent = metrics::processCpuPercent(ps.cpuTicks, ticks, elapsed, m_clockTicks, cpus);
+        // Rates divide by the sample interval, so this process's counters
+        // must have been read at the same point of the sample as last time.
+        // A delay inside the scan (a slow read, an earlier process's user
+        // lookup, preemption) is not seen by the counter-skew check in
+        // sample(); such an interval is withheld here and the new reading
+        // becomes the baseline.
+        bool drifted = false;
+        const auto noteDrift = [&](const ReadTime& a, const ReadTime& b) {
+            drifted = true;
+            const double d = std::fabs(a.at - b.at) + a.spread + b.spread;
+            if (std::isfinite(d))
+                maxDrift = std::max(maxDrift, d);
+        };
+        if (baseline && ps.hasPrev && ps.hasCpu && ticksOk && !fresh) {
+            if (sameTiming(statTime, ps.statTime))
+                p.cpuPercent = metrics::processCpuPercent(ps.cpuTicks, ticks, elapsed, m_clockTicks, cpus);
+            else
+                noteDrift(statTime, ps.statTime);
+        }
         ps.cpuTicks = ticks;
         ps.hasCpu = ticksOk;
+        ps.statTime = statTime;
 
         // Access to /proc/PID/io can change (setuid, prctl dumpable), so a
         // denial is retried on a slow cadence; recovery starts a new baseline.
         if (!p.kernelThread && (!ps.ioDenied || now >= ps.ioRetryAt)) {
             int err = 0;
+            const double ioBefore = stopwatch();
             len = readAt(pidfd, "io", buf, sizeof buf - 1, &err);
+            const ReadTime ioTime = readTime(ioBefore, stopwatch());
             if (len < 0 && (err == EACCES || err == EPERM)) {
                 ps.ioDenied = true;
                 ps.ioRetryAt = now + kIoRetrySeconds;
@@ -1303,11 +1416,16 @@ void Sampler::sampleProcesses(Snapshot& s, bool baseline, double elapsed, double
                 ps.ioDenied = false;
                 if (const auto io = parse::parsePidIo(std::string_view(buf, static_cast<std::size_t>(len)))) {
                     if (baseline && ps.hasPrev && ps.hasIo && !fresh) {
-                        p.ioReadBps = metrics::rate(metrics::counterDelta(ps.ioRead, io->readBytes), elapsed);
-                        p.ioWriteBps = metrics::rate(metrics::counterDelta(ps.ioWrite, io->writeBytes), elapsed);
+                        if (sameTiming(ioTime, ps.ioTime)) {
+                            p.ioReadBps = metrics::rate(metrics::counterDelta(ps.ioRead, io->readBytes), elapsed);
+                            p.ioWriteBps = metrics::rate(metrics::counterDelta(ps.ioWrite, io->writeBytes), elapsed);
+                        } else {
+                            noteDrift(ioTime, ps.ioTime);
+                        }
                     }
                     ps.ioRead = io->readBytes;
                     ps.ioWrite = io->writeBytes;
+                    ps.ioTime = ioTime;
                     ps.hasIo = true;
                 } else {
                     ps.hasIo = false;
@@ -1318,11 +1436,17 @@ void Sampler::sampleProcesses(Snapshot& s, bool baseline, double elapsed, double
         }
         p.ioDenied = ps.ioDenied;
         ps.hasPrev = true;
+        driftedCount += drifted ? 1 : 0;
 
         s.threadCount += p.threads;
         s.processes.push_back(std::move(p));
     }
     ::closedir(dir);
+    if (driftedCount > 0)
+        s.problems.push_back("rates of " + std::to_string(driftedCount)
+                             + (driftedCount == 1 ? " process (reads were " : " processes (reads up to ")
+                             + std::to_string(std::lround(std::min(maxDrift, 1e6) * 1000.0))
+                             + " ms off their usual timing)");
 
     for (auto it = m_procs.begin(); it != m_procs.end();)
         it = it->second.seenScan == m_scanNo ? std::next(it) : m_procs.erase(it);

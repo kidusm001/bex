@@ -43,7 +43,7 @@
 #include <QHeaderView>
 #include <QLabel>
 #include <QSplitter>
-#include <QTableView>
+#include <QTreeView>
 #include <QTreeWidget>
 #endif
 #include <QApplication>
@@ -51,6 +51,9 @@
 #include <QImage>
 #include <QKeyEvent>
 #include <QMouseEvent>
+#endif
+#if defined(PS_ADV_REQUIRE_FULL_UI) && !(defined(PS_ADV_WIDGETS) && defined(PS_ADV_METRICBUTTON) && defined(PS_ADV_MAINWINDOW))
+#error "official full-UI test build: QtWidgets or a required app header is missing, so widget and main-window cases would silently become skips"
 #endif
 #include <QPointer>
 #include <QSignalSpy>
@@ -4727,15 +4730,20 @@ void TestAdversarial::mainWindowStaleThenPauseDoesNotResurrect()
     w.showPage(MainWindow::ProcessPage);
     auto* fs = w.findChild<QTreeWidget*>(QStringLiteral("filesystemTable"));
     auto* sensors = w.findChild<QTreeWidget*>(QStringLiteral("sensorList"));
-    auto* procs = w.findChild<QTableView*>(QStringLiteral("processTable"));
+    auto* procs = w.findChild<QTreeView*>(QStringLiteral("processTable"));
     auto* cpuChart = w.findChild<TimeChart*>(QStringLiteral("cpuChart"));
     auto* procCount = w.findChild<QLabel*>(QStringLiteral("processCount"));
     QVERIFY(fs && sensors && procs && cpuChart && procCount);
+    // Processes are children of the Apps/Background/Kernel group rows; the
+    // group PID 400 lands in depends on app detection, so search them all.
     auto procCell = [&](int column) {
         const auto* m = procs->model();
-        for (int row = 0; row < m->rowCount(); ++row)
-            if (m->data(m->index(row, ProcessModel::Pid)).toInt() == 400)
-                return m->data(m->index(row, column)).toString();
+        for (int g = 0; g < m->rowCount(); ++g) {
+            const QModelIndex group = m->index(g, 0);
+            for (int row = 0; row < m->rowCount(group); ++row)
+                if (m->data(m->index(row, ProcessModel::Pid, group)).toInt() == 400)
+                    return m->data(m->index(row, column, group)).toString();
+        }
         return QStringLiteral("<no row>");
     };
     auto fsCell = [&](int c) { return fs->topLevelItemCount() ? fs->topLevelItem(0)->text(c) : QStringLiteral("<no row>"); };
@@ -5040,15 +5048,24 @@ void TestAdversarial::mainWindowElidedIdentitiesHaveFullTooltips()
         problems << QStringLiteral("network nav full rates not in tooltip/description: value=\"%1\" tip=\"%2\"")
                         .arg(value, netNav->toolTip());
 
-    auto* procs = w.findChild<QTableView*>(QStringLiteral("processTable"));
+    auto* procs = w.findChild<QTreeView*>(QStringLiteral("processTable"));
     QVERIFY(procs);
     for (int c : {int(ProcessModel::Name), int(ProcessModel::User), int(ProcessModel::Command)})
-        if (procs->horizontalHeader()->sectionResizeMode(c) == QHeaderView::Fixed)
+        if (procs->header()->sectionResizeMode(c) == QHeaderView::Fixed)
             problems << QStringLiteral("process column %1 not resizable").arg(c);
     w.showPage(MainWindow::ProcessPage);
+    // One process, as the only child of one of the three group rows.
     const auto* m = procs->model();
-    QVERIFY(m->rowCount() == 1);
-    if (m->data(m->index(0, ProcessModel::Command), Qt::ToolTipRole).toString() != QString::fromStdString(longCmd))
+    QModelIndex only;
+    int processes = 0;
+    for (int g = 0; g < m->rowCount(); ++g) {
+        const QModelIndex group = m->index(g, 0);
+        processes += m->rowCount(group);
+        if (m->rowCount(group) > 0 && !only.isValid())
+            only = m->index(0, ProcessModel::Command, group);
+    }
+    QVERIFY(processes == 1 && only.isValid());
+    if (m->data(only, Qt::ToolTipRole).toString() != QString::fromStdString(longCmd))
         problems << QStringLiteral("command tooltip is not the full command line");
     QVERIFY2(problems.isEmpty(), qPrintable(problems.join(QStringLiteral("; "))));
 #endif

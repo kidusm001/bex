@@ -11,15 +11,18 @@ graphs and current values for:
 - **Network**: receive and transmit throughput per interface.
 - **Temperatures**: every hwmon and thermal-zone sensor the kernel exposes, in
   °C.
-- **Processes**: a filterable, sortable, read-only table of PID, name, user,
-  CPU, resident memory, threads, state, nice, disk I/O, age and command line.
+- **Processes**: a filterable, sortable, read-only list of PID, name, user,
+  CPU, resident memory, threads, state, nice, disk I/O, age and command line,
+  grouped like a task manager into apps, background processes and kernel
+  processes.
 
 Each page opens in a Simple view that reads at a glance: the main value, one
 filled graph and a short summary. **Details** (Ctrl+D) adds every other
 reading. Graphs scroll smoothly between samples.
 
 It reads `/proc` and `/sys` directly. It needs no root, no daemon, no helper
-processes, no network access and no dependencies beyond Qt.
+processes, no network access and no dependencies beyond Qt (plus, optionally,
+libxcb for telling apps apart on X11).
 
 ## Requirements
 
@@ -28,17 +31,21 @@ processes, no network access and no dependencies beyond Qt.
 - A C++20 compiler: GCC 11 or newer, or Clang 14 or newer.
 - CMake 3.21 or newer. Ninja is optional but recommended.
 - Qt 6.4 or newer: Core, Gui and Widgets, plus Test for the test suites.
+- Optional: `xcb` and `xcb-res` (libxcb 1.14 or newer, found with
+  `pkg-config`) to find app windows on X11. Without them PulseScope builds
+  and runs the same, and on X11 the Processes page says app detection is
+  unavailable. Hyprland needs nothing extra.
 
 ### Arch Linux
 
 ```sh
-sudo pacman -S --needed base-devel cmake ninja qt6-base
+sudo pacman -S --needed base-devel cmake ninja qt6-base libxcb
 ```
 
 ### Debian 12+ / Ubuntu 24.04+
 
 ```sh
-sudo apt install build-essential cmake ninja-build qt6-base-dev
+sudo apt install build-essential cmake ninja-build qt6-base-dev libxcb1-dev libxcb-res0-dev
 ```
 
 `qt6-base-dev` includes the Qt Test module. Ubuntu 22.04 ships Qt 6.2, which
@@ -46,7 +53,8 @@ is too old: use a newer release, or install Qt 6.4 or newer from another
 source. The configure step checks the Qt version and stops if it is too old.
 
 Running PulseScope needs only the Qt runtime libraries (`qt6-base` on Arch;
-`libqt6widgets6` on Debian/Ubuntu) and a Qt platform plugin for your session.
+`libqt6widgets6` on Debian/Ubuntu), `libxcb` and `libxcb-res` if it was built
+with them, and a Qt platform plugin for your session.
 Wayland and X11 both work. On Debian/Ubuntu Wayland sessions,
 `qt6-wayland` gives native Wayland windows; without it, Qt falls back to
 XWayland.
@@ -76,21 +84,45 @@ The test suites:
 | `tst_adversarial` | Parsers, delta math, history, the sampler over synthetic `/proc` and `/sys` trees, the collector thread, chart and widget rendering |
 | `tst_core` | Identity, escaping and overflow guarantees |
 | `tst_live` | Read-only invariants against this host's real `/proc` and `/sys`. It never assumes the host has any particular sensor, disk or interface. |
-| `tst_ui` | The main window, Simple and Details views, process model, CSV export, frame driver, cached graph drawing and theme selection, run offscreen with isolated settings |
+| `tst_ui` | The main window, Simple and Details views, grouped process list, CSV export, frame driver, cached graph drawing and theme selection, run offscreen with isolated settings |
+| `tst_process_groups` | Grouping processes into apps, background and kernel: the compositor reply parser, identity checks against synthetic `/proc` trees, the window probe thread and the grouped model |
+| `tst_council` | Review regressions: a capped read is not a complete table, per-process read timing, refreshing process metadata, worker threads that cannot start, and per-core graph accessibility |
 | `tst_graph_upgrade` | Smooth scrolling between samples, area fills, gaps and signed temperatures in the drawn pixels, and that animation never changes measurements |
 | `desktop_entry` | Escaping of the installed desktop entry's `Exec` line |
 
 - CTest runs the Qt tests with `QT_QPA_PLATFORM=offscreen`, so they need no
   display and never open windows on your desktop.
 - Screenshots and other test output go to `build/<dir>/artifacts/`.
-- `-L live` or `-L ui` selects one group, for example
-  `ctest --test-dir build/debug -L ui`.
+- Each test carries labels, and `-L` or `-LE` selects by them:
+
+  | Label | Meaning | Tests |
+  | --- | --- | --- |
+  | `unit` | Synthetic `/proc` and `/sys` trees, injected clocks, local test sockets, at most the test's own `/proc` entries | `tst_adversarial`, `tst_core`, `tst_council`, `tst_process_groups`, `desktop_entry` |
+  | `ui` | Widgets, offscreen | `tst_ui`, `tst_process_groups`, `tst_graph_upgrade` |
+  | `host` | Also depends on this machine: its mount table, real `/proc` and `/sys`, process limits and privileges, or your Qt theme files | `tst_adversarial`, `tst_core`, `tst_council`, `tst_live`, `tst_ui`, `tst_graph_upgrade` |
+  | `live` | Only this host's real `/proc` and `/sys` | `tst_live` |
+  | `slow` | Several minutes | `tst_graph_upgrade` |
+  | `install` | Installed files | `desktop_entry` |
+
+  `ctest --test-dir build/debug -L unit -LE host` runs the subset that does
+  not depend on the machine, and `-LE slow` skips the long graph suite. A
+  label marks a whole binary, so most `host` suites are largely synthetic
+  with one or a few host cases, and their skips (for example no qt6ct
+  configuration, or running as root) depend on the machine.
 
 Useful CMake options:
 
 - `-DPULSESCOPE_WERROR=ON` treats warnings as errors.
 - `-DPULSESCOPE_SANITIZE="address;undefined"` builds with sanitizers. Use a
-  separate build directory for this.
+  separate build directory for this. Sanitizer reports are not recoverable,
+  so any report, including undefined behaviour, fails the test that hit it.
+  For the slower code, the CTest time limit for `tst_graph_upgrade` grows
+  from 1800 s to 3600 s and its Qt Test limit per test function from 300 s
+  to 1800 s; the other suites keep 120 s.
+- `-DPULSESCOPE_X11=AUTO|ON|OFF` controls X11 app detection. `AUTO` (the
+  default) uses `xcb` and `xcb-res` when `pkg-config` finds them, `ON` stops
+  with an error when they are missing, `OFF` leaves them out. The value is
+  case-insensitive; anything else stops with an error.
 
 ## Install (user-local)
 
@@ -146,13 +178,16 @@ Keyboard shortcuts:
 | Ctrl+Q | Quit |
 | Left / Right, Home / End | Move the sample readout in a focused graph |
 | Escape | Hide the graph readout |
+| Left / Right on a process group | Collapse or expand the group |
+| Typing a name in the process list | Jump to the next process whose name starts with it (open groups only) |
 
 Hovering over a graph shows the exact values at that moment. With a graph
 focused, the arrow keys do the same.
 
 Your choices are remembered in `~/.config/PulseScope/PulseScope.conf`: page,
 interval, graph window, Details and Smooth Graphs, selected disk, interface
-and sensors, process sort order, and window geometry.
+and sensors, process sort order, which process groups are open, and window
+geometry.
 
 ### Simple view and Details
 
@@ -167,7 +202,7 @@ Turn on **Details** (toolbar, View menu or Ctrl+D) for everything else:
 | Disks | Read and write, with the disk picker | The local filesystem table, more I/O facts and notes |
 | Network | Receive and transmit, with the interface picker | More interface facts and notes |
 | Temperatures | The checked sensors, each named exactly in the legend and keeping its colour and line style (also in the navigation sparkline of the hottest sensor) | The sensor list for choosing what to plot, and notes |
-| Processes | PID, name, CPU and memory (RSS), with filter and sort | User, threads, state, nice, disk I/O, age and command line |
+| Processes | Name, PID, CPU and memory (RSS) in the three groups, with filter and sort | User, threads, state, nice, disk I/O, age and command line |
 
 Both views show the same live data. Switching never discards history,
 selections or anything CSV export writes, and does not change how often
@@ -267,6 +302,11 @@ automatically. Their graphs show gaps rather than zeros.
     the sample's timestamp. That interval's disk, network and process rates
     are then left unavailable instead of being inflated. CPU usage is
     unaffected because it is a ratio of the kernel's own time counters.
+  - The same applies to each process on its own. A process whose counters
+    were read noticeably earlier or later within the sample than last time
+    (for example after a slow read earlier in the process scan) shows "—" for
+    its CPU and disk rates for that interval, while other processes and the
+    system rates keep their values.
   - A 32-bit counter that wraps is unwrapped. Any other counter that goes
     backwards (reset or device replacement) starts a new baseline instead of
     producing a spike.
@@ -297,6 +337,8 @@ automatically. Their graphs show gaps rather than zeros.
   - *Used* is the space in use. *Free* is the space available to
     unprivileged users. As with `df`, blocks reserved for root count as
     neither.
+  - From 90% use (used / (used + free)) the usage bar turns red and the
+    row's tooltip says "Nearly full".
   - Known network, FUSE, autofs and pseudo filesystem types are skipped.
   - Capacity checks run on their own thread, isolated from collection and the
     UI. A check can still stall, for example when a mount changes while it
@@ -310,7 +352,7 @@ automatically. Their graphs show gaps rather than zeros.
     zero.
   - Having no sensors is normal in virtual machines and on some hardware. The
     Temperatures page then explains why.
-- **Processes**: the table is read-only; PulseScope never signals or changes
+- **Processes**: the list is read-only; PulseScope never signals or changes
   processes.
   - **CPU %** is per-process CPU time over the last interval, where **100% is
     one logical CPU fully busy**. A multi-threaded process can exceed 100%, up
@@ -321,10 +363,22 @@ automatically. Their graphs show gaps rather than zeros.
     for your own processes, so other users' processes show "—".
   - A reused PID is recognised as a new process via its start time and never
     inherits the old process's counters.
-  - Kernel threads are hidden unless "Show kernel threads" is checked.
+  - **User** and **Command** are read when a process first appears or
+    changes its name, and then re-read every 5 s, staggered by PID so the
+    first refresh comes 5 to 10 s after a process appears. A running process
+    that changes its real UID or rewrites its command line therefore shows the
+    change within about 10 s. If one of these reads fails, the user is shown
+    as "—" and the command as `[name]` rather than keeping the old value, and
+    the read is tried again at the next sample. CPU, memory and disk figures
+    are still read at every sample.
+  - See [Process groups](#process-groups) for how processes are grouped.
 - **Unavailable data**:
   - A value that could not be read is shown as "—" or "n/a" and left as a gap
     in the graphs. It is never shown as 0.
+  - Kernel tables (`/proc/diskstats`, `/proc/net/dev`, mountinfo and the
+    like) are read whole, up to 8 MiB. A larger one is reported as "larger
+    than 8 MiB; not read" and its devices are unavailable, instead of a
+    partial table passing for the whole system.
   - Freshness is judged by when a sample was taken, not when it reached the
     window. If no recent sample exists, for example because a kernel read is
     blocked, the whole view is marked stale and the graphs keep moving so the
@@ -335,6 +389,77 @@ History keeps the last 15 minutes, at most 1800 samples per series, whatever
 graph window you are viewing. Changing the graph window never discards data.
 Changing the interval keeps existing history, and rates continue across the
 change without a new warm-up.
+
+### Process groups
+
+The Processes page lists every process once, in three groups that always
+stay in this order, whichever column you sort by:
+
+- **Apps**: processes that own a window on your desktop, including windows
+  that are minimized, unfocused, or on a hidden or special workspace. A
+  process with several windows is listed once. Only the process the
+  compositor names as the window's owner counts. Helpers without windows of
+  their own, such as a browser's content processes, stay in Background:
+  PulseScope does not guess family ties from parent PIDs or names.
+- **Background processes**: every other user-space process.
+- **Kernel processes**: kernel threads, which the kernel marks itself
+  (`PF_KTHREAD` in `/proc/PID/stat`).
+
+Group headers count processes. They do not add up CPU or memory, which would
+double-count shared memory and mislead. Within each group, rows sort by the
+chosen column; equal values fall back to PID. The filter searches PID, name,
+user and command line in every group. While it is active, headers show
+"matching of total", every group opens so matches are never hidden in a
+closed group, and clearing the filter restores the groups you had opened or
+closed. Apps and Background start open and Kernel starts closed; your choice
+is remembered. If you had "Show kernel threads" checked in an earlier
+version, Kernel starts open instead. Selection, scroll position and sort
+order survive every refresh and a process moving between groups. A reused
+PID is a new process: it inherits neither the old one's selection nor its
+window.
+
+Finding app windows depends on the desktop:
+
+| Desktop | How |
+| --- | --- |
+| Hyprland | Asks Hyprland for its window list over its own IPC socket (`$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock`, request `j/clients`). This is read-only: PulseScope never focuses, moves or changes windows. |
+| X11 | Reads the window manager's `_NET_CLIENT_LIST` and asks the X server which process owns each window (the X-Resource extension), when built with `xcb` and `xcb-res` and connected to a local X server. |
+| Other Wayland desktops | Not supported yet. |
+
+When the window list cannot be read, PulseScope says so and why, and lists
+user processes together as **Unclassified user processes** instead of calling
+them all background. Kernel processes are still shown separately. It never
+uses XWayland's window list on a Wayland desktop, because that only knows
+about X11 apps.
+
+How the window list is fetched:
+
+- On a background thread, never on the UI thread, with one request at a
+  time. A request gets 400 ms in total, a reply at most 2 MiB and 1024
+  windows. Anything else is reported as the reason detection is unavailable,
+  for example a malformed reply, a timeout, a missing socket or a socket
+  served by another user.
+- Every 1.5 s while the Processes page is visible and every 5 s otherwise,
+  slowing down to every 10 s after repeated failures. A list stays valid for
+  about two request intervals; after that the Apps group says it is out of
+  date instead of trusting it.
+- Each window's PID is checked against `/proc` when the reply arrives: the
+  process's start time is recorded with it, so a PID reused later cannot
+  pick up the window. A process that started after the request was sent is
+  not counted as an app.
+- A list is used only when the owner of every window was identified. If a
+  window has no usable process ID, or its process could not be read or was
+  replaced while the list was read, the list cannot show which processes own
+  no window. It then counts as a failed request: a complete list that is
+  still valid is kept until it expires, and after that user processes are
+  unclassified, with what was missing as the reason. A complete list with no
+  windows at all is still an answer: Apps (0).
+- If Hyprland's socket is busy (its connection queue is full), PulseScope
+  retries within the 400 ms and otherwise tries again at the next interval.
+- Only process IDs are kept. Window titles, classes and commands are never
+  stored or logged.
+- Pause freezes the groups. On resume, replies to requests sent before the
+  pause are dropped and a new list is fetched at once.
 
 ### Pause
 
@@ -356,6 +481,12 @@ recorded series to a CSV file.
 - **Writing**: the file is written in the background and replaced atomically,
   so a failed or interrupted save never leaves a partial file at the chosen
   name. Errors are reported in the window.
+- **Quitting during an export**: an export still blocked when you quit (for
+  example on an unresponsive network mount) cannot be cancelled. It is
+  abandoned, and PulseScope prints one line naming the destination to its
+  standard error. The file at that name is either complete or unchanged. On a
+  filesystem without unnamed temporary files, a `<name>.XXXXXX` temporary may
+  be left beside it.
 
 ### History limits
 
@@ -401,7 +532,9 @@ pulsescope [--interval 0.5|1|2|5]
 - It makes no network connections, has no telemetry and writes nothing except
   its settings file and the CSV files you explicitly export.
 - It only reads files under `/proc` and `/sys`, and asks the kernel for
-  filesystem capacity (`statvfs`) of local mounts.
+  filesystem capacity (`statvfs`) of local mounts. To tell apps apart it asks
+  your own desktop session for its window list: Hyprland over its local IPC
+  socket, or the local X server. It keeps only process IDs from the answer.
 - It does not run subprocesses, tune the system or generate load.
 - Everything it shows is what any user on the machine can already read.
   - Some per-process fields, such as disk I/O counters, are restricted by the
@@ -422,6 +555,13 @@ pulsescope [--interval 0.5|1|2|5]
   filesystems.
 - Sensor names come from the kernel driver. Some chips report only generic
   labels such as `temp1`.
+- App detection covers Hyprland and X11 only. On other Wayland desktops all
+  user processes are shown as unclassified. Between a window closing and the
+  next list, Hyprland may still name a process that has just exited; if its
+  PID were reused within that interval, the newcomer is excluded because it
+  started after the request.
+- The X11 path is built and unit-tested, but was not run against a live X11
+  desktop during development (the development machine runs Hyprland).
 - History is kept in memory only and is lost when the app quits. Use CSV
   export to keep it.
 - CSV `unix_time_s` is computed at export time from the current difference
@@ -444,12 +584,19 @@ pulsescope [--interval 0.5|1|2|5]
     The CSV file itself is written on a worker thread.
   - When the window closes, PulseScope waits up to two seconds in total for
     its worker threads: first the collector, which gives its capacity-check
-    thread 200 ms, then any running export, for at most one second of what
-    remains. A worker still stuck in a blocked kernel call after that is
+    thread 200 ms, then the window-list thread, then any running export, for
+    at most one second each of what remains. A worker still stuck in a blocked kernel call after that is
     abandoned instead of waited for.
   - This limits PulseScope's own waiting, not the process exit. Saving
     settings is synchronous, and the kernel may delay the exit of a process
     whose thread is stuck in uninterruptible I/O.
+  - If the system refuses to create a worker thread (the per-user process
+    limit or the cgroup's task limit is reached), nothing crashes or waits
+    forever. The status line says the collector could not start, app
+    detection says the window-list thread could not start, and filesystems
+    show "capacity check could not start". Each is retried on its own,
+    after 1 s and then backing off to 30 s; the collector and window-list
+    threads are also retried at once on resume.
 - **Look**: the interface follows the system palette, fonts and light/dark
   preference. It uses plain native controls and custom `QPainter` graphs, with
   no web view, QML or chart library.
@@ -493,4 +640,14 @@ pulsescope [--interval 0.5|1|2|5]
     - The cost grows with how much of the plot the data fills.
 - **Accessibility**: data series are told apart by legend, line style and
   colour, never colour alone. Every control has a tooltip and an accessible
-  name, and graphs expose their current values to screen readers.
+  name, and graphs expose their current values to screen readers. That
+  includes each per-core tile on the CPU page ("CPU 3 42.0 %", or why no
+  value is shown); the tiles are not Tab stops. When samples have stopped or
+  collection is paused, a graph or tile says so before its last value
+  ("Paused, last CPU 3 42.0 %"); a graph with a selected sample reads that
+  sample and its age instead. These descriptions are
+  updated when a sample arrives or the selection changes, not at the
+  animation frame rate.
+- **Review**: [docs/QUALITY_REVIEW.md](docs/QUALITY_REVIEW.md) records the
+  latest code review: ratings per area, each finding and its outcome, and
+  what was not verified.

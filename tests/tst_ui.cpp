@@ -7,13 +7,15 @@
 #include "app/metricbutton.h"
 #include "app/processmodel.h"
 #include "app/timechart.h"
+#include "app/windowowners.h"
 #include "core/format.h"
 #include "core/history.h"
 #include "core/snapshot.h"
 
+#include <QAbstractItemModelTester>
+#include <QAccessible>
 #include <QAction>
 #include <QApplication>
-#include <QCheckBox>
 #include <QComboBox>
 #include <QDir>
 #include <QElapsedTimer>
@@ -24,6 +26,7 @@
 #include <QMouseEvent>
 #include <QMessageBox>
 #include <QPaintEvent>
+#include <QProcess>
 #include <QRegularExpression>
 #include <QScreen>
 #include <QScrollArea>
@@ -33,11 +36,16 @@
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QStandardPaths>
-#include <QTableView>
 #include <QTemporaryDir>
+#include <QTextStream>
 #include <QTimer>
+#include <QTreeView>
 #include <QTreeWidget>
 #include <QtTest/QtTest>
+
+#include <poll.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -50,6 +58,8 @@
 #include <map>
 #include <set>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -215,13 +225,91 @@ QStringList comboData(QComboBox* c)
     return out;
 }
 
-QList<int> pidOrder(QTableView* table)
+// Process PIDs in view order: each group's children (collapsed or not),
+// groups in their order; or only those of `group`.
+QList<int> pidOrder(QTreeView* table, int group = -1)
 {
     QList<int> out;
     auto* m = table->model();
-    for (int r = 0; r < m->rowCount(); ++r)
-        out << m->index(r, ProcessModel::Pid).data(ProcessModel::SortRole).toInt();
+    for (int g = 0; g < m->rowCount(); ++g) {
+        const QModelIndex parent = m->index(g, 0);
+        if (group >= 0 && parent.data(ProcessModel::GroupRole).toInt() != group)
+            continue;
+        for (int r = 0; r < m->rowCount(parent); ++r)
+            out << m->index(r, ProcessModel::Pid, parent).data(ProcessModel::PidRole).toInt();
+    }
     return out;
+}
+
+QStringList groupTitles(QTreeView* table)
+{
+    QStringList out;
+    auto* m = table->model();
+    for (int g = 0; g < m->rowCount(); ++g)
+        out << m->index(g, 0).data().toString();
+    return out;
+}
+
+QModelIndex groupRow(QTreeView* table, ProcessModel::Group group)
+{
+    auto* m = table->model();
+    for (int g = 0; g < m->rowCount(); ++g)
+        if (m->index(g, 0).data(ProcessModel::GroupRole).toInt() == group)
+            return m->index(g, 0);
+    return {};
+}
+
+QModelIndex processRow(QTreeView* table, int pid)
+{
+    auto* m = table->model();
+    for (int g = 0; g < m->rowCount(); ++g) {
+        const QModelIndex parent = m->index(g, 0);
+        for (int r = 0; r < m->rowCount(parent); ++r)
+            if (m->index(r, 0, parent).data(ProcessModel::PidRole).toInt() == pid)
+                return m->index(r, 0, parent);
+    }
+    return {};
+}
+
+QList<int> selectedPids(QTreeView* table)
+{
+    QList<int> out;
+    for (const QModelIndex& i : table->selectionModel()->selectedRows())
+        if (!i.data(ProcessModel::IsGroupRole).toBool())
+            out << i.data(ProcessModel::PidRole).toInt();
+    return out;
+}
+
+windows::ResultPtr windowOwners(std::vector<windows::Owner> owners, double time, double validFor = 3.0)
+{
+    auto r = std::make_shared<windows::Result>();
+    r->status = windows::Status::Ok;
+    r->backend = windows::Backend::Hyprland;
+    r->requested = time;
+    r->time = time;
+    r->validFor = validFor;
+    r->windows = static_cast<int>(owners.size());
+    r->owners = std::move(owners);
+    return r;
+}
+
+windows::ResultPtr windowOwnersFailed(windows::Status status, const char* detail, double time)
+{
+    auto r = std::make_shared<windows::Result>();
+    r->status = status;
+    r->backend = windows::Backend::Hyprland;
+    r->detail = QString::fromLatin1(detail);
+    r->requested = time;
+    r->time = time;
+    return r;
+}
+
+// A /proc/PID/stat line with the given start time (clock ticks).
+std::string statLine(int pid, const std::string& comm, uint64_t startTicks)
+{
+    return std::to_string(pid) + " (" + comm + ") S 1 " + std::to_string(pid) + " " + std::to_string(pid)
+        + " 0 -1 4194560 0 0 0 0 10 5 0 0 20 0 1 0 " + std::to_string(startTicks) + " 1000000 456 "
+        + "18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n";
 }
 
 void feed(MainWindow& w, double t0, int n, double step = 1.0)
@@ -335,10 +423,16 @@ private Q_SLOTS:
     void sensorListNamesAndRemovedPlaceholder();
     void negativeTemperaturesRender();
     void swapUnknownNoneAndKnown();
+    void nearlyFullFilesystemWarns();
     void pauseFreezesAndResumeLeavesGap();
     void intervalAndRangeChangesKeepHistory();
     void processTableSortsAndFilters();
     void processModelStaleKeepsRowsHidesValues();
+    void processGroupsKeepViewState();
+    void processGroupsUseNativeKeys();
+    void processGroupsFollowTheWindowProbe();
+    void processGroupsExpireAndExplain();
+    void processGroupsNeedCompleteWindowLists();
     void csvExportWritesUnitsAndBlanks();
     void csvExportFailureIsReported();
     void csvExportBusyThenCompletes();
@@ -346,6 +440,7 @@ private Q_SLOTS:
     void historyLimitIsExplained();
     void settingsPersist();
     void blockedCollectorGoesStaleAndRecovers();
+    void threadStartFailureIsShownAndRecovers();
     void freshnessFollowsAcquisitionClock();
     void chartWithoutSamplesInWindow();
     void liveCollectorPopulatesAndShutsDown();
@@ -465,6 +560,7 @@ void TestUi::warmupThenLiveValues()
     QCOMPARE(fsTable->topLevelItem(0)->text(3), QStringLiteral("500 GiB"));
     QCOMPARE(fsTable->topLevelItem(1)->text(3), kDash);
     QCOMPARE(fsTable->topLevelItem(1)->text(6), QStringLiteral("not responding"));
+    QVERIFY(!fsTable->topLevelItem(0)->toolTip(6).contains(QStringLiteral("Nearly full")));
 
     // Charts paint real points.
     w.resize(1180, 780);
@@ -855,6 +951,40 @@ void TestUi::negativeTemperaturesRender()
     QVERIFY2(lo <= -20 && hi >= -5.5, qPrintable(QStringLiteral("%1..%2").arg(lo).arg(hi)));
 }
 
+void TestUi::nearlyFullFilesystemWarns()
+{
+    Env env;
+    MainWindow w(env.options());
+    w.setDetailsVisible(true);
+    w.showPage(MainWindow::DiskPage);
+    w.resize(1180, 780);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    auto s = snapshot(10, false);
+    s->filesystems[0].usedBytes = 460 * GiB; // 460 / (460 + 24): 95 %
+    s->filesystems[0].availBytes = 24 * GiB;
+    w.applySnapshot(s);
+    auto* fsTable = child<QTreeWidget>(w, "filesystemTable");
+    QTRY_VERIFY(fsTable->isVisible());
+    QTreeWidgetItem* item = fsTable->topLevelItem(0);
+    QCOMPARE(item->text(6), QStringLiteral("95 %"));
+    // Not colour alone: the tooltip says it too.
+    QVERIFY2(item->toolTip(6).contains(QStringLiteral("Nearly full: 95 % used")), qPrintable(item->toolTip(6)));
+
+    // The bar is drawn in the palette's warning red, not another series hue.
+    const QRect cell = fsTable->visualItemRect(item).intersected(
+        QRect(fsTable->header()->sectionViewportPosition(6), 0, fsTable->header()->sectionSize(6), fsTable->viewport()->height()));
+    QVERIFY(!cell.isEmpty());
+    const QImage img = fsTable->viewport()->grab().toImage();
+    const QColor expected = seriesColor(6, fsTable->palette());
+    const qreal dpr = img.devicePixelRatio();
+    const QColor got = img.pixelColor(qRound((cell.left() + 16) * dpr), qRound(cell.center().y() * dpr)); // inside the bar
+    QVERIFY2(std::abs(got.red() - expected.red()) <= 2 && std::abs(got.green() - expected.green()) <= 2
+                 && std::abs(got.blue() - expected.blue()) <= 2,
+             qPrintable(QStringLiteral("%1 vs %2").arg(got.name(), expected.name())));
+    w.close();
+}
+
 void TestUi::swapUnknownNoneAndKnown()
 {
     Env env;
@@ -984,83 +1114,547 @@ void TestUi::processTableSortsAndFilters()
     MainWindow w(env.options());
     feed(w, 10, 2);
     w.showPage(MainWindow::ProcessPage);
-    auto* table = child<QTableView>(w, "processTable");
+    auto* table = child<QTreeView>(w, "processTable");
     auto* filter = child<QLineEdit>(w, "processFilter");
-    auto* kernel = child<QCheckBox>(w, "kernelThreadsCheck");
     auto* count = child<QLabel>(w, "processCount");
-    QVERIFY(!kernel->isChecked());
-    QCOMPARE(table->model()->rowCount(), 4); // kthreadd hidden
-    QCOMPARE(count->text(), QStringLiteral("Showing 4 of 5 processes, 42 threads"));
+    auto* note = child<QLabel>(w, "processGroupNote");
+    QVERIFY(table && filter && count && note);
+    QAbstractItemModelTester tester(table->model(), QAbstractItemModelTester::FailureReportingMode::QtTest);
+    QVERIFY(!w.findChild<QWidget*>(QStringLiteral("kernelThreadsCheck")));
 
-    // Default: CPU descending; numbers, not text; unavailable last.
-    QCOMPARE(pidOrder(table), (QList<int> {4242, 500, 1, 777}));
+    // Without a window list nothing is called an app or a background process.
+    QCOMPARE(w.processGrouping().state, ProcessGrouping::State::Unavailable);
+    QCOMPARE(groupTitles(table), (QStringList {QStringLiteral("App detection unavailable"),
+                                               QStringLiteral("Unclassified user processes (4)"),
+                                               QStringLiteral("Kernel processes (1)")}));
+    QVERIFY(note->isVisibleTo(&w));
+    QVERIFY2(note->text().contains(QStringLiteral("App detection is off")), qPrintable(note->text()));
+    QCOMPARE(count->text(), QStringLiteral("5 processes, 42 threads"));
+    QCOMPARE(pidOrder(table, ProcessModel::Apps), QList<int>());
+    QCOMPARE(pidOrder(table, ProcessModel::Kernel), QList<int> {2}); // PF_KTHREAD, not a name guess
+
+    w.applyWindowOwners(windowOwners({{4242, 1000 + 4242}, {777, 1000 + 777}}, 1));
+    QCOMPARE(w.processGrouping().state, ProcessGrouping::State::Detected);
+    QCOMPARE(groupTitles(table), (QStringList {QStringLiteral("Apps (2)"), QStringLiteral("Background processes (2)"),
+                                               QStringLiteral("Kernel processes (1)")}));
+    QVERIFY(!note->isVisibleTo(&w));
+    QCOMPARE(count->text(), QStringLiteral("5 processes, 42 threads")); // group rows are not processes
+    QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Apps)));
+    QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Background)));
+    QVERIFY(!table->isExpanded(groupRow(table, ProcessModel::Kernel)));
+    QVERIFY(table->isFirstColumnSpanned(groupRow(table, ProcessModel::Apps).row(), QModelIndex()));
+    // Group rows carry no invented PID or counters.
+    const QModelIndex apps = groupRow(table, ProcessModel::Apps);
+    for (int c = 1; c < ProcessModel::ColumnCount; ++c)
+        QVERIFY(!table->model()->index(apps.row(), c).data().isValid());
+    QVERIFY(!(table->model()->flags(apps) & Qt::ItemIsEditable));
+    QVERIFY(apps.data(Qt::ToolTipRole).toString().contains(QStringLiteral("minimized")));
+
+    // Default: CPU descending within each group; numbers, not text;
+    // unavailable last; groups keep their order either way.
+    const QStringList titles = groupTitles(table);
+    QCOMPARE(pidOrder(table), (QList<int> {4242, 777, 500, 1, 2}));
     table->sortByColumn(ProcessModel::Cpu, Qt::AscendingOrder);
-    QCOMPARE(pidOrder(table), (QList<int> {777, 1, 500, 4242}));
+    QCOMPARE(pidOrder(table), (QList<int> {777, 4242, 1, 500, 2}));
+    QCOMPARE(groupTitles(table), titles);
     table->sortByColumn(ProcessModel::Memory, Qt::DescendingOrder);
-    QCOMPARE(pidOrder(table), (QList<int> {4242, 777, 1, 500}));
+    QCOMPARE(pidOrder(table), (QList<int> {4242, 777, 1, 500, 2}));
+    QCOMPARE(groupTitles(table), titles);
     table->sortByColumn(ProcessModel::Pid, Qt::AscendingOrder);
-    QCOMPARE(pidOrder(table), (QList<int> {1, 500, 777, 4242}));
+    QCOMPARE(pidOrder(table), (QList<int> {777, 4242, 1, 500, 2}));
+    table->sortByColumn(ProcessModel::Pid, Qt::DescendingOrder);
+    QCOMPARE(pidOrder(table), (QList<int> {4242, 777, 500, 1, 2}));
+    QCOMPARE(groupTitles(table), titles);
+    table->sortByColumn(ProcessModel::Name, Qt::AscendingOrder);
+    QCOMPARE(pidOrder(table, ProcessModel::Apps), (QList<int> {777, 4242})); // "fire) fox" < "Web Content (x)"
+    table->sortByColumn(ProcessModel::Pid, Qt::AscendingOrder);
     // CPU above 100 % is displayed as measured (one core = 100 %).
-    const QModelIndex hot = table->model()->index(3, ProcessModel::Cpu);
+    const QModelIndex hot = processRow(table, 4242).siblingAtColumn(ProcessModel::Cpu);
     QCOMPARE(hot.data().toString(), QStringLiteral("150.0"));
     QVERIFY(table->model()->headerData(ProcessModel::Cpu, Qt::Horizontal, Qt::ToolTipRole)
                 .toString()
                 .contains(QStringLiteral("100")));
     // Names with spaces and parentheses are shown intact.
-    QCOMPARE(table->model()->index(3, ProcessModel::Name).data().toString(), QStringLiteral("Web Content (x)"));
-    QCOMPARE(table->model()->index(2, ProcessModel::Name).data().toString(), QStringLiteral("fire) fox"));
+    QCOMPARE(processRow(table, 4242).data().toString(), QStringLiteral("Web Content (x)"));
+    QCOMPARE(processRow(table, 777).data().toString(), QStringLiteral("fire) fox"));
 
+    // Filtering covers every group, counts matches against totals, and
+    // opens collapsed groups so matches can be seen.
     QTest::keyClicks(filter, QStringLiteral("FOX"));
     QCOMPARE(pidOrder(table), (QList<int> {777}));
-    QCOMPARE(count->text(), QStringLiteral("Showing 1 of 5 processes, 42 threads"));
-    filter->clear();
+    QCOMPARE(groupTitles(table), (QStringList {QStringLiteral("Apps (1 of 2)"), QStringLiteral("Background processes (0 of 2)"),
+                                               QStringLiteral("Kernel processes (0 of 1)")}));
+    QCOMPARE(count->text(), QStringLiteral("1 of 5 processes match, 42 threads"));
+    filter->setText(QStringLiteral("kthreadd"));
+    QCOMPARE(pidOrder(table), (QList<int> {2}));
+    QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Kernel)));
     filter->setText(QStringLiteral("4242"));
     QCOMPARE(pidOrder(table), (QList<int> {4242}));
     filter->setText(QStringLiteral("(x)"));
     QCOMPARE(pidOrder(table), (QList<int> {4242}));
     filter->setText(QStringLiteral("/usr/bin/bash"));
     QCOMPARE(pidOrder(table), (QList<int> {500}));
+    filter->setText(QStringLiteral("dev")); // user
+    QCOMPARE(pidOrder(table).size(), 5);
     filter->clear();
-    kernel->setChecked(true);
-    QCOMPARE(table->model()->rowCount(), 5);
-    QCOMPARE(count->text(), QStringLiteral("Showing 5 of 5 processes, 42 threads"));
+    QCOMPARE(pidOrder(table).size(), 5);
+    QCOMPARE(count->text(), QStringLiteral("5 processes, 42 threads"));
+    QVERIFY(!table->isExpanded(groupRow(table, ProcessModel::Kernel))); // as the user left it
 
-    // Refresh with an exited and a reused PID: rows follow (PID, start time).
+    // Refresh with an exited and a reused PID: rows follow (PID, start
+    // time), and the newcomer does not inherit the old owner's window.
     auto next = snapshot(12, true);
     next->processes.erase(next->processes.begin() + 2); // bash exited
     next->processes[3].startTicks += 999;               // PID 777 reused
     next->processes[3].name = "newcomer";
     w.applySnapshot(next);
-    QCOMPARE(table->model()->rowCount(), 4);
-    filter->setText(QStringLiteral("777"));
-    QCOMPARE(table->model()->index(0, ProcessModel::Name).data().toString(), QStringLiteral("newcomer"));
+    QCOMPARE(pidOrder(table), (QList<int> {4242, 1, 777, 2}));
+    QCOMPARE(processRow(table, 777).data().toString(), QStringLiteral("newcomer"));
+    QCOMPARE(groupTitles(table).first(), QStringLiteral("Apps (1)"));
+    QCOMPARE(count->text(), QStringLiteral("4 processes, 42 threads"));
+
+    // A command line rewritten in place (same identity) is filtered by its
+    // new text.
+    filter->setText(QStringLiteral("--renamed"));
+    QCOMPARE(pidOrder(table), QList<int>());
+    auto renamed = std::make_shared<ps::Snapshot>(*next);
+    renamed->time += 1;
+    for (auto& p : renamed->processes)
+        if (p.pid == 1)
+            p.command += " --renamed";
+    w.applySnapshot(renamed);
+    QCOMPARE(pidOrder(table), (QList<int> {1}));
+    filter->clear();
 }
 
 void TestUi::processModelStaleKeepsRowsHidesValues()
 {
     ProcessModel model;
+    QAbstractItemModelTester tester(&model, QAbstractItemModelTester::FailureReportingMode::QtTest);
     model.setProcesses(snapshot(1, true)->processes);
-    QCOMPARE(model.rowCount(), 5);
-    const int row = 3; // 4242
-    QCOMPARE(model.index(row, ProcessModel::Pid).data().toInt(), 4242);
-    QCOMPARE(model.index(row, ProcessModel::Cpu).data().toString(), QStringLiteral("150.0"));
+    QCOMPARE(model.rowCount(), int(ProcessModel::GroupCount));
+    QCOMPARE(model.processCount(), 5);
+    const QModelIndex user = model.groupIndex(ProcessModel::Background);
+    QCOMPARE(model.rowCount(user), 4);
+    const int row = 2; // 4242, in snapshot order
+    QCOMPARE(model.index(row, ProcessModel::Pid, user).data().toInt(), 4242);
+    QCOMPARE(model.index(row, ProcessModel::Cpu, user).data().toString(), QStringLiteral("150.0"));
     model.setStale(true);
-    QCOMPARE(model.rowCount(), 5);
-    QCOMPARE(model.index(row, ProcessModel::Pid).data().toInt(), 4242);
-    QCOMPARE(model.index(row, ProcessModel::Name).data().toString(), QStringLiteral("Web Content (x)"));
+    QCOMPARE(model.processCount(), 5);
+    QCOMPARE(model.index(row, ProcessModel::Pid, user).data().toInt(), 4242);
+    QCOMPARE(model.index(row, ProcessModel::Name, user).data().toString(), QStringLiteral("Web Content (x)"));
     for (int c = 0; c < ProcessModel::ColumnCount; ++c) {
-        const QString text = model.index(row, c).data().toString();
+        const QString text = model.index(row, c, user).data().toString();
         if (ProcessModel::isSampledColumn(c)) {
             QCOMPARE(text, kDash);
-            QVERIFY(model.index(row, c).data(Qt::ToolTipRole).toString().contains(QStringLiteral("No recent samples")));
+            QVERIFY(model.index(row, c, user).data(Qt::ToolTipRole).toString().contains(QStringLiteral("No recent samples")));
         } else {
             QVERIFY2(text != kDash, qPrintable(QString::number(c)));
         }
     }
+    // Regrouping while stale moves the row but does not bring values back.
+    ProcessGrouping g;
+    g.state = ProcessGrouping::State::Detected;
+    g.apps.insert({4242, 1000 + 4242});
+    model.setGrouping(g);
+    const QModelIndex apps = model.groupIndex(ProcessModel::Apps);
+    QCOMPARE(model.rowCount(apps), 1);
+    QCOMPARE(model.index(0, ProcessModel::Pid, apps).data().toInt(), 4242);
+    QCOMPARE(model.index(0, ProcessModel::Cpu, apps).data().toString(), kDash);
     model.setStale(false);
-    QCOMPARE(model.index(row, ProcessModel::Cpu).data().toString(), QStringLiteral("150.0"));
+    QCOMPARE(model.index(0, ProcessModel::Cpu, apps).data().toString(), QStringLiteral("150.0"));
     // Sorting role stays numeric (NaN for unavailable) regardless of display.
-    QVERIFY(std::isnan(model.index(4, ProcessModel::Cpu).data(ProcessModel::SortRole).toDouble()));
+    QCOMPARE(model.index(2, ProcessModel::Pid, user).data().toInt(), 777);
+    QVERIFY(std::isnan(model.index(2, ProcessModel::Cpu, user).data(ProcessModel::SortRole).toDouble()));
+}
+
+void TestUi::processGroupsKeepViewState()
+{
+    Env env;
+    MainWindow w(env.options());
+    feed(w, 10, 2);
+    w.resize(1000, 700);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    w.showPage(MainWindow::ProcessPage);
+    auto* table = child<QTreeView>(w, "processTable");
+    auto* filter = child<QLineEdit>(w, "processFilter");
+    QAbstractItemModelTester tester(table->model(), QAbstractItemModelTester::FailureReportingMode::QtTest);
+    w.applyWindowOwners(windowOwners({{4242, 1000 + 4242}, {777, 1000 + 777}}, 1));
+
+    // Selection follows the process (PID + start time) between groups.
+    table->selectionModel()->setCurrentIndex(processRow(table, 4242),
+                                             QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    QCOMPARE(selectedPids(table), QList<int> {4242});
+    w.applyWindowOwners(windowOwners({{777, 1000 + 777}}, 2)); // its window closed
+    QCOMPARE(pidOrder(table, ProcessModel::Background).contains(4242), true);
+    QCOMPARE(selectedPids(table), QList<int> {4242});
+    QCOMPARE(table->currentIndex().parent().data(ProcessModel::GroupRole).toInt(), int(ProcessModel::Background));
+    w.applySnapshot(snapshot(12, true));
+    QCOMPARE(selectedPids(table), QList<int> {4242});
+    w.applyWindowOwners(windowOwners({{777, 1000 + 777}, {4242, 1000 + 4242}}, 3)); // reopened
+    QCOMPARE(pidOrder(table, ProcessModel::Apps), (QList<int> {4242, 777}));
+    QCOMPARE(selectedPids(table), QList<int> {4242});
+    // An older result arriving late changes nothing.
+    w.applyWindowOwners(windowOwners({}, 2.5));
+    QCOMPARE(pidOrder(table, ProcessModel::Apps), (QList<int> {4242, 777}));
+
+    // A reused PID is a different row: no selection, no window.
+    auto reused = snapshot(13, true);
+    reused->processes[3].startTicks += 5; // 4242
+    w.applySnapshot(reused);
+    // (A single-selection view moves the selection to a neighbour when the
+    // selected row goes; it must not be the newcomer.)
+    QVERIFY(!selectedPids(table).contains(4242));
+    QCOMPARE(pidOrder(table, ProcessModel::Apps), QList<int> {777});
+    QVERIFY(pidOrder(table, ProcessModel::Background).contains(4242));
+
+    // Several windows of one process: listed once.
+    w.applyWindowOwners(windowOwners({{777, 1000 + 777}, {777, 1000 + 777}}, 4));
+    QCOMPARE(pidOrder(table).count(777), 1);
+
+    // Expansion: the user's choice survives refreshes; a filter opens every
+    // group for the matches, and clearing it restores the user's choice.
+    table->collapse(groupRow(table, ProcessModel::Apps));
+    w.applySnapshot(snapshot(14, true));
+    QVERIFY(!table->isExpanded(groupRow(table, ProcessModel::Apps)));
+    filter->setText(QStringLiteral("fox"));
+    QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Apps)));
+    QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Kernel)));
+    table->collapse(groupRow(table, ProcessModel::Background)); // only for this filter
+    w.applySnapshot(snapshot(15, true));
+    QVERIFY(!table->isExpanded(groupRow(table, ProcessModel::Background)));
+    filter->clear();
+    QVERIFY(!table->isExpanded(groupRow(table, ProcessModel::Apps)));
+    QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Background)));
+    QVERIFY(!table->isExpanded(groupRow(table, ProcessModel::Kernel)));
+    filter->setText(QStringLiteral("fox"));
+    QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Background))); // a new filter starts open
+    filter->clear();
+
+    // A group that empties and refills keeps its expansion.
+    table->expand(groupRow(table, ProcessModel::Apps));
+    w.applyWindowOwners(windowOwners({}, 5));
+    QCOMPARE(groupTitles(table).first(), QStringLiteral("Apps (0)")); // detected: no windows at all
+    w.applyWindowOwners(windowOwners({{777, 1000 + 777}}, 6));
+    QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Apps)));
+    QCOMPARE(pidOrder(table, ProcessModel::Apps), QList<int> {777});
+
+    // Details keeps the order, sort and expansion; Simple shows the name
+    // with the spare width.
+    table->sortByColumn(ProcessModel::Memory, Qt::AscendingOrder);
+    const QList<int> order = pidOrder(table);
+    auto* header = table->header();
+    const int nameSimple = header->sectionSize(ProcessModel::Name);
+    QVERIFY2(nameSimple > header->sectionSize(ProcessModel::Memory) * 2, qPrintable(QString::number(nameSimple)));
+    // The numbers keep their content width next to the name (no stretched
+    // Memory column pushing its values to the far edge).
+    const int memorySimple = header->sectionSize(ProcessModel::Memory);
+    QVERIFY(!header->stretchLastSection());
+    QCOMPARE(header->sectionViewportPosition(ProcessModel::Memory) + memorySimple, table->viewport()->width());
+    QVERIFY2(memorySimple < table->fontMetrics().horizontalAdvance(QStringLiteral("Memory (RSS)")) + 60,
+             qPrintable(QString::number(memorySimple)));
+    w.setDetailsVisible(true);
+    QCOMPARE(pidOrder(table), order);
+    QCOMPARE(header->sortIndicatorSection(), int(ProcessModel::Memory));
+    QVERIFY(!table->isColumnHidden(ProcessModel::Command));
+    QVERIFY(header->stretchLastSection()); // the command line takes the spare width
+    QCOMPARE(header->logicalIndex(header->count() - 1), int(ProcessModel::Command));
+    QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Apps)));
+    w.setDetailsVisible(false);
+    QCOMPARE(pidOrder(table), order);
+    QCOMPARE(header->sectionSize(ProcessModel::Name), nameSimple);
+    // Too narrow for every column: the name stays readable and the list
+    // scrolls sideways.
+    table->setFixedWidth(260);
+    QTRY_VERIFY(table->horizontalScrollBar()->maximum() > 0);
+    QVERIFY(header->sectionSize(ProcessModel::Name)
+            >= 2 * table->indentation() + table->fontMetrics().horizontalAdvance(QStringLiteral("gnome-shell")));
+    table->setMinimumWidth(0);
+    table->setMaximumWidth(QWIDGETSIZE_MAX);
+    QTRY_COMPARE(header->sectionSize(ProcessModel::Name), nameSimple);
+
+    // Saved: expansion, sort.
+    w.close();
+    QSettings saved(env.settings(), QSettings::IniFormat);
+    QCOMPARE(saved.value(QStringLiteral("processView/expandApps")).toBool(), true);
+    QCOMPARE(saved.value(QStringLiteral("processView/expandKernel")).toBool(), false);
+    QCOMPARE(saved.value(QStringLiteral("processView/sortColumn")).toInt(), int(ProcessModel::Memory));
+}
+
+void TestUi::processGroupsUseNativeKeys()
+{
+    // What the README documents: the tree's own keys, nothing custom.
+    Env env;
+    MainWindow w(env.options());
+    feed(w, 10, 2);
+    w.applyWindowOwners(windowOwners({{4242, 1000 + 4242}, {777, 1000 + 777}}, 11));
+    w.showPage(MainWindow::ProcessPage);
+    w.resize(1180, 780);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    auto* table = child<QTreeView>(w, "processTable");
+    table->setFocus();
+    const QModelIndex apps = groupRow(table, ProcessModel::Apps);
+    table->setCurrentIndex(apps);
+    QVERIFY(table->isExpanded(apps));
+    QTest::keyClick(table, Qt::Key_Left);
+    QVERIFY(!table->isExpanded(apps));
+    QTest::keyClick(table, Qt::Key_Right);
+    QVERIFY(table->isExpanded(apps));
+    // Type-ahead by name, inside the open groups.
+    QTest::keyClicks(table, QStringLiteral("fire"));
+    QCOMPARE(table->currentIndex().siblingAtColumn(ProcessModel::Pid).data(ProcessModel::SortRole).toInt(), 777);
+    table->collapse(apps);
+    table->setCurrentIndex(groupRow(table, ProcessModel::Background));
+    QTest::qWait(QApplication::keyboardInputInterval() + 100); // a new search, not a continuation
+    QTest::keyClicks(table, QStringLiteral("fire"));
+    QCOMPARE(table->currentIndex(), groupRow(table, ProcessModel::Background));
+    QVERIFY(!table->isExpanded(apps));
+    w.close();
+}
+
+void TestUi::processGroupsFollowTheWindowProbe()
+{
+    // The real probe thread with an injected compositor answer and a
+    // synthetic /proc that pins each PID to its start time.
+    Tree tree;
+    tree.write("proc/4242/stat", statLine(4242, "Web Content (x)", 1000 + 4242));
+    tree.write("proc/777/stat", statLine(777, "fire) fox", 1000 + 777));
+    struct Compositor {
+        std::mutex m;
+        std::vector<int> pids {777, 4242};
+        bool hang = false;
+        std::atomic<int> asked {0};
+    };
+    auto compositor = std::make_shared<Compositor>();
+    auto clock = std::make_shared<std::atomic<double>>(1000.0);
+    Env env;
+    MainWindowOptions o = env.options();
+    o.clock = [clock] { return clock->load(); };
+    o.windowProbe.procRoot = tree.path("proc");
+    o.windowProbe.clockTicks = 100; // start times 7.77 s and 52.42 s, well before the clock
+    o.windowProbe.visibleIntervalMs = 200;
+    o.windowProbe.backgroundIntervalMs = 200;
+    o.windowProbe.query = [compositor](const windows::QueryContext& ctx) {
+        ++compositor->asked;
+        windows::Query q;
+        bool hang = false;
+        {
+            std::lock_guard lock(compositor->m);
+            q.pids = compositor->pids;
+            hang = compositor->hang;
+        }
+        if (hang) { // a compositor that never answers: only shutdown ends it
+            pollfd p {ctx.cancelFd, POLLIN, 0};
+            ::poll(&p, 1, 20000);
+            q.status = windows::Status::Cancelled;
+            return q;
+        }
+        q.status = windows::Status::Ok;
+        q.windows = static_cast<int>(q.pids.size()) + 1;
+        return q;
+    };
+    MainWindow w(std::move(o));
+    QVERIFY(w.windowProbe());
+    QCOMPARE(w.processGrouping().state, ProcessGrouping::State::Pending); // before any answer
+    w.applySnapshot(snapshot(999.5, false));
+    w.applySnapshot(snapshot(1000, true));
+    w.showPage(MainWindow::ProcessPage);
+    auto* table = child<QTreeView>(w, "processTable");
+    QCOMPARE(groupTitles(table).first(), QString::fromUtf8("Apps (detecting\u2026)"));
+    QVERIFY(!child<QLabel>(w, "processGroupNote")->isVisibleTo(&w));
+
+    QTRY_COMPARE_WITH_TIMEOUT(w.processGrouping().state, ProcessGrouping::State::Detected, 3000);
+    QCOMPARE(pidOrder(table, ProcessModel::Apps), (QList<int> {4242, 777}));
+    QCOMPARE(pidOrder(table, ProcessModel::Background), (QList<int> {500, 1}));
+
+    // Paused: membership is frozen and the probe asks nothing.
+    w.setPaused(true);
+    QTest::qWait(100);
+    {
+        std::lock_guard lock(compositor->m);
+        compositor->pids = {4242};
+    }
+    const int asked = compositor->asked.load();
+    QTest::qWait(600);
+    QCOMPARE(compositor->asked.load(), asked);
+    QCOMPARE(pidOrder(table, ProcessModel::Apps), (QList<int> {4242, 777}));
+    // Resume: a fresh list regroups.
+    clock->store(1000.5);
+    w.setPaused(false);
+    QTRY_COMPARE_WITH_TIMEOUT(pidOrder(table, ProcessModel::Apps), QList<int> {4242}, 3000);
+    QVERIFY(pidOrder(table, ProcessModel::Background).contains(777));
+
+    // A compositor that stops answering: the list expires and says so,
+    // and the window still shuts down promptly.
+    {
+        std::lock_guard lock(compositor->m);
+        compositor->hang = true;
+    }
+    QTest::qWait(400); // the probe is now stuck in the query
+    clock->store(1010.0);
+    QTRY_COMPARE_WITH_TIMEOUT(w.processGrouping().state, ProcessGrouping::State::Unavailable, 3000);
+    QVERIFY2(w.processGrouping().reason.contains(QStringLiteral("out of date")), qPrintable(w.processGrouping().reason));
+    QCOMPARE(groupTitles(table).first(), QStringLiteral("App detection unavailable"));
+    QCOMPARE(pidOrder(table, ProcessModel::Apps), QList<int>());
+    QElapsedTimer t;
+    t.start();
+    QVERIFY(w.shutdown(2000));
+    QVERIFY2(t.elapsed() < 1500, qPrintable(QString::number(t.elapsed())));
+    QVERIFY(!w.windowProbe()->isRunning());
+}
+
+void TestUi::processGroupsExpireAndExplain()
+{
+    Env env;
+    auto clock = std::make_shared<double>(100.0);
+    auto o = env.options();
+    o.clock = [clock] { return *clock; };
+    MainWindow w(o);
+    w.applySnapshot(snapshot(99, false));
+    w.applySnapshot(snapshot(100, true));
+    w.showPage(MainWindow::ProcessPage);
+    auto* table = child<QTreeView>(w, "processTable");
+    auto* note = child<QLabel>(w, "processGroupNote");
+
+    w.applyWindowOwners(windowOwners({{4242, 1000 + 4242}}, 100, 3.0));
+    QCOMPARE(pidOrder(table, ProcessModel::Apps), QList<int> {4242});
+    // One failed request does not undo a list that is still valid...
+    *clock = 101;
+    w.applyWindowOwners(windowOwnersFailed(windows::Status::Timeout, "Hyprland did not answer within 400 ms", 101));
+    QCOMPARE(w.processGrouping().state, ProcessGrouping::State::Detected);
+    // ...but once it has expired, the newest failure is the explanation.
+    *clock = 103.5;
+    QTRY_COMPARE_WITH_TIMEOUT(w.processGrouping().state, ProcessGrouping::State::Unavailable, 2000);
+    QCOMPARE(groupTitles(table), (QStringList {QStringLiteral("App detection unavailable"),
+                                               QStringLiteral("Unclassified user processes (4)"),
+                                               QStringLiteral("Kernel processes (1)")}));
+    QVERIFY(note->isVisibleTo(&w));
+    QVERIFY2(note->text().contains(QStringLiteral("did not answer within 400 ms")), qPrintable(note->text()));
+    QVERIFY(groupRow(table, ProcessModel::Apps).data(Qt::ToolTipRole).toString().contains(QStringLiteral("did not answer")));
+
+    // A result from the future or without a time is not trusted.
+    w.applyWindowOwners(windowOwners({{4242, 1000 + 4242}}, 200));
+    w.applyWindowOwners(windowOwners({{4242, 1000 + 4242}}, ps::kNaN));
+    QCOMPARE(w.processGrouping().state, ProcessGrouping::State::Unavailable);
+
+    // An empty, successful list is not a failure: nothing owns a window.
+    w.applyWindowOwners(windowOwners({}, 103.6));
+    QCOMPARE(w.processGrouping().state, ProcessGrouping::State::Detected);
+    QCOMPARE(groupTitles(table).first(), QStringLiteral("Apps (0)"));
+    QCOMPARE(groupTitles(table).at(1), QStringLiteral("Background processes (4)"));
+    QVERIFY(!note->isVisibleTo(&w));
+
+
+    // Paused: new results are ignored and nothing expires.
+    w.setPaused(true);
+    w.applyWindowOwners(windowOwners({{4242, 1000 + 4242}}, 103.7));
+    *clock = 200;
+    QTest::qWait(700);
+    QCOMPARE(w.processGrouping().state, ProcessGrouping::State::Detected);
+    QCOMPARE(pidOrder(table, ProcessModel::Apps), QList<int>());
+    // Without a probe there is nothing to wait for after resume: the old
+    // list expires.
+    w.setPaused(false);
+    QTRY_COMPARE_WITH_TIMEOUT(w.processGrouping().state, ProcessGrouping::State::Unavailable, 2000);
+
+    // A failure that cannot change within this run explains itself.
+    w.applyWindowOwners(windowOwnersFailed(windows::Status::Unsupported,
+                                           "This Wayland desktop does not share its window list", 200));
+    QVERIFY(note->text().contains(QStringLiteral("does not share its window list")));
+    QVERIFY(!note->text().contains(QChar(0x2014))); // no dashes in the copy
+}
+
+void TestUi::processGroupsNeedCompleteWindowLists()
+{
+    Env env;
+    auto clock = std::make_shared<double>(100.0);
+    auto o = env.options();
+    o.clock = [clock] { return *clock; };
+    MainWindow w(o);
+    w.applySnapshot(snapshot(99, false));
+    w.applySnapshot(snapshot(100, true));
+    w.showPage(MainWindow::ProcessPage);
+    auto* table = child<QTreeView>(w, "processTable");
+    auto* note = child<QLabel>(w, "processGroupNote");
+    const auto incomplete = [](std::vector<windows::Owner> owners, double time, int withoutPid, int unresolved,
+                               int ambiguous) {
+        auto r = std::make_shared<windows::Result>(*windowOwners(std::move(owners), time));
+        r->windows += withoutPid + unresolved + ambiguous;
+        r->withoutPid = withoutPid;
+        r->unresolved = unresolved;
+        r->ambiguous = ambiguous;
+        return r;
+    };
+
+    // A complete list names the apps; everything else is known background.
+    w.applyWindowOwners(windowOwners({{4242, 1000 + 4242}}, 100, 3.0));
+    QCOMPARE(pidOrder(table, ProcessModel::Apps), QList<int> {4242});
+    QVERIFY(incomplete({}, 0, 0, 0, 0)->complete());
+
+    // An incomplete one while that list is still valid changes nothing, not
+    // even its expiry...
+    *clock = 101;
+    w.applyWindowOwners(incomplete({{4242, 1000 + 4242}, {100, 1100}}, 101, 1, 0, 0));
+    QCOMPARE(w.processGrouping().state, ProcessGrouping::State::Detected);
+    QCOMPARE(pidOrder(table, ProcessModel::Apps), QList<int> {4242});
+    QVERIFY(!note->isVisibleTo(&w));
+    *clock = 103.1;
+    QTRY_COMPARE_WITH_TIMEOUT(w.processGrouping().state, ProcessGrouping::State::Unavailable, 2000);
+    // ...and then it is the reason, with what was missing.
+    QCOMPARE(groupTitles(table), (QStringList {QStringLiteral("App detection unavailable"),
+                                               QStringLiteral("Unclassified user processes (4)"),
+                                               QStringLiteral("Kernel processes (1)")}));
+    QVERIFY2(note->isVisibleTo(&w), "incomplete list without a note");
+    QVERIFY2(note->text().contains(QStringLiteral("The window list from Hyprland is incomplete (1 window has no "
+                                                  "usable process ID)")),
+             qPrintable(note->text()));
+
+    // Each kind of gap, with or without identified owners, is not Detected.
+    struct Gap {
+        int withoutPid, unresolved, ambiguous;
+        const char* text;
+    };
+    const Gap gaps[] = {
+        {2, 0, 0, "2 windows have no usable process ID"},
+        {0, 1, 0, "1 window owner could not be read or had just exited"},
+        {0, 3, 0, "3 window owners could not be read or had just exited"},
+        {0, 0, 1, "1 window owner started or was replaced while the list was read"},
+        {0, 0, 2, "2 window owners started or were replaced while the list was read"},
+        {1, 1, 1, "1 window has no usable process ID; 1 window owner could not be read"},
+    };
+    double t = 103.2;
+    for (const Gap& gap : gaps) {
+        for (const bool withOwners : {false, true}) {
+            t += 0.01;
+            *clock = t;
+            std::vector<windows::Owner> owners;
+            if (withOwners)
+                owners = {{4242, 1000 + 4242}};
+            w.applyWindowOwners(incomplete(owners, t, gap.withoutPid, gap.unresolved, gap.ambiguous));
+            QCOMPARE(w.processGrouping().state, ProcessGrouping::State::Unavailable);
+            QVERIFY(pidOrder(table, ProcessModel::Apps).isEmpty());
+            QCOMPARE(groupTitles(table).at(1), QStringLiteral("Unclassified user processes (4)"));
+            QVERIFY2(note->text().contains(QLatin1String(gap.text)), qPrintable(note->text()));
+            QVERIFY(groupRow(table, ProcessModel::Apps).data(Qt::ToolTipRole).toString().contains(QLatin1String(gap.text)));
+        }
+    }
+
+    // A complete, empty list is an answer: no process owns a window.
+    t += 0.01;
+    *clock = t;
+    w.applyWindowOwners(windowOwners({}, t));
+    QCOMPARE(w.processGrouping().state, ProcessGrouping::State::Detected);
+    QCOMPARE(groupTitles(table).mid(0, 2), (QStringList {QStringLiteral("Apps (0)"),
+                                                         QStringLiteral("Background processes (4)")}));
+    QVERIFY(!note->isVisibleTo(&w));
+    // A later incomplete list does not replace it while it is valid.
+    t += 0.01;
+    *clock = t;
+    w.applyWindowOwners(incomplete({{4242, 1000 + 4242}}, t, 0, 0, 1));
+    QCOMPARE(w.processGrouping().state, ProcessGrouping::State::Detected);
+    QVERIFY(pidOrder(table, ProcessModel::Apps).isEmpty());
 }
 
 void TestUi::csvExportWritesUnitsAndBlanks()
@@ -1171,10 +1765,17 @@ void TestUi::csvExportShutdownIsBounded()
     QSignalSpy done(w.get(), &MainWindow::csvExportFinished);
     QVERIFY(w->startCsvExport(env.dir.filePath(QStringLiteral("stuck.csv"))));
     QVERIFY(gate->waitEntered(5000));
+    // The abandoned export is reported once, with the destination and the
+    // possible named temporary, and not again when the window is destroyed.
+    QTest::ignoreMessage(QtWarningMsg,
+                         QRegularExpression(QStringLiteral(
+                             "CSV export to \".*stuck\\.csv\" was still blocked at exit and was abandoned\\..*"
+                             "either complete or unchanged.*\"stuck\\.csv\\.XXXXXX\" temporary may remain")));
     QElapsedTimer t;
     t.start();
     QVERIFY(!w->shutdown(300)); // export abandoned, not waited for
     QVERIFY2(t.elapsed() < 1500, qPrintable(QString::number(t.elapsed())));
+    QTest::failOnWarning(QRegularExpression(QStringLiteral("CSV export")));
     w.reset(); // destroying the window after that must not hang either
     QVERIFY(t.elapsed() < 2500);
     gate->release(); // the detached worker finishes with its own data only
@@ -1240,7 +1841,9 @@ void TestUi::settingsPersist()
         w.setIntervalMs(2000);
         w.setWindowSeconds(60);
         w.showPage(MainWindow::MemoryPage);
-        child<QCheckBox>(w, "kernelThreadsCheck")->setChecked(true);
+        auto* table = child<QTreeView>(w, "processTable");
+        table->expand(groupRow(table, ProcessModel::Kernel));
+        table->sortByColumn(ProcessModel::Name, Qt::AscendingOrder);
         auto* nets = child<QComboBox>(w, "netSelector");
         nets->setCurrentIndex(2);
         Q_EMIT nets->activated(2);
@@ -1251,7 +1854,10 @@ void TestUi::settingsPersist()
         QCOMPARE(w.intervalMs(), 2000);
         QCOMPARE(w.windowSeconds(), 60);
         QCOMPARE(w.currentPage(), MainWindow::MemoryPage);
-        QVERIFY(child<QCheckBox>(w, "kernelThreadsCheck")->isChecked());
+        auto* table = child<QTreeView>(w, "processTable");
+        QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Kernel)));
+        QCOMPARE(table->header()->sortIndicatorSection(), int(ProcessModel::Name));
+        QCOMPARE(table->header()->sortIndicatorOrder(), Qt::AscendingOrder);
         w.applySnapshot(snapshot(5, false));
         QCOMPARE(child<QComboBox>(w, "netSelector")->currentData().toString(), QStringLiteral("wlp0s20f3"));
     }
@@ -1273,6 +1879,43 @@ void TestUi::settingsPersist()
         QCOMPARE(w.windowSeconds(), 300);
         QVERIFY(w.currentPage() >= 0 && w.currentPage() < MainWindow::PageCount);
     }
+    {
+        // Settings from before process groups: the kernel thread checkbox
+        // opens the kernel group, and the sort column follows PID and Name
+        // swapping places.
+        Env old;
+        {
+            QSettings s(old.settings(), QSettings::IniFormat);
+            s.setValue(QStringLiteral("showKernelThreads"), true);
+            s.setValue(QStringLiteral("processSortColumn"), 0); // PID then
+            s.setValue(QStringLiteral("processSortOrder"), 0);
+        }
+        {
+            MainWindow w(old.options());
+            auto* table = child<QTreeView>(w, "processTable");
+            QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Kernel)));
+            QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Apps)));
+            QCOMPARE(table->header()->sortIndicatorSection(), int(ProcessModel::Pid));
+            QCOMPARE(table->header()->sortIndicatorOrder(), Qt::AscendingOrder);
+            w.close();
+        }
+        {
+            // Once saved, the new keys win over the old ones.
+            QSettings s(old.settings(), QSettings::IniFormat);
+            s.setValue(QStringLiteral("processView/expandKernel"), false);
+            s.sync();
+            MainWindow w(old.options());
+            auto* table = child<QTreeView>(w, "processTable");
+            QVERIFY(!table->isExpanded(groupRow(table, ProcessModel::Kernel)));
+            QCOMPARE(table->header()->sortIndicatorSection(), int(ProcessModel::Pid));
+        }
+        Env fresh;
+        MainWindow w(fresh.options());
+        auto* table = child<QTreeView>(w, "processTable");
+        QVERIFY(!table->isExpanded(groupRow(table, ProcessModel::Kernel))); // new users: collapsed
+        QCOMPARE(table->header()->sortIndicatorSection(), int(ProcessModel::Cpu));
+        QCOMPARE(table->header()->sortIndicatorOrder(), Qt::DescendingOrder);
+    }
 }
 
 void TestUi::blockedCollectorGoesStaleAndRecovers()
@@ -1293,6 +1936,7 @@ void TestUi::blockedCollectorGoesStaleAndRecovers()
     MainWindowOptions o = env.options();
     o.startCollector = true;
     o.initialIntervalMs = 500;
+    o.windowProbe.enabled = false; // not this desktop's windows
     o.sampler.procRoot = tree.path("proc");
     o.sampler.sysRoot = tree.path("sys");
     o.sampler.statFs = [](const std::string&, int& err) -> std::optional<ps::FsStats> {
@@ -1321,7 +1965,7 @@ void TestUi::blockedCollectorGoesStaleAndRecovers()
     MainWindow w(std::move(o));
     QTRY_VERIFY_WITH_TIMEOUT(w.snapshotsApplied() >= 2, 5000);
     w.showPage(MainWindow::ProcessPage);
-    QTRY_VERIFY_WITH_TIMEOUT(child<QTableView>(w, "processTable")->model()->rowCount() >= 1, 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(!pidOrder(child<QTreeView>(w, "processTable")).isEmpty(), 3000);
     QVERIFY(!w.isStale());
     QVERIFY(child<MetricButton>(w, "navMemory")->valueText() != kDash);
 
@@ -1334,9 +1978,9 @@ void TestUi::blockedCollectorGoesStaleAndRecovers()
     QVERIFY2(w.statusText().contains(QStringLiteral("blocked or starved")), qPrintable(w.statusText()));
     QCOMPARE(child<MetricButton>(w, "navMemory")->valueText(), kDash);
     QCOMPARE(factText(w, "mem_used"), kDash);
-    auto* table = child<QTableView>(w, "processTable");
-    QVERIFY(table->model()->rowCount() >= 1); // rows kept...
-    QCOMPARE(table->model()->index(0, ProcessModel::Cpu).data().toString(), kDash); // ...values not
+    auto* table = child<QTreeView>(w, "processTable");
+    QVERIFY(!pidOrder(table).isEmpty()); // rows kept...
+    QCOMPARE(processRow(table, 100).siblingAtColumn(ProcessModel::Cpu).data().toString(), kDash); // ...values not
     QVERIFY(child<QLabel>(w, "processCount")->text().contains(QStringLiteral("No recent samples")));
     for (auto* chart : w.findChildren<TimeChart*>())
         QCOMPARE(chart->notice(), QStringLiteral("No recent samples"));
@@ -1576,11 +2220,72 @@ void TestUi::chartWithoutSamplesInWindow()
         (void)chart.grab();
         QCOMPARE(chart.lastPaintedPoints(), 1);
 
-        // The compact form shows no current value from an expired sample.
+        // The compact form shows no current value from an expired sample,
+        // and says so to assistive technology too.
         chart.setViewEnd(400);
         chart.setMode(TimeChart::Mode::Compact);
         (void)chart.grab();
         QCOMPARE(chart.lastPaintedPoints(), 0);
+        QCOMPARE(chart.accessibleDescription(), idle);
+        QCOMPARE(chart.focusPolicy(), Qt::NoFocus);
+        // A new sample is announced as the latest value (no cursor readout
+        // in the compact form); the frame loop alone never rewrites it.
+        add(partial, 399, 40);
+        chart.refresh();
+        QCOMPARE(chart.accessibleDescription(), pct(40));
+        for (double end = 400; end < 470; end += 1.0 / 60) {
+            chart.setViewEnd(end);
+            chart.update();
+        }
+        (void)chart.grab();
+        QCOMPARE(chart.lastPaintedPoints(), 0);
+        QCOMPARE(chart.accessibleDescription(), pct(40));
+        chart.refresh(); // sample cadence (a sample or the stale timer)
+        QCOMPARE(chart.accessibleDescription(), idle);
+        // While the window says samples stopped or are paused, the value is
+        // announced as the last one, not as current; an expired window
+        // keeps its own explanation.
+        chart.setViewEnd(470);
+        add(partial, 469, 50);
+        chart.refresh();
+        QCOMPARE(chart.accessibleDescription(), pct(50));
+        chart.setNotice(QStringLiteral("No recent samples"));
+        QCOMPARE(chart.accessibleDescription(), QStringLiteral("No recent samples, last ") + pct(50));
+        chart.refresh();
+        QCOMPARE(chart.accessibleDescription(), QStringLiteral("No recent samples, last ") + pct(50));
+        chart.setNotice(QStringLiteral("Paused"));
+        QCOMPARE(chart.accessibleDescription(), QStringLiteral("Paused, last ") + pct(50));
+        chart.setViewEnd(600);
+        chart.refresh();
+        QCOMPARE(chart.accessibleDescription(), idle);
+        chart.setViewEnd(470);
+        chart.setNotice(QString());
+        QCOMPARE(chart.accessibleDescription(), pct(50));
+        // The full form without a cursor announces the notice the same way.
+        chart.setMode(TimeChart::Mode::Full);
+        chart.clearCursor();
+        QCOMPARE(chart.readoutText(), QString());
+        QCOMPARE(chart.accessibleDescription(), pct(50));
+        chart.setNotice(QStringLiteral("No recent samples"));
+        QCOMPARE(chart.accessibleDescription(), QStringLiteral("No recent samples, last ") + pct(50));
+        chart.refresh(); // a stale-timer refresh changes nothing
+        QCOMPARE(chart.accessibleDescription(), QStringLiteral("No recent samples, last ") + pct(50));
+        chart.setNotice(QStringLiteral("Paused"));
+        QCOMPARE(chart.accessibleDescription(), QStringLiteral("Paused, last ") + pct(50));
+        // With a cursor it hears exactly the readout, which gives the
+        // selected sample's own age, whatever the notice.
+        chart.setCursorTime(469);
+        QCOMPARE(chart.readoutText(), QStringLiteral("1.0 s ago\n") + line(50));
+        QCOMPARE(chart.accessibleDescription(), chart.readoutText());
+        chart.setNotice(QStringLiteral("No recent samples"));
+        QCOMPARE(chart.accessibleDescription(), chart.readoutText());
+        chart.clearCursor();
+        QCOMPARE(chart.accessibleDescription(), QStringLiteral("No recent samples, last ") + pct(50));
+        // Recovery: samples resume, the notice clears, the value is current.
+        chart.setNotice(QString());
+        add(partial, 470, 60);
+        chart.refresh();
+        QCOMPARE(chart.accessibleDescription(), pct(60));
     }
 
     // Wrapped history: capacity 4 after 7 samples keeps 103..106 with the
@@ -1664,7 +2369,8 @@ void TestUi::liveCollectorPopulatesAndShutsDown()
     const QString temp = child<MetricButton>(*w, "navTemperatures")->valueText();
     QVERIFY2(temp.contains(QString::fromUtf8("\u00b0C")) || temp == QStringLiteral("Unavailable"), qPrintable(temp));
     QVERIFY(child<MetricButton>(*w, "navProcesses")->valueText().contains(QStringLiteral("processes")));
-    QVERIFY(child<QTableView>(*w, "processTable")->model()->rowCount() > 0);
+    QVERIFY(!pidOrder(child<QTreeView>(*w, "processTable")).isEmpty());
+    QVERIFY(w->windowProbe() == nullptr || w->windowProbe()->isRunning());
 
     w->showPage(MainWindow::CpuPage);
     const QString shot = QDir(artifactDir()).filePath(QStringLiteral("tst_ui-live.png"));
@@ -1733,7 +2439,7 @@ void TestUi::simpleByDefaultDetailsRestoresEverything()
 
     auto* cpuChart = child<TimeChart>(w, "cpuChart");
     auto* memChart = child<TimeChart>(w, "memoryChart");
-    auto* table = child<QTableView>(w, "processTable");
+    auto* table = child<QTreeView>(w, "processTable");
     auto* disks = child<QComboBox>(w, "diskSelector");
     auto* nets = child<QComboBox>(w, "netSelector");
     auto* sensors = child<QTreeWidget>(w, "sensorList");
@@ -1812,8 +2518,15 @@ void TestUi::simpleByDefaultDetailsRestoresEverything()
     QTest::qWait(30);
     QVERIFY(factText(w, "cpu_user").contains(QStringLiteral("15")));
     int coresShown = 0;
-    for (auto* c : child<QWidget>(w, "coreGrid")->findChildren<TimeChart*>())
+    for (auto* c : child<QWidget>(w, "coreGrid")->findChildren<TimeChart*>()) {
         coresShown += shownWithArea(c) ? 1 : 0;
+        // Each tile's value is available without pixels, as "CPU n 12.0 %".
+        QAccessibleInterface* a11y = QAccessible::queryAccessibleInterface(c);
+        QVERIFY(a11y);
+        const QString d = a11y->text(QAccessible::Description);
+        QVERIFY2(d.startsWith(c->accessibleName() + QLatin1Char(' ')) && d.endsWith(QLatin1Char('%')), qPrintable(d));
+        QCOMPARE(c->focusPolicy(), Qt::NoFocus);
+    }
     QCOMPARE(coresShown, 4);
 
     details->trigger();
@@ -1826,7 +2539,7 @@ void TestUi::simpleByDefaultDetailsRestoresEverything()
     QCOMPARE(w.snapshotsApplied(), applied);
     QCOMPARE(disks->currentData().toString(), QStringLiteral("nvme0n1"));
     QCOMPARE(nets->currentData().toString(), QStringLiteral("wlp0s20f3"));
-    QCOMPARE(table->horizontalHeader()->sortIndicatorSection(), int(ProcessModel::Memory));
+    QCOMPARE(table->header()->sortIndicatorSection(), int(ProcessModel::Memory));
     QCOMPARE(pidOrder(table), order);
     QCOMPARE(sensors->topLevelItemCount(), 2);
     w.close();
@@ -3441,6 +4154,136 @@ void TestUi::timeAxisLabelsNeverTouch()
     }
 }
 
+namespace {
+
+constexpr int kChildSkip = 77;
+
+// Child process of threadStartFailureIsShownAndRecovers(): lowers only its own
+// soft RLIMIT_NPROC while the window is created, so neither the collector
+// thread nor the window-probe thread can start, then restores it.
+int runThreadStartChild()
+{
+    QTextStream out(stdout);
+    int failures = 0;
+    const auto fail = [&](const QString& m) {
+        out << "FAIL: " << m << Qt::endl;
+        ++failures;
+    };
+    Tree tree;
+    tree.base();
+    Env env;
+    MainWindowOptions o = env.options();
+    o.startCollector = true;
+    o.initialIntervalMs = 500;
+    o.sampler.procRoot = tree.path("proc");
+    o.sampler.sysRoot = tree.path("sys");
+    o.sampler.statFs = [](const std::string&, int& err) -> std::optional<ps::FsStats> {
+        err = ENOENT;
+        return std::nullopt;
+    };
+    o.sampler.userName = [](uint32_t uid) { return "u" + std::to_string(uid); };
+    windows::Environment e;
+    e.hyprlandSignature = "sig";
+    e.runtimeDir = "/nonexistent-run";
+    e.waylandDisplay = "wayland-1";
+    e.sessionType = "wayland";
+    o.windowProbe.environment = e;
+    o.windowProbe.procRoot = tree.path("proc");
+    o.windowProbe.query = [](const windows::QueryContext&) {
+        windows::Query q; // a complete, empty window list
+        q.status = windows::Status::Ok;
+        return q;
+    };
+
+    rlimit old {};
+    if (::getrlimit(RLIMIT_NPROC, &old) != 0)
+        return kChildSkip;
+    rlimit low = old;
+    low.rlim_cur = 1;
+    if (::setrlimit(RLIMIT_NPROC, &low) != 0)
+        return kChildSkip;
+    try {
+        std::thread t([] {});
+        t.join();
+        ::setrlimit(RLIMIT_NPROC, &old);
+        out << "INFO: RLIMIT_NPROC does not stop thread creation here" << Qt::endl;
+        return kChildSkip;
+    } catch (const std::system_error&) {
+    }
+    std::unique_ptr<MainWindow> w;
+    try {
+        w = std::make_unique<MainWindow>(std::move(o));
+    } catch (const std::exception& ex) {
+        ::setrlimit(RLIMIT_NPROC, &old);
+        fail(QStringLiteral("creating the window threw: %1").arg(QString::fromLocal8Bit(ex.what())));
+        return failures;
+    }
+    // The failure result is queued; the first retry is a second away.
+    QElapsedTimer t;
+    t.start();
+    while (t.elapsed() < 300)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    const QString status = w->statusText();
+    const ProcessGrouping grouping = w->processGrouping();
+    const int applied = w->snapshotsApplied();
+    ::setrlimit(RLIMIT_NPROC, &old);
+    out << "INFO: while limited: status \"" << status << "\"; app detection: \"" << grouping.reason << "\""
+        << Qt::endl;
+    if (!status.contains(QStringLiteral("The collector thread could not be started"))
+        || !status.contains(QStringLiteral("retrying automatically")))
+        fail(QStringLiteral("status does not explain the collector start failure: \"%1\"").arg(status));
+    if (grouping.state != ProcessGrouping::State::Unavailable
+        || !grouping.reason.startsWith(QStringLiteral("Could not start the window-list thread")))
+        fail(QStringLiteral("app detection does not explain the probe start failure: \"%1\"").arg(grouping.reason));
+    if (applied != 0)
+        fail(QStringLiteral("%1 snapshots arrived without a collector thread").arg(applied));
+
+    // With the limit restored, both threads start on their own.
+    t.restart();
+    const auto recovered = [&] {
+        return w->snapshotsApplied() >= 1 && !w->statusText().contains(QStringLiteral("could not be started"))
+            && w->processGrouping().state == ProcessGrouping::State::Detected;
+    };
+    while (!recovered() && t.elapsed() < 6000)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    out << "INFO: recovered after " << t.elapsed() << " ms: status \"" << w->statusText() << "\"" << Qt::endl;
+    if (!recovered())
+        fail(QStringLiteral("no recovery within 6 s: %1 snapshots, status \"%2\", app detection \"%3\"")
+                 .arg(w->snapshotsApplied())
+                 .arg(w->statusText(), w->processGrouping().reason));
+    if (!w->shutdown(2000))
+        fail(QStringLiteral("shutdown was not clean after recovery"));
+    return failures;
+}
+
+} // namespace
+
+void TestUi::threadStartFailureIsShownAndRecovers()
+{
+    if (::geteuid() == 0)
+        QSKIP("root is exempt from RLIMIT_NPROC");
+    QProcess child;
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.insert(QStringLiteral("PS_UI_CHILD"), QStringLiteral("threadstart"));
+    child.setProcessEnvironment(env);
+    child.setProcessChannelMode(QProcess::MergedChannels);
+    child.start(QCoreApplication::applicationFilePath(), {});
+    QVERIFY(child.waitForStarted(5000));
+    if (!child.waitForFinished(30000)) {
+        child.kill();
+        child.waitForFinished(5000);
+        QFAIL(qPrintable(QStringLiteral("child did not finish within 30 s:\n") + QString::fromLocal8Bit(child.readAll())));
+    }
+    const QString out = QString::fromLocal8Bit(child.readAll());
+    for (const QString& line : out.split(QLatin1Char('\n'), Qt::SkipEmptyParts))
+        if (line.startsWith(QLatin1String("INFO: ")))
+            qInfo("%s", qPrintable(line.mid(6)));
+    if (child.exitStatus() == QProcess::NormalExit && child.exitCode() == kChildSkip)
+        QSKIP("RLIMIT_NPROC does not stop thread creation for this user");
+    QVERIFY2(child.exitStatus() == QProcess::NormalExit && child.exitCode() == 0 && !out.contains(QLatin1String("FAIL: ")),
+             qPrintable(QStringLiteral("exit %1:\n%2").arg(child.exitCode()).arg(out)));
+}
+
 int main(int argc, char** argv)
 {
     // Never open windows on the user's desktop unless explicitly asked to
@@ -3448,6 +4291,8 @@ int main(int argc, char** argv)
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM"))
         qputenv("QT_QPA_PLATFORM", "offscreen");
     QApplication app(argc, argv);
+    if (qgetenv("PS_UI_CHILD") == "threadstart")
+        return runThreadStartChild();
     TestUi tc;
     QTEST_SET_MAIN_SOURCE_PATH
     return QTest::qExec(&tc, argc, argv);

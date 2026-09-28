@@ -85,7 +85,48 @@ Collector::Collector(ps::SamplerOptions options, QObject* parent)
     m_worker = worker;
     connect(m_thread, &QThread::finished, worker, &QObject::deleteLater);
     connect(worker, &CollectorWorker::snapshotReady, this, &Collector::onWorkerSnapshot, Qt::QueuedConnection);
+    m_retryTimer = new QTimer(this);
+    m_retryTimer->setSingleShot(true);
+    connect(m_retryTimer, &QTimer::timeout, this, &Collector::retryStart);
+    startThread();
+}
+
+// QThread::start() only logs a warning when the system refuses a new thread
+// (EAGAIN at RLIMIT_NPROC or the cgroup's pids.max); the thread is then just
+// not running, and the worker stays unstarted until a retry succeeds.
+bool Collector::startThread()
+{
     m_thread->start();
+    const bool running = m_thread->isRunning();
+    m_startFailures = running ? 0 : std::min(m_startFailures + 1, 6);
+    const QString error = running ? QString()
+                                  : QStringLiteral("The collector thread could not be started: the system refused to "
+                                                   "create a thread (a process or thread limit may have been reached)");
+    if (error != m_startError) {
+        m_startError = error;
+        Q_EMIT startErrorChanged();
+    }
+    return running;
+}
+
+void Collector::retryStart()
+{
+    if (m_stopped || !m_thread || m_thread->isRunning())
+        return;
+    if (startThread()) {
+        if (m_started && !m_paused)
+            activateWorker();
+    } else if (m_started && !m_paused) {
+        m_retryTimer->start(std::min(30000, 1000 << (m_startFailures - 1)));
+    }
+}
+
+void Collector::activateWorker()
+{
+    if (!m_worker || !m_thread || !m_thread->isRunning())
+        return;
+    QMetaObject::invokeMethod(m_worker, "activate", Qt::QueuedConnection, Q_ARG(int, m_intervalMs),
+                              Q_ARG(quint64, m_generation));
 }
 
 Collector::~Collector()
@@ -106,8 +147,12 @@ void Collector::start(int intervalMs)
     m_started = true;
     if (m_paused || !m_worker)
         return; // setPaused(false) activates the worker later
-    QMetaObject::invokeMethod(m_worker, "activate", Qt::QueuedConnection, Q_ARG(int, m_intervalMs),
-                              Q_ARG(quint64, m_generation));
+    if (!m_thread->isRunning()) {
+        if (!m_retryTimer->isActive())
+            m_retryTimer->start(std::min(30000, 1000 << std::max(0, m_startFailures - 1)));
+        return; // activated once a retry starts the thread
+    }
+    activateWorker();
 }
 
 void Collector::setIntervalMs(int intervalMs)
@@ -115,7 +160,7 @@ void Collector::setIntervalMs(int intervalMs)
     if (m_stopped)
         return;
     m_intervalMs = std::clamp(intervalMs, kMinIntervalMs, kMaxIntervalMs);
-    if (m_worker)
+    if (m_worker && m_thread && m_thread->isRunning())
         QMetaObject::invokeMethod(m_worker, "setIntervalMs", Qt::QueuedConnection, Q_ARG(int, m_intervalMs));
 }
 
@@ -126,14 +171,22 @@ void Collector::setPaused(bool paused)
     m_paused = paused;
     if (!m_worker || !m_started)
         return;
+    if (!m_thread->isRunning()) {
+        // Never started: resuming retries at once, pausing stops retrying.
+        m_retryTimer->stop();
+        if (!paused) {
+            ++m_generation;
+            retryStart();
+        }
+        return;
+    }
     if (paused) {
         QMetaObject::invokeMethod(m_worker, "pause", Qt::QueuedConnection);
     } else {
         // A new generation makes any snapshot still in flight from before the
         // pause stale; activation also rebases every counter.
         ++m_generation;
-        QMetaObject::invokeMethod(m_worker, "activate", Qt::QueuedConnection, Q_ARG(int, m_intervalMs),
-                                  Q_ARG(quint64, m_generation));
+        activateWorker();
     }
 }
 
@@ -155,8 +208,19 @@ bool Collector::stop(int timeoutMs)
         if (m_worker)
             disconnect(m_worker, nullptr, this, nullptr);
     }
+    if (m_retryTimer)
+        m_retryTimer->stop();
     if (!m_thread)
         return true;
+    if (!m_thread->isRunning() && !m_thread->isFinished()) {
+        // The thread never started, so its event loop cannot delete the
+        // worker; nothing else references it.
+        delete m_worker.data();
+        delete m_thread;
+        m_thread = nullptr;
+        m_worker = nullptr;
+        return true;
+    }
     if (m_thread->isRunning()) {
         if (m_worker)
             QMetaObject::invokeMethod(m_worker, "shutdown", Qt::QueuedConnection);

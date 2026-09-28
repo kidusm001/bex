@@ -4,6 +4,8 @@
 
 #include "app/collector.h"
 #include "app/csvexporter.h"
+#include "app/processmodel.h"
+#include "app/windowowners.h"
 #include "core/history.h"
 #include "core/snapshot.h"
 
@@ -18,23 +20,20 @@
 #include <vector>
 
 class QAction;
-class QCheckBox;
 class QComboBox;
 class QGridLayout;
 class QLabel;
 class QLineEdit;
 class QSettings;
 class QStackedWidget;
-class QTableView;
 class QTimer;
+class QTreeView;
 class QSplitter;
 class QTreeWidget;
 class QWindow;
 class CoreGrid;
 class HeadRow;
 class MetricButton;
-class ProcessFilterModel;
-class ProcessModel;
 class TimeChart;
 
 struct MainWindowOptions {
@@ -53,6 +52,11 @@ struct MainWindowOptions {
     QString themeNote;
     // The Qt style chosen at startup, for About: a style sheet wraps it later.
     QString styleName;
+    // Window-owner detection for the Apps group. The probe thread runs when
+    // enabled and either the collector runs or a query is injected; without
+    // it, results only arrive via applyWindowOwners(). Its clock defaults to
+    // `clock`, which is then also called on the probe thread.
+    windows::ProbeOptions windowProbe;
 };
 
 class MainWindow : public QMainWindow {
@@ -105,12 +109,22 @@ public:
     // Feeds one snapshot as if the collector delivered it (tests, and the
     // collector connection itself). Ignored while paused.
     void applySnapshot(ps::SnapshotPtr snapshot);
-    // Stops the collector thread and waits (within the same budget, at most
-    // one second) for a running export; false if either had to be abandoned.
+    // Feeds one window-owner result as if the probe delivered it (tests, and
+    // the probe connection itself). Ignored while paused or stopped, and if
+    // resolved no later than the newest one applied or in the future.
+    void applyWindowOwners(windows::ResultPtr result);
+    // The Apps / Background split in effect (it follows the newest result
+    // while that is valid; see README, "Processes").
+    const ProcessGrouping& processGrouping() const { return m_grouping; }
+    windows::WindowProbe* windowProbe() const { return m_probe; }
+    // Stops the collector and window-probe threads and waits (within the
+    // same budget, at most one second) for a running export; false if any
+    // had to be abandoned.
     bool shutdown(int timeoutMs = 2000);
 
 Q_SIGNALS:
     void snapshotApplied();
+    void windowOwnersApplied();
     void csvExportFinished(bool ok, const QString& path, const QString& error);
 
 protected:
@@ -141,6 +155,17 @@ private:
     void updateFacts();
     void updateFilesystems(const ps::Snapshot& s);
     void updateProcesses();
+    // Recomputes m_grouping from the newest results and the clock; true if
+    // it changed (the process model is regrouped when its page shows).
+    bool updateGrouping();
+    void updateGroupNote();
+    void syncGroupExpansion();
+    void onGroupExpansion(const QModelIndex& index, bool expanded);
+    void saveGroupExpansion();
+    // The process list is on screen, so window owners are asked for often.
+    void fitProcessNameColumn();
+    bool processListShown() const;
+    void updateProbeVisibility();
     void updateStatus();
     void updateChartNotices();
     void refreshCharts();
@@ -175,6 +200,7 @@ private:
     MainWindowOptions m_options;
     std::unique_ptr<QSettings> m_settings;
     Collector* m_collector = nullptr;
+    windows::WindowProbe* m_probe = nullptr;
     CsvExporter* m_exporter = nullptr;
     ps::History m_history;
     ps::SnapshotPtr m_latest;
@@ -232,11 +258,29 @@ private:
     QTreeWidget* m_sensorList = nullptr;
     QLabel* m_tempNote = nullptr;
     QLineEdit* m_procFilter = nullptr;
-    QCheckBox* m_kernelCheck = nullptr;
     QLabel* m_procCount = nullptr;
-    QTableView* m_procTable = nullptr;
+    QLabel* m_groupNote = nullptr;
+    QTreeView* m_procTable = nullptr;
+    int m_procNameWidth = 0;    // the Name column's width in Details
+    int m_procNameMinWidth = 0; // Simple: narrower than this scrolls sideways
+    bool m_procNameFitted = false; // Simple: the Name column fills the width
     ProcessModel* m_procModel = nullptr;
     ProcessFilterModel* m_procProxy = nullptr;
+    // Window owners: the newest successful list and the newest failure
+    // (each may be null), and the grouping derived from them.
+    windows::ResultPtr m_ownersOk;
+    windows::ResultPtr m_ownersFailure;
+    double m_ownersNewest = ps::kNaN; // resolution time of the newest result applied
+    // No result yet since the probe started or resumed (since when).
+    bool m_ownersAwaiting = false;
+    double m_ownersAwaitingSince = ps::kNaN;
+    ProcessGrouping m_grouping;
+    // Group expansion chosen by the user (saved), and while a filter is
+    // typed: every group opens so matches show, unless collapsed during the
+    // filter. Clearing the filter restores the saved state.
+    std::array<bool, ProcessModel::GroupCount> m_groupExpanded {true, true, false};
+    std::array<bool, ProcessModel::GroupCount> m_filterExpanded {true, true, true};
+    bool m_syncingExpansion = false;
 
     // Fact labels by page, keyed by a stable id.
     std::vector<std::pair<std::string, QLabel*>> m_facts;
