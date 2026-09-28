@@ -11,7 +11,19 @@
 #include "core/snapshot.h"
 
 #include <QAccessible>
+#include <QAction>
+#include <QActionGroup>
 #include <QApplication>
+#include <QComboBox>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMenu>
+#include <QMenuBar>
+#include <QSettings>
+#include <QStatusBar>
+#include <QTimer>
+#include <QToolBar>
+#include <QToolButton>
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QProcess>
@@ -765,6 +777,10 @@ private Q_SLOTS:
     void detailsCoreChartsStayHonest();
     void threadStartFailure_data();
     void threadStartFailure();
+    void declutterToolbarKeepsOnlyRangeAndDetails();
+    void declutterIntervalMenuIsOneExclusiveChoice();
+    void declutterHealthyViewIsQuiet();
+    void declutterExceptionsAreShortVisibleAndDescribed();
 };
 
 // ---------------------------------------------------------------------------
@@ -1088,6 +1104,9 @@ public:
     }
     int count(const QObject* o) const { return int(std::count(m_events.begin(), m_events.end(), o)); }
     int total() const { return int(m_events.size()); }
+    // Before Qt 6.10, QAccessible::setActive() does not activate the platform
+    // accessibility, and updates reach the handler only while it is active.
+    bool observable() const { return QAccessible::isActive(); }
 
 private:
     static void handle(QAccessibleEvent* e)
@@ -1210,6 +1229,8 @@ void TestCouncil::compactChartAnnouncesAtDataCadenceOnly()
     QCOMPARE(descriptionOf(&c), QStringLiteral("CPU 0 20.0 %"));
 
     AccessibleLog log;
+    if (!log.observable())
+        QSKIP("accessibility updates are not observable here (Qt < 6.10 without an active platform accessibility)");
     const int paintsBefore = c.paintCount();
     // Two seconds of 60 FPS frames between samples.
     for (int f = 1; f <= 120; ++f) {
@@ -1315,6 +1336,8 @@ void TestCouncil::detailsCoreChartsStayHonest()
     QVERIFY2(!descriptionOf(cores[2]).contains(QLatin1Char('%')), qPrintable(descriptionOf(cores[2]))); // offline
 
     AccessibleLog log;
+    if (!log.observable())
+        QSKIP("accessibility updates are not observable here (Qt < 6.10 without an active platform accessibility)");
     // One second of frames between samples: no announcements.
     const int paintsBefore = cores[0]->paintCount();
     for (int f = 1; f <= 60; ++f) {
@@ -1410,6 +1433,409 @@ void TestCouncil::detailsCoreChartsStayHonest()
 }
 
 // ---------------------------------------------------------------------------
+// Declutter (COUNCIL-FOLLOWUP-2): Pause and Export live in the menus only, the
+// update interval is View > Update Interval, a healthy view says nothing in
+// the status bar, and every exception is a short visible cue whose full
+// reason is the tooltip and the accessible description.
+
+namespace {
+
+struct QuietWindow {
+    QTemporaryDir dir;
+    std::shared_ptr<double> clock = std::make_shared<double>(100.0);
+    MainWindowOptions options(int intervalMs = 1000)
+    {
+        MainWindowOptions o;
+        o.startCollector = false;
+        o.settingsFile = dir.filePath(QStringLiteral("pulsescope.ini"));
+        o.windowProbe.enabled = false;
+        o.initialIntervalMs = intervalMs;
+        auto c = clock;
+        o.clock = [c] { return *c; };
+        return o;
+    }
+    QVariant saved(const QString& key) const
+    {
+        QSettings s(dir.filePath(QStringLiteral("pulsescope.ini")), QSettings::IniFormat);
+        return s.value(key);
+    }
+};
+
+void applyAt(MainWindow& w, QuietWindow& q, double t, std::vector<std::string> problems = {})
+{
+    *q.clock = t;
+    auto s = std::make_shared<ps::Snapshot>(*coreSnapshot(t, 20.0, 10.0));
+    s->problems = std::move(problems);
+    w.applySnapshot(s);
+}
+
+QString describeToolbar(QToolBar* tb)
+{
+    QStringList parts;
+    for (QAction* a : tb->actions()) {
+        if (!a->isVisible())
+            continue;
+        if (a->isSeparator())
+            parts << QStringLiteral("|");
+        else if (QWidget* x = tb->widgetForAction(a); x && !qobject_cast<QToolButton*>(x))
+            parts << x->objectName();
+        else
+            parts << a->objectName();
+    }
+    return parts.join(QLatin1Char(' '));
+}
+
+// Sentences of the removed explanatory paragraphs, the timing footer and the
+// healthy status line (tooltips and the README may keep them; the screen not).
+const char* const kRemovedProse[] = {"Live, sampling every", "Each chart is 0", "Read from /proc/stat",
+                                     "matching free(1)",     "never per partition", "from /proc/net/dev (1 KiB/s",
+                                     "Degrees Celsius from", "CPU %: 100% is one logical CPU"};
+const char* const kRemovedWidgets[] = {"timingLabel", "coreNote", "processShortNote", "intervalCombo"};
+
+QStringList quietProblems(MainWindow& w, const QString& when)
+{
+    QStringList p;
+    if (!w.statusText().isEmpty())
+        p << when + QStringLiteral(": status text \"%1\"").arg(w.statusText());
+    if (!w.statusDetail().isEmpty())
+        p << when + QStringLiteral(": status detail \"%1\"").arg(w.statusDetail());
+    if (w.statusBar()->isVisibleTo(&w))
+        p << when + QStringLiteral(": status bar shown while healthy");
+    for (const char* name : kRemovedWidgets)
+        if (w.findChild<QWidget*>(QLatin1String(name)))
+            p << when + QStringLiteral(": removed widget %1 exists").arg(QLatin1String(name));
+    for (QLabel* l : w.findChildren<QLabel*>()) {
+        if (!l->isVisibleTo(&w))
+            continue;
+        for (const char* prose : kRemovedProse)
+            if (l->text().contains(QLatin1String(prose)))
+                p << when + QStringLiteral(": %1 shows removed prose \"%2\"")
+                                .arg(l->objectName().isEmpty() ? QStringLiteral("a label") : l->objectName(), l->text());
+    }
+    return p;
+}
+
+// A short visible cue; the whole reason in the tooltip, the accessible
+// description and statusDetail().
+QStringList cueProblems(MainWindow& w, const QString& when, const QString& text, const QString& detail)
+{
+    QStringList p;
+    auto* label = w.findChild<QLabel*>(QStringLiteral("statusLabel"));
+    if (!label)
+        return {when + QStringLiteral(": no statusLabel")};
+    const QString shown = w.statusText();
+    if (!shown.contains(text))
+        p << when + QStringLiteral(": status text \"%1\" lacks \"%2\"").arg(shown, text);
+    if (!w.statusBar()->isVisibleTo(&w) || !label->isVisibleTo(&w))
+        p << when + QStringLiteral(": cue hidden (bar %1, label %2)").arg(w.statusBar()->isVisibleTo(&w)).arg(label->isVisibleTo(&w));
+    if (shown.contains(QLatin1Char('\n')) || shown.size() > 60)
+        p << when + QStringLiteral(": status text is not a short cue: \"%1\"").arg(shown);
+    const QString d = w.statusDetail();
+    if (!detail.isEmpty() && !d.contains(detail))
+        p << when + QStringLiteral(": detail \"%1\" lacks \"%2\"").arg(d, detail);
+    if (!detail.isEmpty() && d.size() <= shown.size())
+        p << when + QStringLiteral(": detail \"%1\" adds nothing to \"%2\"").arg(d, shown);
+    if (label->toolTip() != d || label->accessibleDescription() != d)
+        p << when + QStringLiteral(": tooltip \"%1\" / accessible description \"%2\" differ from the detail")
+                        .arg(label->toolTip(), label->accessibleDescription());
+    if (QAccessibleInterface* ai = QAccessible::queryAccessibleInterface(label)) {
+        if (ai->text(QAccessible::Description) != d)
+            p << when + QStringLiteral(": QAccessible description \"%1\"").arg(ai->text(QAccessible::Description));
+        // The cue itself must reach AT too: as the name, the value, or the
+        // label's text interface (an accessible name alone replaces it).
+        QString body;
+        if (QAccessibleTextInterface* ti = ai->textInterface())
+            body = ti->text(0, ti->characterCount());
+        if (!ai->text(QAccessible::Name).contains(text) && !ai->text(QAccessible::Value).contains(text)
+            && !body.contains(text))
+            p << when + QStringLiteral(": QAccessible name \"%1\" / value \"%2\" / text \"%3\" lack the cue")
+                            .arg(ai->text(QAccessible::Name), ai->text(QAccessible::Value), body);
+    } else {
+        p << when + QStringLiteral(": statusLabel has no accessible interface");
+    }
+    return p;
+}
+
+void closeModalsSoon()
+{
+    // A file chooser that should not have opened would block exec() forever.
+    QTimer::singleShot(2000, qApp, [] {
+        if (QWidget* m = QApplication::activeModalWidget())
+            m->close();
+    });
+}
+
+} // namespace
+
+void TestCouncil::declutterToolbarKeepsOnlyRangeAndDetails()
+{
+    QuietWindow q;
+    MainWindow w(q.options());
+    w.resize(1100, 720);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    w.activateWindow();
+    QVERIFY(QTest::qWaitForWindowActive(&w));
+    auto* pause = w.findChild<QAction*>(QStringLiteral("pauseAction"));
+    auto* exportAction = w.findChild<QAction*>(QStringLiteral("exportAction"));
+    auto* details = w.findChild<QAction*>(QStringLiteral("detailsAction"));
+    QVERIFY(pause && exportAction && details);
+
+    const auto toolbars = w.findChildren<QToolBar*>();
+    QVERIFY(!toolbars.isEmpty());
+    QStringList layout;
+    for (QToolBar* tb : toolbars) {
+        QVERIFY2(!tb->actions().contains(pause), qPrintable(tb->objectName()));
+        QVERIFY2(!tb->actions().contains(exportAction), qPrintable(tb->objectName()));
+        QVERIFY2(!tb->widgetForAction(pause) && !tb->widgetForAction(exportAction), qPrintable(tb->objectName()));
+        for (QComboBox* combo : tb->findChildren<QComboBox*>())
+            QVERIFY2(combo->objectName() == QLatin1String("rangeCombo"), qPrintable(combo->objectName()));
+        if (tb->isVisibleTo(&w))
+            layout << describeToolbar(tb);
+    }
+    QCOMPARE(layout, QStringList {QStringLiteral("rangeLabel rangeCombo | detailsAction")});
+    // No button anywhere still carries them (not just a blank label).
+    for (QToolButton* b : w.findChildren<QToolButton*>())
+        QVERIFY2(b->defaultAction() != pause && b->defaultAction() != exportAction, qPrintable(b->objectName()));
+    QVERIFY(!w.findChild<QWidget*>(QStringLiteral("intervalCombo")));
+
+    // Still in the menus, enabled, with their shortcuts.
+    const auto menuOf = [&](QAction* a) -> QString {
+        for (QAction* top : w.menuBar()->actions())
+            if (top->menu() && top->menu()->actions().contains(a))
+                return top->menu()->title();
+        return {};
+    };
+    QCOMPARE(menuOf(exportAction), QStringLiteral("&File"));
+    QCOMPARE(menuOf(pause), QStringLiteral("&View"));
+    QVERIFY(pause->isEnabled() && exportAction->isEnabled());
+    QVERIFY(pause->shortcuts().contains(QKeySequence(Qt::Key_P)));
+    QCOMPARE(exportAction->shortcut(), QKeySequence(Qt::CTRL | Qt::Key_E));
+
+    // The keys still work. Ctrl+E before any sample refuses without a
+    // chooser, and its explanation opens the otherwise hidden bar.
+    QWidget* target = w.focusWidget() ? w.focusWidget() : static_cast<QWidget*>(&w);
+    closeModalsSoon();
+    QTest::keyClick(target, Qt::Key_E, Qt::ControlModifier);
+    QTest::qWait(50);
+    QVERIFY2(!w.statusBar()->currentMessage().isEmpty(), "Ctrl+E without samples explained nothing");
+    QVERIFY2(w.statusBar()->isVisibleTo(&w), "the export explanation is in a hidden status bar");
+
+    applyAt(w, q, 100);
+    applyAt(w, q, 101);
+    target = w.focusWidget() ? w.focusWidget() : static_cast<QWidget*>(&w);
+    QVERIFY2(!qobject_cast<QLineEdit*>(target), "a text field has focus; P would be typed");
+    QTest::keyClick(target, Qt::Key_P);
+    QVERIFY2(w.isPaused() && pause->isChecked(), "P did not pause");
+    QVERIFY2(w.statusText().contains(QStringLiteral("Paused")), qPrintable(w.statusText()));
+    QVERIFY(w.statusBar()->isVisibleTo(&w));
+    QTest::keyClick(w.focusWidget() ? w.focusWidget() : static_cast<QWidget*>(&w), Qt::Key_P);
+    QVERIFY2(!w.isPaused() && !pause->isChecked(), "P did not resume");
+}
+
+void TestCouncil::declutterIntervalMenuIsOneExclusiveChoice()
+{
+    QuietWindow q;
+    auto w = std::make_unique<MainWindow>(q.options(1000));
+    auto* menu = w->findChild<QMenu*>(QStringLiteral("intervalMenu"));
+    QVERIFY(menu);
+    bool inView = false;
+    for (QAction* top : w->menuBar()->actions())
+        if (top->menu() && top->menu()->title() == QLatin1String("&View"))
+            inView = top->menu()->actions().contains(menu->menuAction());
+    QVERIFY2(inView, "Update Interval is not in the View menu");
+    QVERIFY(menu->menuAction()->isEnabled() && menu->menuAction()->isVisible());
+    const auto actions = menu->actions();
+    QCOMPARE(actions.size(), 4);
+    QList<int> data;
+    QStringList texts;
+    QActionGroup* group = actions.front()->actionGroup();
+    QVERIFY(group && group->isExclusive());
+    for (QAction* a : actions) {
+        data << a->data().toInt();
+        texts << a->text();
+        QVERIFY(a->isCheckable() && a->isEnabled() && a->isVisible());
+        QCOMPARE(a->actionGroup(), group);
+        QCOMPARE(a->objectName(), QStringLiteral("intervalAction%1").arg(a->data().toInt()));
+    }
+    QCOMPARE(data, (QList<int> {500, 1000, 2000, 5000}));
+    QCOMPARE(texts, (QStringList {QStringLiteral("0.5 seconds"), QStringLiteral("1 second"), QStringLiteral("2 seconds"),
+                                  QStringLiteral("5 seconds")}));
+    const auto checked = [&] {
+        QList<int> c;
+        for (QAction* a : actions)
+            if (a->isChecked())
+                c << a->data().toInt();
+        return c;
+    };
+    QCOMPARE(checked(), QList<int> {1000});
+    QCOMPARE(w->intervalMs(), 1000);
+
+    applyAt(*w, q, 100);
+    applyAt(*w, q, 101);
+    applyAt(*w, q, 102);
+    const auto samples = w->history().size();
+    const int applied = w->snapshotsApplied();
+    const double latest = w->history().latestTime();
+
+    actions[2]->trigger(); // 2 seconds
+    QCOMPARE(w->intervalMs(), 2000);
+    QCOMPARE(checked(), QList<int> {2000});
+    QCOMPARE(q.saved(QStringLiteral("intervalMs")).toInt(), 2000);
+    actions[2]->trigger(); // the checked choice again: still one choice
+    QCOMPARE(checked(), QList<int> {2000});
+    QCOMPARE(w->intervalMs(), 2000);
+    // Changing the cadence records nothing and drops nothing.
+    QCOMPARE(w->history().size(), samples);
+    QCOMPARE(w->snapshotsApplied(), applied);
+    QCOMPARE(w->history().latestTime(), latest);
+    QVERIFY2(!w->isStale(), qPrintable(w->statusText()));
+
+    w->setIntervalMs(5000);
+    QCOMPARE(checked(), QList<int> {5000});
+    w->setIntervalMs(700); // not a choice
+    QCOMPARE(w->intervalMs(), 5000);
+    QCOMPARE(checked(), QList<int> {5000});
+    QCOMPARE(q.saved(QStringLiteral("intervalMs")).toInt(), 5000);
+    applyAt(*w, q, 103);
+    QCOMPARE(w->snapshotsApplied(), applied + 1);
+    QCOMPARE(w->history().size(), samples + 1);
+
+    // The saved choice comes back checked.
+    w.reset();
+    MainWindow again(q.options(0));
+    QCOMPARE(again.intervalMs(), 5000);
+    auto* restored = again.findChild<QAction*>(QStringLiteral("intervalAction5000"));
+    QVERIFY(restored && restored->isChecked());
+    for (int ms : {500, 1000, 2000})
+        QVERIFY(!again.findChild<QAction*>(QStringLiteral("intervalAction%1").arg(ms))->isChecked());
+}
+
+void TestCouncil::declutterHealthyViewIsQuiet()
+{
+    QuietWindow q;
+    MainWindow w(q.options());
+    w.resize(1180, 780);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    double t = 100;
+    applyAt(w, q, t);
+    applyAt(w, q, ++t);
+    QStringList problems;
+    for (bool details : {false, true, false}) {
+        w.setDetailsVisible(details);
+        for (int page = 0; page < MainWindow::PageCount; ++page) {
+            w.showPage(static_cast<MainWindow::Page>(page));
+            applyAt(w, q, ++t);
+            QTest::qWait(20);
+            problems << quietProblems(w, QStringLiteral("%1 page %2").arg(details ? "Details" : "Simple").arg(page));
+        }
+    }
+    // Healthy for several stale checks in a row (500 ms each), and after a
+    // pause/resume round trip once a sample arrives.
+    QTest::qWait(1200);
+    problems << quietProblems(w, QStringLiteral("after 1.2 s healthy"));
+    w.setPaused(true);
+    w.setPaused(false);
+    applyAt(w, q, ++t);
+    problems << quietProblems(w, QStringLiteral("after resume"));
+    QVERIFY2(problems.isEmpty(), qPrintable(problems.join(QStringLiteral("\n  "))));
+}
+
+void TestCouncil::declutterExceptionsAreShortVisibleAndDescribed()
+{
+    QuietWindow q;
+    MainWindow w(q.options(1000));
+    w.resize(1100, 720);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    QStringList problems;
+    // No collector and nothing injected yet (test-only configuration).
+    problems << cueProblems(w, QStringLiteral("not collecting"), QStringLiteral("Not collecting"), {});
+    double t = 100;
+    applyAt(w, q, t);
+    applyAt(w, q, ++t);
+    problems << quietProblems(w, QStringLiteral("first samples"));
+
+    for (bool details : {false, true}) {
+        const QString mode = details ? QStringLiteral("Details: ") : QStringLiteral("Simple: ");
+        w.setDetailsVisible(details);
+        w.setPaused(true);
+        problems << cueProblems(w, mode + QStringLiteral("paused"), QStringLiteral("Paused"), QStringLiteral("Resuming"));
+        w.setPaused(false);
+        applyAt(w, q, ++t);
+        problems << quietProblems(w, mode + QStringLiteral("resumed"));
+
+        applyAt(w, q, ++t, {"/proc/diskstats: cannot read"});
+        problems << cueProblems(w, mode + QStringLiteral("unreadable source"), QStringLiteral("unavailable"),
+                                QStringLiteral("/proc/diskstats: cannot read"));
+        applyAt(w, q, ++t);
+        problems << quietProblems(w, mode + QStringLiteral("source back"));
+
+        *q.clock = t + 8; // no sample for 8 s at 1 s
+        QTRY_VERIFY_WITH_TIMEOUT(w.isStale(), 3000);
+        problems << cueProblems(w, mode + QStringLiteral("stale"), QStringLiteral("Readings unavailable"),
+                                QStringLiteral("8 s old"));
+        t += 9;
+        applyAt(w, q, t);
+        QVERIFY(!w.isStale());
+        problems << quietProblems(w, mode + QStringLiteral("fresh again"));
+    }
+    QVERIFY2(problems.isEmpty(), qPrintable(problems.join(QStringLiteral("\n  "))));
+}
+
+// Startup failure in the real window: a short cue that says it is retrying,
+// the collector's reason in the detail, and nothing left once it recovers.
+int childMainWindowStartup()
+{
+    FixtureRoot r;
+    writeBaseTree(r);
+    QTemporaryDir dir;
+    MainWindowOptions o;
+    o.sampler = fixtureOptions(r);
+    o.settingsFile = dir.filePath(QStringLiteral("pulsescope.ini"));
+    o.initialIntervalMs = 500;
+    o.windowProbe.enabled = false;
+    ThreadLimit limit;
+    if (!limit.lower()) {
+        childInfo("RLIMIT_NPROC does not stop thread creation here");
+        return kChildSkip;
+    }
+    std::unique_ptr<MainWindow> w;
+    try {
+        w = std::make_unique<MainWindow>(o);
+    } catch (const std::exception& e) {
+        limit.restore();
+        childFail(std::string("MainWindow threw while threads cannot start: ") + e.what());
+        return g_childFailures;
+    }
+    pump(300);
+    const QString error = w->collector() ? w->collector()->startError() : QString();
+    checkReason(error, "main window collector");
+    if (!w->statusText().contains(QStringLiteral("retrying")))
+        childFail("startup failure cue \"" + w->statusText().toStdString() + "\" does not say it is retrying");
+    if (w->statusText().size() > 80 || w->statusText().contains(QLatin1Char('\n')))
+        childFail("startup failure cue is not short: \"" + w->statusText().toStdString() + "\"");
+    if (!w->statusBar()->isVisibleTo(w.get()))
+        childFail("startup failure cue is in a hidden status bar");
+    if (error.isEmpty() || !w->statusDetail().contains(error))
+        childFail("detail \"" + w->statusDetail().toStdString() + "\" lacks the reason \"" + error.toStdString() + "\"");
+    if (auto* label = w->findChild<QLabel*>(QStringLiteral("statusLabel"));
+        !label || label->accessibleDescription() != w->statusDetail())
+        childFail("the startup reason is not the status accessible description");
+    limit.restore();
+    const qint64 at = pump(6000, [&] { return w->snapshotsApplied() > 0; });
+    childInfo("first sample " + std::to_string(at) + " ms after threads became available");
+    if (w->snapshotsApplied() == 0)
+        childFail("no sample within 6 s after threads became available");
+    if (w->statusText().contains(QStringLiteral("retrying")) || (!error.isEmpty() && w->statusDetail().contains(error)))
+        childFail("the startup cue stayed after recovery: \"" + w->statusText().toStdString() + "\" / \""
+                  + w->statusDetail().toStdString() + "\"");
+    w->shutdown();
+    return g_childFailures;
+}
+
+// ---------------------------------------------------------------------------
 // SYS-001: a thread that cannot start. Runs in a child process.
 
 void TestCouncil::threadStartFailure_data()
@@ -1420,6 +1846,7 @@ void TestCouncil::threadStartFailure_data()
     QTest::newRow("window probe") << QStringLiteral("windowprobe");
     QTest::newRow("collector retry") << QStringLiteral("collector-retry");
     QTest::newRow("window probe retry") << QStringLiteral("windowprobe-retry");
+    QTest::newRow("main window startup cue") << QStringLiteral("mainwindow");
 }
 
 void TestCouncil::threadStartFailure()
@@ -1455,8 +1882,12 @@ void TestCouncil::threadStartFailure()
 int main(int argc, char** argv)
 {
     if (const char* scenario = std::getenv("PS_COUNCIL_CHILD")) {
-        QCoreApplication app(argc, argv);
         const std::string which = scenario;
+        if (which == "mainwindow") {
+            QApplication app(argc, argv);
+            return childMainWindowStartup();
+        }
+        QCoreApplication app(argc, argv);
         if (which == "fsprober")
             return childFsProber();
         if (which == "collector")

@@ -20,6 +20,7 @@
 #include <vector>
 
 class QAction;
+class QActionGroup;
 class QComboBox;
 class QGridLayout;
 class QLabel;
@@ -80,7 +81,8 @@ public:
     int windowSeconds() const { return m_windowSeconds; }
     // Details off (the default) shows each page at a glance: the main value,
     // the main chart and the controls needed to choose what it shows. On, it
-    // adds the full facts, secondary series and charts, tables and notes.
+    // adds the full facts, secondary series and charts, tables and the
+    // navigation's detail lines.
     // Only visibility and chart series change; nothing is collected
     // differently. Saved as the "details" setting.
     void setDetailsVisible(bool on);
@@ -104,7 +106,10 @@ public:
     ps::SnapshotPtr latestSnapshot() const { return m_latest; }
     int snapshotsApplied() const { return m_applied; }
     bool isStale() const { return m_stale; }
+    // The status bar says only what is wrong (empty, and the bar hidden, when
+    // nothing is); the details are its tooltip and accessible description.
     QString statusText() const;
+    QString statusDetail() const;
 
     // Feeds one snapshot as if the collector delivered it (tests, and the
     // collector connection itself). Ignored while paused.
@@ -167,6 +172,7 @@ private:
     bool processListShown() const;
     void updateProbeVisibility();
     void updateStatus();
+    void updateStatusBarVisibility();
     void updateChartNotices();
     void refreshCharts();
     void checkStale();
@@ -235,18 +241,16 @@ private:
     QAction* m_detailsAction = nullptr;
     QAction* m_smoothAction = nullptr;
     std::vector<QAction*> m_pageActions;
-    QComboBox* m_intervalCombo = nullptr;
+    QActionGroup* m_intervalGroup = nullptr; // View > Update Interval
     QComboBox* m_rangeCombo = nullptr;
 
     std::vector<MetricButton*> m_nav;
     QWidget* m_navPanel = nullptr;
     QStackedWidget* m_stack = nullptr;
     QLabel* m_statusLabel = nullptr;
-    QLabel* m_timingLabel = nullptr;
 
     TimeChart* m_cpuChart = nullptr;
     CoreGrid* m_coreGrid = nullptr;
-    QLabel* m_coreNote = nullptr;
     TimeChart* m_memChart = nullptr;
     TimeChart* m_swapChart = nullptr;
     TimeChart* m_diskChart = nullptr;
@@ -293,7 +297,6 @@ private:
     QTimer* m_frameTimer = nullptr;
     QPointer<QWindow> m_watchedWindow;
     std::vector<QWidget*> m_detailWidgets; // shown only with Details
-    std::vector<QWidget*> m_simpleWidgets; // shown only without Details
     std::array<HeadRow*, PageCount> m_head {};
     QSplitter* m_tempSplit = nullptr;
     QList<int> m_tempSplitSizes;

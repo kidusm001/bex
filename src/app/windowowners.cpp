@@ -476,7 +476,9 @@ public:
             }
         }
         Query q = list(limits, cancelFd, deadline);
-        if (q.status != Status::Ok)
+        // A late server keeps its connection: reconnecting would block in
+        // xcb_connect() while it is still stalled. Late replies are discarded.
+        if (q.status != Status::Ok && q.status != Status::Timeout)
             disconnect(); // start from a clean connection next time
         return q;
     }
@@ -598,8 +600,11 @@ private:
                                                  static_cast<uint32_t>(limits.maxWindows));
         xcb_flush(m_conn);
         xcb_get_property_reply_t* prop = nullptr;
-        if (Status s = await(propCookie.sequence, &prop, cancelFd, deadline); s != Status::Ok)
+        if (Status s = await(propCookie.sequence, &prop, cancelFd, deadline); s != Status::Ok) {
+            if (s == Status::Timeout)
+                xcb_discard_reply(m_conn, propCookie.sequence);
             return statusQuery(s, QStringLiteral("window list"));
+        }
         std::unique_ptr<xcb_get_property_reply_t, decltype(&std::free)> propHolder(prop, &std::free);
         if (prop->type == XCB_ATOM_NONE)
             return fail(Status::NotRunning, QStringLiteral("No window manager publishes _NET_CLIENT_LIST"));
@@ -628,7 +633,7 @@ private:
                 continue;
             }
             if (s != Status::Ok) {
-                for (std::size_t j = i + 1; j < cookies.size(); ++j)
+                for (std::size_t j = s == Status::Timeout ? i : i + 1; j < cookies.size(); ++j)
                     xcb_discard_reply(m_conn, cookies[j]);
                 return statusQuery(s, QStringLiteral("window owners"));
             }

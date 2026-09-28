@@ -145,6 +145,15 @@ void MetricButton::advanceView(double time)
         update(sparkUpdateRect());
 }
 
+void MetricButton::setDetailLineVisible(bool visible)
+{
+    if (visible == m_detailLine)
+        return;
+    m_detailLine = visible;
+    updateGeometry();
+    update();
+}
+
 void MetricButton::setStale(bool stale)
 {
     if (stale == m_stale)
@@ -171,7 +180,7 @@ QSize MetricButton::sizeHint() const
     const QFontMetrics fm(font());
     const QFontMetrics vfm(valueFont(font()));
     const QFontMetrics sfm(smallFont(font()));
-    const int h = kPadY * 2 + fm.height() + vfm.height() + sfm.height() + 2;
+    const int h = kPadY * 2 + fm.height() + vfm.height() + (m_detailLine ? sfm.height() + 2 : 0);
     int w = std::max(fm.horizontalAdvance(QStringLiteral("Temperatures")) + kSparkW + 8,
                      sfm.horizontalAdvance(QStringLiteral("0000 MiB/s up  0000 MiB/s down")));
     // Wide enough for the template in the compact font at least.
@@ -283,7 +292,7 @@ void MetricButton::paintEvent(QPaintEvent* event)
     y += vfm.height() + 2;
 
     const QRect detailRect(x, y, textW, sfm.height());
-    if (dirty.intersects(detailRect)) {
+    if (m_detailLine && dirty.intersects(detailRect)) {
         p.setFont(sf);
         p.setPen(muted);
         p.drawText(detailRect, Qt::AlignLeft | Qt::AlignVCenter,

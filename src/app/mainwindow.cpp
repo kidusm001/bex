@@ -7,6 +7,7 @@
 #include "core/format.h"
 
 #include <QAction>
+#include <QActionGroup>
 #include <QApplication>
 #include <QButtonGroup>
 #include <QCloseEvent>
@@ -22,6 +23,7 @@
 #include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPainter>
@@ -105,7 +107,7 @@ QString qCelsius(double v)
 
 QString intervalText(int ms)
 {
-    return ms % 1000 == 0 ? QStringLiteral("%1 s").arg(ms / 1000) : QStringLiteral("%1 s").arg(ms / 1000.0, 0, 'f', 1);
+    return ms == 1000 ? QStringLiteral("1 second") : QStringLiteral("%1 seconds").arg(ms / 1000.0, 0, 'g', 3);
 }
 
 QFont scaledFont(const QFont& base, double factor, QFont::Weight weight)
@@ -363,6 +365,76 @@ public:
             p->drawRoundedRect(bar, 2, 2);
         }
         p->restore();
+    }
+};
+
+// Process cells other than the name keep a gutter of at least half an average
+// character on the side their text is aligned to, so that a right-aligned
+// number and the left-aligned text after it (PID and User, Threads and State,
+// Age and Command) do not run together. The gutter is an empty decoration
+// beside the text: the style lays it out and draws the whole cell itself, so
+// text colours, selection, hover, focus and alternating rows are the theme's.
+class ProcessCellDelegate : public QStyledItemDelegate {
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+
+    static int gutter(const QFontMetrics& fm) { return std::max(2, (fm.averageCharWidth() + 1) / 2); }
+
+    QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex& index) const override
+    {
+        // The gutter widens the cell; the row keeps the height of its text
+        // (styles add room around a decoration's height).
+        QSize size = QStyledItemDelegate::sizeHint(option, index);
+        QStyleOptionViewItem plain = option;
+        QStyledItemDelegate::initStyleOption(&plain, index);
+        const QWidget* w = plain.widget;
+        const QStyle* style = w ? w->style() : QApplication::style();
+        size.setHeight(style->sizeFromContents(QStyle::CT_ItemViewItem, &plain, QSize(), w).height());
+        return size;
+    }
+
+protected:
+    void initStyleOption(QStyleOptionViewItem* option, const QModelIndex& index) const override
+    {
+        QStyledItemDelegate::initStyleOption(option, index);
+        if (!index.parent().isValid() || index.column() == ProcessModel::Name || option->text.isEmpty()
+            || (option->features & QStyleOptionViewItem::HasDecoration))
+            return;
+        const bool number = option->displayAlignment & Qt::AlignRight;
+        QStyleOptionViewItem padded = *option;
+        padded.features |= QStyleOptionViewItem::HasDecoration;
+        padded.decorationPosition = number ? QStyleOptionViewItem::Right : QStyleOptionViewItem::Left;
+        padded.decorationSize = QSize(1, 1);
+        padded.icon = QIcon();
+        int width = gutter(option->fontMetrics);
+        if (option->rect.isValid()) {
+            // What the style's own layout gives: the text's inset and the
+            // text width a one pixel decoration costs, which grow with it.
+            const QWidget* w = option->widget;
+            const QStyle* style = w ? w->style() : QApplication::style();
+            const QRect plain = style->subElementRect(QStyle::SE_ItemViewItemText, option, w);
+            const QRect one = style->subElementRect(QStyle::SE_ItemViewItemText, &padded, w);
+            const bool drawnRight = QStyle::visualAlignment(option->direction, option->displayAlignment) & Qt::AlignRight;
+            const int inset = drawnRight ? plain.right() - one.right() : one.left() - plain.left();
+            const int cost = plain.width() - one.width();
+            const int margin = style->pixelMetric(QStyle::PM_FocusFrameHMargin, option, w) + 1;
+            const int room = plain.width() - 2 * margin;
+            const int text = qCeil(QFontMetricsF(option->font).horizontalAdvance(option->text));
+            // Text that fits stays whole and gives up the gutter first; text
+            // that is elided anyway keeps it while more than an ellipsis
+            // remains. A number is never cut for it.
+            int spare = room - text;
+            if (spare < 0) {
+                if (number)
+                    return;
+                spare = room - option->fontMetrics.horizontalAdvance(QChar(0x2026));
+            }
+            width = std::min(1 + std::max(0, width - inset), 1 + spare - cost);
+            if (width < 1)
+                return;
+        }
+        padded.decorationSize = QSize(width, 1);
+        *option = padded;
     }
 };
 
@@ -724,16 +796,12 @@ MainWindow::MainWindow(MainWindowOptions options, QWidget* parent)
     layout->addWidget(m_stack, 1);
     setCentralWidget(central);
 
+    // Shown only while something is wrong or a message (export) is up.
     m_statusLabel = new QLabel(this);
     m_statusLabel->setObjectName(QStringLiteral("statusLabel"));
     m_statusLabel->setAccessibleName(QStringLiteral("Status"));
-    m_timingLabel = new QLabel(this);
-    m_timingLabel->setObjectName(QStringLiteral("timingLabel"));
-    m_timingLabel->setToolTip(QStringLiteral("Time the collector thread spent reading /proc and /sys for the "
-                                             "latest sample"));
     statusBar()->addWidget(m_statusLabel, 1);
-    statusBar()->addPermanentWidget(m_timingLabel);
-    m_detailWidgets.push_back(m_timingLabel);
+    connect(statusBar(), &QStatusBar::messageChanged, this, &MainWindow::updateStatusBarVisibility);
 
     for (auto* chart : allCharts())
         chart->setWindowSeconds(m_windowSeconds);
@@ -905,6 +973,7 @@ void MainWindow::buildActions()
     m_pauseAction->setIcon(style()->standardIcon(QStyle::SP_MediaPause));
     m_pauseAction->setToolTip(QStringLiteral("Pause collection and freeze the view (P)"));
     connect(m_pauseAction, &QAction::toggled, this, &MainWindow::setPaused);
+    addAction(m_pauseAction); // the shortcut works whatever the menu bar does
 
     m_exportAction = new QAction(QStringLiteral("Export History as CSV\u2026"), this);
     m_exportAction->setObjectName(QStringLiteral("exportAction"));
@@ -912,6 +981,21 @@ void MainWindow::buildActions()
     m_exportAction->setIcon(style()->standardIcon(QStyle::SP_DialogSaveButton));
     m_exportAction->setToolTip(QStringLiteral("Save the retained history (up to 15 minutes) as CSV (Ctrl+E)"));
     connect(m_exportAction, &QAction::triggered, this, &MainWindow::exportCsvInteractive);
+    addAction(m_exportAction);
+
+    // View > Update Interval: one checked choice, the same saved setting
+    // and cadence the collector runs at.
+    m_intervalGroup = new QActionGroup(this);
+    m_intervalGroup->setExclusive(true);
+    for (int ms : intervalChoicesMs()) {
+        auto* a = new QAction(intervalText(ms), m_intervalGroup);
+        a->setObjectName(QStringLiteral("intervalAction%1").arg(ms));
+        a->setCheckable(true);
+        a->setChecked(ms == m_intervalMs);
+        a->setData(ms);
+    }
+    connect(m_intervalGroup, &QActionGroup::triggered, this,
+            [this](QAction* a) { setIntervalMs(a->data().toInt()); });
 
     m_quitAction = new QAction(QStringLiteral("Quit"), this);
     m_quitAction->setShortcut(QKeySequence::Quit);
@@ -928,16 +1012,21 @@ void MainWindow::buildActions()
     m_detailsAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_D));
     m_detailsAction->setIcon(style()->standardIcon(QStyle::SP_FileDialogDetailedView));
     m_detailsAction->setToolTip(QStringLiteral("Show every reading: secondary series, per-CPU charts, swap, "
-                                               "filesystems, sensor list, all process columns and notes (Ctrl+D)"));
+                                               "filesystems, sensor list, all process columns and the navigation's "
+                                               "detail lines (Ctrl+D)"));
     connect(m_detailsAction, &QAction::toggled, this, &MainWindow::setDetailsVisible);
 
     m_smoothAction = new QAction(QStringLiteral("Smooth Graphs"), this);
     m_smoothAction->setObjectName(QStringLiteral("smoothAction"));
     m_smoothAction->setCheckable(true);
     m_smoothAction->setChecked(m_smooth);
+    m_smoothAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_M));
     m_smoothAction->setToolTip(QStringLiteral("Scroll graphs continuously between samples, up to 60 frames per "
-                                              "second. Off, graphs move once per sample: less power, less motion."));
+                                              "second. Off, graphs move once per sample: less power, less motion "
+                                              "(%1)")
+                                   .arg(m_smoothAction->shortcut().toString(QKeySequence::NativeText)));
     connect(m_smoothAction, &QAction::toggled, this, &MainWindow::setSmoothGraphs);
+    addAction(m_smoothAction);
 
     const QStringList names {QStringLiteral("CPU"),          QStringLiteral("Memory"),
                              QStringLiteral("Disks"),        QStringLiteral("Network"),
@@ -958,24 +1047,11 @@ void MainWindow::buildToolbar()
     tb->setMovable(false);
     tb->setFloatable(false);
     tb->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-    tb->addAction(m_pauseAction);
-    tb->addSeparator();
 
-    auto* intervalLabel = new QLabel(QStringLiteral(" Sample every "), tb);
-    m_intervalCombo = new QComboBox(tb);
-    m_intervalCombo->setObjectName(QStringLiteral("intervalCombo"));
-    m_intervalCombo->setAccessibleName(QStringLiteral("Sampling interval"));
-    m_intervalCombo->setToolTip(QStringLiteral("How often the system is sampled"));
-    for (int ms : intervalChoicesMs())
-        m_intervalCombo->addItem(intervalText(ms), ms);
-    m_intervalCombo->setCurrentIndex(m_intervalCombo->findData(m_intervalMs));
-    intervalLabel->setBuddy(m_intervalCombo);
-    connect(m_intervalCombo, &QComboBox::activated, this,
-            [this](int index) { setIntervalMs(m_intervalCombo->itemData(index).toInt()); });
-    tb->addWidget(intervalLabel);
-    tb->addWidget(m_intervalCombo);
-
-    auto* rangeLabel = new QLabel(QStringLiteral("  Show last "), tb);
+    auto* rangeLabel = new QLabel(QStringLiteral("History"), tb);
+    rangeLabel->setObjectName(QStringLiteral("rangeLabel"));
+    const int pad = fontMetrics().averageCharWidth();
+    rangeLabel->setContentsMargins(pad / 2, 0, pad, 0);
     m_rangeCombo = new QComboBox(tb);
     m_rangeCombo->setObjectName(QStringLiteral("rangeCombo"));
     m_rangeCombo->setAccessibleName(QStringLiteral("Chart time range"));
@@ -990,7 +1066,6 @@ void MainWindow::buildToolbar()
     tb->addWidget(m_rangeCombo);
     tb->addSeparator();
     tb->addAction(m_detailsAction);
-    tb->addAction(m_exportAction);
 }
 
 void MainWindow::buildMenus()
@@ -1001,6 +1076,9 @@ void MainWindow::buildMenus()
     file->addAction(m_quitAction);
     auto* view = menuBar()->addMenu(QStringLiteral("&View"));
     view->addAction(m_pauseAction);
+    auto* interval = view->addMenu(QStringLiteral("Update Interval"));
+    interval->setObjectName(QStringLiteral("intervalMenu"));
+    interval->addActions(m_intervalGroup->actions());
     view->addSeparator();
     view->addAction(m_detailsAction);
     view->addAction(m_smoothAction);
@@ -1106,9 +1184,11 @@ QWidget* MainWindow::buildCpuPage()
     auto* coreHeader = new QHBoxLayout(coreHeaderRow);
     coreHeader->setContentsMargins(0, 0, 0, 0);
     coreHeader->setSpacing(12); // some styles (Kvantum themes) have near-zero default layout spacing
-    coreHeader->addWidget(makeSubheading(QStringLiteral("Per logical CPU"), coreHeaderRow));
-    m_coreNote = makeNote(QStringLiteral("Each chart is 0\u2013100% of one logical CPU."), coreHeaderRow);
-    coreHeader->addWidget(m_coreNote, 1);
+    auto* coreHeading = makeSubheading(QStringLiteral("Per logical CPU"), coreHeaderRow);
+    coreHeading->setToolTip(QStringLiteral("Each chart is 0\u2013100% of one logical CPU"));
+    coreHeading->setAccessibleDescription(coreHeading->toolTip());
+    coreHeader->addWidget(coreHeading);
+    coreHeader->addStretch(1);
     v->addWidget(detailOnly(coreHeaderRow));
 
     auto* scroll = new QScrollArea(page);
@@ -1122,8 +1202,6 @@ QWidget* MainWindow::buildCpuPage()
     m_coreGrid->setObjectName(QStringLiteral("coreGrid"));
     scroll->setWidget(m_coreGrid);
     v->addWidget(detailOnly(scroll), 2);
-    v->addWidget(detailOnly(
-        makeNote(convention + QStringLiteral(" Read from /proc/stat; guest time is counted once."), page)));
     return page;
 }
 
@@ -1171,12 +1249,6 @@ QWidget* MainWindow::buildMemoryPage()
                                         Qt::SolidLine, true)});
     m_swapChart->setEmptyText(QStringLiteral("No swap is configured"));
     v->addWidget(detailOnly(m_swapChart), 2);
-
-    v->addWidget(detailOnly(makeNote(
-        QStringLiteral("Used = total \u2212 available, matching free(1). Buff/cache overlaps available because the kernel "
-                       "reclaims most cache when programs need memory, so used + buff/cache + available exceeds total. "
-                       "Sizes are IEC units (1 GiB = 1024\u00b3 bytes). Source: /proc/meminfo."),
-        page)));
     return page;
 }
 
@@ -1194,7 +1266,9 @@ QWidget* MainWindow::buildDiskPage()
     m_diskCombo->setObjectName(QStringLiteral("diskSelector"));
     m_diskCombo->setAccessibleName(QStringLiteral("Disk device"));
     m_diskCombo->setSizeAdjustPolicy(QComboBox::AdjustToContents);
-    m_diskCombo->setToolTip(QStringLiteral("Whole disks only; partitions are never added to their disk"));
+    m_diskCombo->setToolTip(QStringLiteral("Whole disks only, never partitions, so no byte is counted twice. The "
+                                           "sum covers physical disks; device-mapper, RAID and zram devices carry "
+                                           "that traffic again and are listed separately"));
     devLabel->setBuddy(m_diskCombo);
     connect(m_diskCombo, &QComboBox::activated, this, [this] {
         m_wantedDisk = m_diskCombo->currentData().toString();
@@ -1229,7 +1303,10 @@ QWidget* MainWindow::buildDiskPage()
     m_diskChart->setEmptyText(QStringLiteral("Measuring: throughput needs two samples"));
     v->addWidget(m_diskChart, 3);
 
-    v->addWidget(detailOnly(makeSubheading(QStringLiteral("Local filesystems"), page)));
+    auto* fsHeading = makeSubheading(QStringLiteral("Local filesystems"), page);
+    fsHeading->setToolTip(QStringLiteral("Capacity from statvfs on local filesystems only; network, FUSE and "
+                                         "automount points are never touched"));
+    v->addWidget(detailOnly(fsHeading));
     m_fsTable = new QTreeWidget(page);
     m_fsTable->setObjectName(QStringLiteral("filesystemTable"));
     m_fsTable->setAccessibleName(QStringLiteral("Local filesystems"));
@@ -1250,13 +1327,6 @@ QWidget* MainWindow::buildDiskPage()
     for (int c = 3; c <= 5; ++c)
         m_fsTable->setColumnWidth(c, fm.horizontalAdvance(QStringLiteral("1000 GiB")) + 24);
     v->addWidget(detailOnly(m_fsTable), 2);
-
-    v->addWidget(detailOnly(makeNote(
-        QStringLiteral("Throughput is measured per whole disk (/proc/diskstats), never per partition, so no byte is "
-                       "counted twice. The sum covers physical disks; device-mapper, RAID and zram devices re-carry that "
-                       "traffic and are listed separately. Capacity comes from statvfs on local filesystems only; "
-                       "network, FUSE and automount points are never touched."),
-        page)));
     return page;
 }
 
@@ -1274,6 +1344,9 @@ QWidget* MainWindow::buildNetworkPage()
     m_netCombo->setObjectName(QStringLiteral("netSelector"));
     m_netCombo->setAccessibleName(QStringLiteral("Network interface"));
     m_netCombo->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    m_netCombo->setToolTip(QStringLiteral("The sum covers physical interfaces and never includes loopback; bridges, "
+                                          "VPN tunnels and container links carry traffic already counted on a "
+                                          "physical interface, so they are listed separately"));
     ifLabel->setBuddy(m_netCombo);
     connect(m_netCombo, &QComboBox::activated, this, [this] {
         m_wantedNet = m_netCombo->currentData().toString();
@@ -1302,11 +1375,6 @@ QWidget* MainWindow::buildNetworkPage()
     m_netChart->setHistory(&m_history);
     m_netChart->setEmptyText(QStringLiteral("Measuring: throughput needs two samples"));
     v->addWidget(m_netChart, 1);
-    v->addWidget(detailOnly(makeNote(
-        QStringLiteral("Bytes per second from /proc/net/dev (1 KiB/s = 1024 B/s). The default sum covers physical "
-                       "interfaces and never includes loopback; bridges, VPN tunnels and container links re-carry "
-                       "traffic already counted on a physical interface, so they are listed individually."),
-        page)));
     return page;
 }
 
@@ -1335,6 +1403,9 @@ QWidget* MainWindow::buildTemperaturePage()
     // Core 1"); eliding in the middle keeps the distinguishing end visible.
     m_sensorList->setTextElideMode(Qt::ElideMiddle);
     m_sensorList->setHeaderLabels({QStringLiteral("Sensor (check to plot)"), QStringLiteral("Now")});
+    m_sensorList->headerItem()->setToolTip(0, QStringLiteral("Degrees Celsius from /sys/class/hwmon and "
+                                                             "/sys/class/thermal. A sensor that reports a fault or "
+                                                             "an impossible value is shown as unavailable"));
     m_sensorList->header()->setStretchLastSection(false);
     m_sensorList->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_sensorList->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
@@ -1373,10 +1444,6 @@ QWidget* MainWindow::buildTemperaturePage()
     m_sensorList->setMinimumWidth(sensorListMinimumWidth(m_sensorList));
     detailOnly(m_sensorList);
     v->addWidget(split, 1);
-    v->addWidget(detailOnly(makeNote(QStringLiteral("Degrees Celsius from /sys/class/hwmon and /sys/class/thermal. "
-                                                    "Sensors that report a fault or an impossible value are shown as "
-                                                    "unavailable."),
-                                     page)));
     return page;
 }
 
@@ -1400,12 +1467,19 @@ QWidget* MainWindow::buildProcessPage()
     m_procCount->setObjectName(QStringLiteral("processCount"));
     m_procCount->setForegroundRole(QPalette::PlaceholderText);
     v->addLayout(header);
-    v->addWidget(m_procCount);
+    // One line: the count, and only when app detection fails, a short
+    // notice whose reason is in its tooltip and accessible description.
+    auto* countRow = new QHBoxLayout;
+    countRow->setSpacing(fontMetrics().averageCharWidth() * 3);
+    countRow->addWidget(m_procCount);
     m_groupNote = makeNote(QString(), page);
     m_groupNote->setObjectName(QStringLiteral("processGroupNote"));
     m_groupNote->setAccessibleName(QStringLiteral("App detection"));
+    m_groupNote->setWordWrap(false);
     m_groupNote->hide();
-    v->addWidget(m_groupNote);
+    countRow->addWidget(m_groupNote);
+    countRow->addStretch(1);
+    v->addLayout(countRow);
 
     auto* find = new QAction(this);
     find->setShortcut(QKeySequence::Find);
@@ -1451,8 +1525,11 @@ QWidget* MainWindow::buildProcessPage()
     m_procTable = new QTreeView(page);
     m_procTable->setObjectName(QStringLiteral("processTable"));
     m_procTable->setAccessibleName(QStringLiteral("Processes"));
-    m_procTable->setAccessibleDescription(QStringLiteral("Grouped as apps, background processes and kernel processes"));
+    m_procTable->setAccessibleDescription(QStringLiteral("Grouped as apps, background processes and kernel "
+                                                         "processes. CPU % is of one logical CPU, so it can exceed "
+                                                         "100%. Read-only."));
     m_procTable->setModel(m_procProxy);
+    m_procTable->setItemDelegate(new ProcessCellDelegate(m_procTable));
     m_procTable->setSortingEnabled(true);
     m_procTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_procTable->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -1466,18 +1543,20 @@ QWidget* MainWindow::buildProcessPage()
     m_procTable->header()->setSectionsMovable(false);
     const QFontMetrics fm(font());
     const auto width = [&](const char* sample) { return fm.horizontalAdvance(QString::fromLatin1(sample)) + 28; };
-    m_procTable->setColumnWidth(ProcessModel::Pid, width("4194304"));
+    // Cells beside the name also hold the delegate's gutter on both sides.
+    const auto cellWidth = [&](const char* sample) { return width(sample) + 2 * ProcessCellDelegate::gutter(fm); };
+    m_procTable->setColumnWidth(ProcessModel::Pid, cellWidth("4194304"));
     // The name column also holds the group branch indicator and indent.
     m_procTable->setColumnWidth(ProcessModel::Name, width("gnome-shell-calen") + m_procTable->indentation());
-    m_procTable->setColumnWidth(ProcessModel::User, width("username"));
-    m_procTable->setColumnWidth(ProcessModel::Cpu, width("1000.0 %"));
-    m_procTable->setColumnWidth(ProcessModel::Memory, width("Memory (RSS)"));
-    m_procTable->setColumnWidth(ProcessModel::Threads, width("Threads"));
-    m_procTable->setColumnWidth(ProcessModel::State, width("Disk wait"));
-    m_procTable->setColumnWidth(ProcessModel::Nice, width("Nice"));
-    m_procTable->setColumnWidth(ProcessModel::IoRead, width("1000 KiB/s"));
-    m_procTable->setColumnWidth(ProcessModel::IoWrite, width("1000 KiB/s"));
-    m_procTable->setColumnWidth(ProcessModel::Age, width("12m 05s"));
+    m_procTable->setColumnWidth(ProcessModel::User, cellWidth("username"));
+    m_procTable->setColumnWidth(ProcessModel::Cpu, cellWidth("1000.0 %"));
+    m_procTable->setColumnWidth(ProcessModel::Memory, cellWidth("Memory (RSS)"));
+    m_procTable->setColumnWidth(ProcessModel::Threads, cellWidth("Threads"));
+    m_procTable->setColumnWidth(ProcessModel::State, cellWidth("Disk wait"));
+    m_procTable->setColumnWidth(ProcessModel::Nice, cellWidth("Nice"));
+    m_procTable->setColumnWidth(ProcessModel::IoRead, cellWidth("1000 KiB/s"));
+    m_procTable->setColumnWidth(ProcessModel::IoWrite, cellWidth("1000 KiB/s"));
+    m_procTable->setColumnWidth(ProcessModel::Age, cellWidth("12m 05s"));
     // In Simple, the name fills what the numbers leave, but never shrinks
     // below a readable name under a group (two indentation steps): a narrow
     // window scrolls sideways instead.
@@ -1517,19 +1596,6 @@ QWidget* MainWindow::buildProcessPage()
             [this](const QModelIndex& index) { onGroupExpansion(index, false); });
     syncGroupExpansion();
     v->addWidget(m_procTable, 1);
-    v->addWidget(detailOnly(makeNote(
-        QStringLiteral("CPU %: 100% is one logical CPU fully busy, so a multithreaded process can exceed 100% "
-                       "(up to 100% \u00d7 the number of logical CPUs). Memory is the resident set size, which includes "
-                       "shared pages. Disk I/O is only readable for your own processes. Apps are processes that own "
-                       "a window, even a minimized or hidden one; helpers without a window of their own are "
-                       "background processes. This view is read-only."),
-        page)));
-    auto* shortNote = makeNote(QStringLiteral("CPU %: 100% is one logical CPU fully busy, so a multithreaded process "
-                                              "can exceed 100%. Memory is the resident set size (RSS). Read-only."),
-                               page);
-    shortNote->setObjectName(QStringLiteral("processShortNote"));
-    m_simpleWidgets.push_back(shortNote);
-    v->addWidget(shortNote);
     return page;
 }
 
@@ -1600,8 +1666,9 @@ void MainWindow::setIntervalMs(int ms)
     const auto& choices = intervalChoicesMs();
     if (std::find(choices.begin(), choices.end(), ms) == choices.end())
         return;
-    if (m_intervalCombo->currentData().toInt() != ms)
-        m_intervalCombo->setCurrentIndex(m_intervalCombo->findData(ms));
+    for (QAction* a : m_intervalGroup->actions())
+        if (a->data().toInt() == ms && !a->isChecked())
+            a->setChecked(true);
     if (ms == m_intervalMs)
         return;
     m_intervalMs = ms;
@@ -1751,8 +1818,11 @@ void MainWindow::applyDetails()
     m_appliedDetails = state;
     for (auto* w : m_detailWidgets)
         w->setVisible(m_details);
-    for (auto* w : m_simpleWidgets)
-        w->setVisible(!m_details);
+    // The navigation's third line (load, swap, device, threads...) is a
+    // Details reading; its text stays in each entry's tooltip and
+    // accessible description.
+    for (auto* b : m_nav)
+        b->setDetailLineVisible(m_details);
     if (m_details && m_tempSplit && m_tempSplitSizes.size() == 2)
         m_tempSplit->setSizes(m_tempSplitSizes);
 
@@ -2212,8 +2282,17 @@ void MainWindow::updateSensorList(const ps::Snapshot& s)
         if (item->toolTip(1) != e.valueTip)
             item->setToolTip(1, e.valueTip);
     }
-    m_tempNote->setText(q(s.temperatureNote));
-    m_tempNote->setVisible(!s.temperatureNote.empty());
+    // Why nothing reads, in one line; the whole explanation in the tooltip.
+    const QString note = q(s.temperatureNote);
+    const qsizetype end = note.indexOf(QStringLiteral(". "));
+    const QString line = end < 0 ? note : note.left(end + 1);
+    if (m_tempNote->text() != line)
+        m_tempNote->setText(line);
+    if (m_tempNote->toolTip() != note) {
+        m_tempNote->setToolTip(note);
+        m_tempNote->setAccessibleDescription(note);
+    }
+    m_tempNote->setVisible(!note.isEmpty());
     applySensorSelection();
 }
 
@@ -2291,19 +2370,29 @@ void MainWindow::updateHeadlines()
     if (!m_head[CpuPage])
         return;
     const ps::Snapshot* s = m_latest.get();
-    const QString paused = m_paused ? QStringLiteral("Paused. ") : QString();
+    // Each summary adds only what the values, the picker and the chart do
+    // not already say; a warning comes first. Nothing while starting: the
+    // charts say they are measuring.
+    const auto summary = [this](const QString& text) {
+        QStringList parts;
+        if (m_paused)
+            parts << QStringLiteral("Paused");
+        if (!text.isEmpty())
+            parts << text;
+        return parts.join(QStringLiteral(". "));
+    };
     if (!s || m_stale) {
         QString why;
-        if (!s)
-            why = m_options.startCollector ? QStringLiteral("Starting\u2026") : QStringLiteral("Not collecting");
-        else
-            why = QStringLiteral("No recent samples: values are unavailable until the collector recovers");
+        if (s)
+            why = QStringLiteral("No recent samples");
+        else if (!m_options.startCollector)
+            why = QStringLiteral("Not collecting");
         for (auto* h : m_head) {
             if (!h)
                 continue;
             h->setValue(0, kDash);
             h->setValue(1, kDash);
-            h->setSummary(paused + why);
+            h->setSummary(summary(why));
         }
         return;
     }
@@ -2315,11 +2404,7 @@ void MainWindow::updateHeadlines()
     {
         auto* h = m_head[CpuPage];
         h->setValue(0, measured(s->cpu.total, qPercent(s->cpu.total)));
-        QString text = s->logicalCpus == 1 ? QStringLiteral("One logical CPU")
-                                           : QStringLiteral("Average of %1 logical CPUs").arg(s->logicalCpus);
-        if (ps::isValid(s->load1))
-            text += QStringLiteral(", load average %1").arg(s->load1, 0, 'f', 2);
-        h->setSummary(paused + text);
+        h->setSummary(summary({}));
     }
 
     // Memory
@@ -2334,26 +2419,24 @@ void MainWindow::updateHeadlines()
                 text += QStringLiteral(", swap %1 of %2").arg(qBytes(m.swapUsed), qBytes(m.swapTotal));
             else
                 text += ps::isValid(m.swapTotal) ? QStringLiteral(", no swap") : QStringLiteral(", swap unknown");
-            h->setSummary(paused + text);
+            h->setSummary(summary(text));
         } else {
             h->setValue(0, kDash);
-            h->setSummary(paused + QStringLiteral("/proc/meminfo is unavailable"));
+            h->setSummary(summary(QStringLiteral("/proc/meminfo is unavailable")));
         }
     }
 
-    // Disks: the selected device, and the root filesystem's free space.
+    // Disks: the selected device (named by the picker), and the root
+    // filesystem's free space.
     {
         auto* h = m_head[DiskPage];
         const QString dev = selectedDisk();
         double r = ps::kNaN, w = ps::kNaN;
         bool present = true;
-        QString text;
+        QStringList text;
         if (dev.isEmpty()) {
             r = s->diskTotal.a;
             w = s->diskTotal.b;
-            const int n = s->diskTotal.members;
-            text = n == 1 ? QStringLiteral("One physical disk")
-                          : (n > 1 ? QStringLiteral("Sum of %1 physical disks").arg(n) : QStringLiteral("No disks found"));
         } else {
             const ps::DiskIo* found = nullptr;
             for (const auto& d : s->disks)
@@ -2363,24 +2446,23 @@ void MainWindow::updateHeadlines()
             if (found) {
                 r = found->readBps;
                 w = found->writeBps;
-                text = ps::isValid(found->sizeBytes) ? QStringLiteral("%1, %2").arg(dev, qBytes(found->sizeBytes)) : dev;
             } else {
-                text = QStringLiteral("%1 is not present").arg(dev);
+                text << QStringLiteral("%1 is not present").arg(dev);
             }
         }
         for (const auto& fs : s->filesystems) {
             const bool root = std::find(fs.mountPoints.begin(), fs.mountPoints.end(), "/") != fs.mountPoints.end();
             if (root && ps::isValid(fs.availBytes) && ps::isValid(fs.totalBytes)) {
-                text += QStringLiteral(". / has %1 free of %2").arg(qBytes(fs.availBytes), qBytes(fs.totalBytes));
+                text << QStringLiteral("/ has %1 free of %2").arg(qBytes(fs.availBytes), qBytes(fs.totalBytes));
                 break;
             }
         }
         h->setValue(0, present ? measured(r, qRate(r)) : kDash);
         h->setValue(1, present ? measured(w, qRate(w)) : kDash);
-        h->setSummary(paused + text);
+        h->setSummary(summary(text.join(QStringLiteral(". "))));
     }
 
-    // Network: the selected interface.
+    // Network: the selected interface, named by the picker.
     {
         auto* h = m_head[NetworkPage];
         const QString dev = selectedNet();
@@ -2390,9 +2472,6 @@ void MainWindow::updateHeadlines()
         if (dev.isEmpty()) {
             rx = s->netTotal.a;
             tx = s->netTotal.b;
-            text = s->netTotal.members > 0
-                ? capitalized(aggregateKind(s->netTotal)) + QStringLiteral(", loopback excluded")
-                : QStringLiteral("No interfaces besides loopback");
         } else {
             const ps::NetIo* found = nullptr;
             for (const auto& n : s->interfaces)
@@ -2402,40 +2481,34 @@ void MainWindow::updateHeadlines()
             if (found) {
                 rx = found->rxBps;
                 tx = found->txBps;
-                text = QStringLiteral("%1, %2, %3").arg(dev, q(found->operState), kindText(found->kind));
             } else {
                 text = QStringLiteral("%1 is not present").arg(dev);
             }
         }
         h->setValue(0, present ? measured(rx, qRate(rx)) : kDash);
         h->setValue(1, present ? measured(tx, qRate(tx)) : kDash);
-        h->setSummary(paused + text);
+        h->setSummary(summary(text));
     }
 
     // Temperatures: the hottest valid sensor, named exactly.
     {
         auto* h = m_head[TemperaturePage];
         const ps::TemperatureReading* hottest = nullptr;
-        int valid = 0;
         for (const auto& t : s->temperatures) {
             if (!ps::isValid(t.celsius))
                 continue;
-            ++valid;
             if (!hottest || t.celsius > hottest->celsius)
                 hottest = &t;
         }
         if (hottest) {
             h->setValue(0, qCelsius(hottest->celsius));
-            h->setSummary(paused
-                          + (valid == 1 ? QStringLiteral("%1, the only sensor reading").arg(q(hottest->displayName))
-                                        : QStringLiteral("%1, the hottest of %2 sensors reading")
-                                              .arg(q(hottest->displayName))
-                                              .arg(valid)));
+            h->setSummary(summary(q(hottest->displayName)));
         } else {
+            // The temperature note, when there is one, says why.
             h->setValue(0, kDash);
-            h->setSummary(paused
-                          + (s->temperatures.empty() ? QStringLiteral("No temperature sensors found")
-                                                     : QStringLiteral("No sensor is reading")));
+            h->setSummary(summary(!s->temperatureNote.empty() ? QString()
+                                      : s->temperatures.empty() ? QStringLiteral("No temperature sensors found")
+                                                                : QStringLiteral("No sensor is reading")));
         }
     }
 }
@@ -2765,7 +2838,7 @@ void MainWindow::updateProcesses()
 void MainWindow::updateProcessCount()
 {
     const ps::Snapshot* s = m_latest.get();
-    QString text;
+    QString text, tip;
     if (!s) {
         text = QStringLiteral("Waiting for the first scan");
     } else if (!s->processesScanned) {
@@ -2774,16 +2847,23 @@ void MainWindow::updateProcessCount()
         // Processes only; group rows are not counted.
         const int total = m_procModel->processCount();
         text = m_procProxy->isFiltering()
-            ? QStringLiteral("%1 of %2 processes match, %3 threads").arg(m_procProxy->visibleProcessCount()).arg(total)
-            : QStringLiteral("%1 processes, %2 threads").arg(total);
-        text = text.arg(s->threadCount);
-        if (m_stale)
-            text += QStringLiteral(". No recent samples: values are out of date and shown as unavailable");
-        else if (m_paused)
-            text += QStringLiteral(". Paused: frozen at the last sample");
+            ? QStringLiteral("%1 of %2 processes match").arg(m_procProxy->visibleProcessCount()).arg(total)
+            : QStringLiteral("%1 processes").arg(total);
+        tip = QStringLiteral("%1 threads").arg(s->threadCount);
+        if (m_stale) {
+            text += QStringLiteral(". No recent samples");
+            tip += QStringLiteral(". Values are out of date and shown as unavailable");
+        } else if (m_paused) {
+            text += QStringLiteral(". Paused");
+            tip += QStringLiteral(". Frozen at the last sample");
+        }
     }
     if (m_procCount->text() != text)
         m_procCount->setText(text);
+    if (m_procCount->toolTip() != tip) {
+        m_procCount->setToolTip(tip);
+        m_procCount->setAccessibleDescription(tip);
+    }
 }
 
 void MainWindow::applyWindowOwners(windows::ResultPtr result)
@@ -2866,11 +2946,16 @@ void MainWindow::updateGroupNote()
         return;
     const bool show = m_grouping.state == ProcessGrouping::State::Unavailable;
     if (show) {
-        const QString text = QStringLiteral("App detection unavailable: %1. User processes are listed together "
-                                            "without deciding which are apps; kernel processes are still separate.")
-                                 .arg(m_grouping.reason.isEmpty() ? QStringLiteral("no window list") : m_grouping.reason);
+        const QString text = QStringLiteral("App detection unavailable");
+        const QString why = QStringLiteral("App detection unavailable: %1. User processes are listed together "
+                                           "without deciding which are apps; kernel processes are still separate.")
+                                .arg(m_grouping.reason.isEmpty() ? QStringLiteral("no window list") : m_grouping.reason);
         if (m_groupNote->text() != text)
             m_groupNote->setText(text);
+        if (m_groupNote->toolTip() != why) {
+            m_groupNote->setToolTip(why);
+            m_groupNote->setAccessibleDescription(why);
+        }
     }
     if (m_groupNote->isVisibleTo(m_groupNote->parentWidget()) != show)
         m_groupNote->setVisible(show);
@@ -3025,46 +3110,58 @@ QString MainWindow::statusText() const
     return m_statusLabel ? m_statusLabel->text() : QString();
 }
 
+QString MainWindow::statusDetail() const
+{
+    return m_statusLabel ? m_statusLabel->toolTip() : QString();
+}
+
 void MainWindow::updateStatus()
 {
-    QString text;
+    // A few words for what is wrong; why, how old and what happens next go
+    // to the tooltip and the accessible description.
+    QStringList text;
+    QStringList detail;
     if (m_paused) {
-        text = QStringLiteral("Paused: the view is frozen. Resuming starts new rate baselines and leaves a gap.");
+        text << QStringLiteral("Paused (press %1 to resume)")
+                    .arg(m_pauseAction->shortcut().toString(QKeySequence::NativeText));
+        detail << QStringLiteral("The view is frozen. Resuming starts new rate baselines and leaves a gap.");
         if (m_stale)
-            text += QStringLiteral(" Samples had already stopped arriving before the pause, so current values stay "
-                                   "unavailable.");
+            detail << QStringLiteral("Samples had already stopped arriving before the pause, so current values stay "
+                                     "unavailable.");
     } else if (m_collector && !m_collector->startError().isEmpty()) {
-        text = m_collector->startError() + QStringLiteral(". Nothing is being collected; retrying automatically.");
+        const QString error = m_collector->startError();
+        const qsizetype colon = error.indexOf(QStringLiteral(": "));
+        text << (colon > 0 ? error.left(colon) : error) + QStringLiteral("; retrying");
+        detail << error + QStringLiteral(". Nothing is being collected; retrying automatically.");
     } else if (m_stale) {
+        text << QStringLiteral("Readings unavailable");
         const double age = now() - m_lastAcquired;
         const double waited = now() - m_waitingSince;
         const bool futureShown = m_latest && isFromFuture(*m_latest);
         if (futureShown)
-            text = QStringLiteral("The newest sample has an inconsistent time. Values are shown as unavailable "
-                                  "until a current sample arrives.");
+            detail << QStringLiteral("The newest sample has an inconsistent time. Values are shown as unavailable "
+                                     "until a current sample arrives.");
         else if (ps::isValid(m_lastAcquired) && ps::isValid(age) && age >= 0)
-            text = QStringLiteral("The newest sample is %1 s old: the collector is blocked or starved. Values are "
-                                  "shown as unavailable until it recovers.")
-                       .arg(age, 0, 'f', 0);
+            detail << QStringLiteral("The newest sample is %1 s old: the collector is blocked or starved. Values are "
+                                     "shown as unavailable until it recovers.")
+                          .arg(age, 0, 'f', 0);
         else if (ps::isValid(m_lastAcquired))
-            text = QStringLiteral("The newest sample has an inconsistent time. Values are shown as unavailable "
-                                  "until a current sample arrives.");
+            detail << QStringLiteral("The newest sample has an inconsistent time. Values are shown as unavailable "
+                                     "until a current sample arrives.");
         else
-            text = QStringLiteral("Waiting %1 s for a sample: the collector is blocked or starved. Values are shown "
-                                  "as unavailable until it recovers.")
-                       .arg(ps::isValid(waited) ? waited : 0.0, 0, 'f', 0);
-    } else if (!m_latest) {
-        text = m_options.startCollector ? QStringLiteral("Starting\u2026") : QStringLiteral("Not collecting");
-    } else if (!m_latest->continuous) {
-        text = QStringLiteral("Warming up: CPU use and transfer rates appear after the next sample.");
-    } else {
-        text = QStringLiteral("Live, sampling every %1.").arg(intervalText(m_intervalMs));
+            detail << QStringLiteral("Waiting %1 s for a sample: the collector is blocked or starved. Values are "
+                                     "shown as unavailable until it recovers.")
+                          .arg(ps::isValid(waited) ? waited : 0.0, 0, 'f', 0);
+    } else if (!m_latest && !m_options.startCollector) {
+        text << QStringLiteral("Not collecting");
     }
     if (m_latest && !m_paused && !m_latest->problems.empty()) {
         QStringList problems;
         for (const auto& p : m_latest->problems)
             problems << q(p);
-        text += QStringLiteral(" Unavailable: ") + problems.join(QStringLiteral("; ")) + QLatin1Char('.');
+        if (text.isEmpty())
+            text << QStringLiteral("Some readings unavailable");
+        detail << QStringLiteral("Unavailable: ") + problems.join(QStringLiteral("; ")) + QLatin1Char('.');
     }
     if (m_latest && !m_paused) {
         // Each category has a fixed share of the bounded history; say so when a
@@ -3077,17 +3174,35 @@ void MainWindow::updateStatus()
         for (const auto& [group, name] : groups)
             if (const std::size_t n = m_history.refusedInLastSample(group))
                 limited << QStringLiteral("%1 %2").arg(n).arg(QLatin1String(name));
-        if (!limited.isEmpty())
-            text += QStringLiteral(" History limit reached, not recorded: ") + limited.join(QStringLiteral(", "))
-                + QLatin1Char('.');
+        if (!limited.isEmpty()) {
+            text << QStringLiteral("History limit reached");
+            detail << QStringLiteral("History limit reached, not recorded: ") + limited.join(QStringLiteral(", "))
+                    + QLatin1Char('.');
+        }
     }
-    if (m_statusLabel->text() != text)
-        m_statusLabel->setText(text);
-    const QString timing = (m_latest && ps::isValid(m_latest->collectMs))
-        ? QStringLiteral("Sample took %1 ms").arg(m_latest->collectMs, 0, 'f', 1)
-        : QString();
-    if (m_timingLabel->text() != timing)
-        m_timingLabel->setText(timing);
+    const QString shown = text.join(QStringLiteral(". "));
+    const QString tip = detail.join(QLatin1Char('\n'));
+    if (m_statusLabel->text() != shown)
+        m_statusLabel->setText(shown);
+    // The name replaces the label's text for assistive technology, so it
+    // carries the cue itself.
+    const QString name = shown.isEmpty() ? QStringLiteral("Status") : QStringLiteral("Status: ") + shown;
+    if (m_statusLabel->accessibleName() != name)
+        m_statusLabel->setAccessibleName(name);
+    if (m_statusLabel->toolTip() != tip) {
+        m_statusLabel->setToolTip(tip);
+        m_statusLabel->setAccessibleDescription(tip);
+    }
+    updateStatusBarVisibility();
+}
+
+void MainWindow::updateStatusBarVisibility()
+{
+    // A message (export progress or result) shows the bar too, and it hides
+    // again when both are gone. Always an explicit show or hide: a bar left
+    // implicitly hidden would appear with the window.
+    QStatusBar* bar = statusBar();
+    bar->setVisible(!m_statusLabel->text().isEmpty() || !bar->currentMessage().isEmpty());
 }
 
 // ---------------------------------------------------------------------------

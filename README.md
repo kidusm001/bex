@@ -158,13 +158,21 @@ too, but is not required.
 Controls, left to right:
 
 - **Navigation list**: pick a page. Each entry shows the current value and a
-  small sparkline.
-- **Toolbar**: pause/resume, the sampling interval (0.5, 1, 2 or 5 s), the
-  graph window (1, 5 or 15 minutes), **Details** and CSV export.
-- **View menu**: **Details** and **Smooth Graphs**.
+  small sparkline; with **Details** on, a third line adds a secondary value.
+- **Toolbar**: **History** (the graph window: 1, 5 or 15 minutes) and
+  **Details**.
+- **File menu**: **Export History as CSV** and **Quit**.
+- **View menu**: **Pause**, **Update Interval** (0.5, 1, 2 or 5 seconds),
+  **Details**, **Smooth Graphs** (Ctrl+Shift+M) and the pages.
 
-The status bar shows the last sample time, the collector's own cost per
-sample, and any problem reading a source.
+The status bar appears only when something needs attention: paused, readings
+unavailable or out of date, a collector that cannot start, or a history limit
+reached. It shows a few words; its tooltip (and accessible description) gives
+the full reason. When everything is healthy it is hidden.
+
+Units and conventions (what "used" memory means, CPU per core, which devices
+are counted) are in the tooltips of the headings, pickers and table columns
+rather than in notes on the pages.
 
 Keyboard shortcuts:
 
@@ -173,6 +181,7 @@ Keyboard shortcuts:
 | Ctrl+1 … Ctrl+6 | CPU, Memory, Disks, Network, Temperatures, Processes |
 | P or Pause | Pause or resume |
 | Ctrl+D | Show or hide details |
+| Ctrl+Shift+M | Turn smooth graphs on or off |
 | Ctrl+E | Export history to CSV |
 | Ctrl+F | Filter processes (switches to the Processes page) |
 | Ctrl+Q | Quit |
@@ -192,16 +201,19 @@ geometry.
 ### Simple view and Details
 
 PulseScope starts in the Simple view: each page shows its main reading in
-large type, one graph with a filled area under its line, and a short summary.
+large type and one graph with a filled area under its line. A line of text
+under the reading appears only where it adds something (memory of total and
+swap, root filesystem free space, the hottest sensor) or when a reading is
+paused or unavailable.
 Turn on **Details** (toolbar, View menu or Ctrl+D) for everything else:
 
 | Page | Simple | Details adds |
 | --- | --- | --- |
 | CPU | Total utilization | User, system and I/O wait lines, per-CPU graphs, load average and the other facts |
 | Memory | Used of total, available, and the used area | Buff/cache, the swap graph and all memory facts |
-| Disks | Read and write, with the disk picker | The local filesystem table, more I/O facts and notes |
-| Network | Receive and transmit, with the interface picker | More interface facts and notes |
-| Temperatures | The checked sensors, each named exactly in the legend and keeping its colour and line style (also in the navigation sparkline of the hottest sensor) | The sensor list for choosing what to plot, and notes |
+| Disks | Read and write, with the disk picker | The local filesystem table and more I/O facts |
+| Network | Receive and transmit, with the interface picker | More interface facts |
+| Temperatures | The checked sensors, each named exactly in the legend and keeping its colour and line style (also in the navigation sparkline of the hottest sensor) | The sensor list for choosing what to plot |
 | Processes | Name, PID, CPU and memory (RSS) in the three groups, with filter and sort | User, threads, state, nice, disk I/O, age and command line |
 
 Both views show the same live data. Switching never discards history,
@@ -227,11 +239,12 @@ of jumping once per sample.
   paused. Frames copy cached images of the graphs and repaint only what
   moved; the graphs are redrawn from the data only when a sample arrives or
   the view changes.
-- Turn off **View > Smooth Graphs** for less power use and less motion: the
-  graphs then move once per sample. Smooth graphs on a visible window cost a
-  few percent of one core; see [Design notes](#design-notes) for
-  measurements. Qt 6 offers no system "reduce motion" preference for
-  PulseScope to follow, so this switch is the way to choose.
+- Turn off **View > Smooth Graphs** (Ctrl+Shift+M) for less power use and
+  less motion: the graphs then move once per sample. Smooth graphs on a
+  visible window cost a few percent of one core; see
+  [Design notes](#design-notes) for measurements. Qt 6 offers no system
+  "reduce motion" preference for PulseScope to follow, so this switch is the
+  way to choose.
 
 ### Look and theme
 
@@ -426,11 +439,13 @@ Finding app windows depends on the desktop:
 | X11 | Reads the window manager's `_NET_CLIENT_LIST` and asks the X server which process owns each window (the X-Resource extension), when built with `xcb` and `xcb-res` and connected to a local X server. |
 | Other Wayland desktops | Not supported yet. |
 
-When the window list cannot be read, PulseScope says so and why, and lists
-user processes together as **Unclassified user processes** instead of calling
-them all background. Kernel processes are still shown separately. It never
-uses XWayland's window list on a Wayland desktop, because that only knows
-about X11 apps.
+When the window list cannot be read, the Apps header reads **Apps
+(unavailable)**, and a note above the list and the header's tooltip say why.
+User processes are then listed together as **Unclassified user processes**
+instead of calling them all background. Until the first list arrives, the
+header reads **Apps (detecting…)**. Kernel processes are still shown
+separately. PulseScope never uses XWayland's window list on a Wayland
+desktop, because that only knows about X11 apps.
 
 How the window list is fetched:
 
@@ -512,8 +527,8 @@ pulsescope [--interval 0.5|1|2|5]
            [--frame-stats]
 ```
 
-- `--interval` replaces the saved interval at startup. Like a change made in
-  the toolbar, it is saved and used on the next start.
+- `--interval` replaces the saved interval at startup. Like a choice made in
+  **View > Update Interval**, it is saved and used on the next start.
 - `--page`, `--size`, `--screenshot` and `--quit-after` mainly exist for
   testing and documentation screenshots.
 - `--theme-info` prints the Qt theme, style, font, icon theme and palette in
@@ -560,8 +575,13 @@ pulsescope [--interval 0.5|1|2|5]
   next list, Hyprland may still name a process that has just exited; if its
   PID were reused within that interval, the newcomer is excluded because it
   started after the request.
-- The X11 path is built and unit-tested, but was not run against a live X11
-  desktop during development (the development machine runs Hyprland).
+- The X11 path is built and unit-tested, and was run against a private Xvfb
+  server with test windows, but not on a live X11 desktop with a real window
+  manager (the development machine runs Hyprland). If the X server is already
+  unresponsive when PulseScope first connects, `xcb_connect()` can block the
+  app-detection thread (never the window); after 5 s the group reads "Apps
+  (unavailable)" and user processes stay unclassified. On quit that thread is
+  abandoned after a bounded wait.
 - History is kept in memory only and is lost when the app quits. Use CSV
   export to keep it.
 - CSV `unix_time_s` is computed at export time from the current difference

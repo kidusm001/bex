@@ -4787,7 +4787,11 @@ void TestAdversarial::mainWindowStaleThenPauseDoesNotResurrect()
     QTest::qWait(700);
     QVERIFY2(w.isStale(), "pausing cleared staleness without a new sample");
     QVERIFY2(violations().isEmpty(), qPrintable(QStringLiteral("stale->paused: ") + violations()));
-    QVERIFY2(w.statusText().contains(QStringLiteral("unavailable")), qPrintable(w.statusText()));
+    // Decluttered status: a short visible cue (paused wins), and the detail
+    // still says the values are unavailable because samples had stopped.
+    QVERIFY2(w.statusText().contains(QStringLiteral("Paused")), qPrintable(w.statusText()));
+    QVERIFY2(w.statusDetail().contains(QStringLiteral("unavailable")), qPrintable(w.statusDetail()));
+    QVERIFY2(w.statusBar()->isVisibleTo(&w), "stale+paused status bar hidden");
 
     server.setGated(false); // the collector recovers while the view is paused
     QTest::qWait(1500);
@@ -5200,12 +5204,15 @@ void TestAdversarial::mainWindowReportsHistoryTruncation()
     w.applySnapshot(uiSnap(2, 2, true, kCores));
     QCOMPARE(w.history().refusedInLastSample(ps::SeriesGroup::Core), over);
     const QString expected = QStringLiteral("%1 CPU cores").arg(over);
-    QVERIFY2(w.statusText().contains(QStringLiteral("History limit")) && w.statusText().contains(expected),
-             qPrintable(w.statusText()));
+    // A short visible cue; the counts are in the detail (tooltip and AT).
+    QVERIFY2(w.statusText().contains(QStringLiteral("History limit")), qPrintable(w.statusText()));
+    QVERIFY2(w.statusDetail().contains(expected), qPrintable(w.statusDetail()));
+    QVERIFY2(w.statusBar()->isVisibleTo(&w), "history limit cue hidden");
     QVERIFY(ps::isValid(w.history().latestValue(ps::keys::cpuTotal)));
     // Back under the quota: the notice must clear rather than stick.
     w.applySnapshot(uiSnap(3, 3, true, 8));
     QVERIFY2(!w.statusText().contains(QStringLiteral("History limit")), qPrintable(w.statusText()));
+    QVERIFY2(!w.statusDetail().contains(QStringLiteral("History limit")), qPrintable(w.statusDetail()));
 #endif
 }
 
@@ -5358,8 +5365,11 @@ QString staleLeaks(MainWindow& w)
                 v << QStringLiteral("sensor row %1=\"%2\"").arg(i).arg(sl->topLevelItem(i)->text(1));
     if (auto* c = w.findChild<TimeChart*>(QStringLiteral("cpuChart")); c && c->notice().isEmpty())
         v << QStringLiteral("cpu chart has no stale notice");
-    if (!w.statusText().contains(QStringLiteral("unavailable")))
-        v << QStringLiteral("status \"%1\"").arg(w.statusText());
+    if (!w.statusText().contains(QStringLiteral("unavailable")) || w.statusDetail().isEmpty()
+        || !w.statusBar()->isVisibleTo(&w))
+        v << QStringLiteral("status \"%1\" (detail \"%2\", bar shown %3)")
+                 .arg(w.statusText(), w.statusDetail())
+                 .arg(w.statusBar()->isVisibleTo(&w));
     return v.join(QStringLiteral("; "));
 }
 
@@ -5688,6 +5698,7 @@ void TestAdversarial::mainWindowInteractiveExportUsesChooser()
         QTest::qWait(100);
         QVERIFY2(!drv.seen, "chooser shown although there is nothing to export");
         QVERIFY2(!w.statusBar()->currentMessage().isEmpty(), "no explanation for the refused export");
+        QVERIFY2(w.statusBar()->isVisibleTo(&w), "the refused-export explanation is in a hidden status bar");
     }
     w.applySnapshot(uiSnap(1, 1, false));
     w.applySnapshot(uiSnap(2, 2, true));

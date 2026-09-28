@@ -28,6 +28,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
+#include <QMenuBar>
 #include <QProcess>
 #include <QScreen>
 #include <QMouseEvent>
@@ -1336,7 +1337,7 @@ const Essential kEssentials[] = {{MainWindow::CpuPage, "cpuChart"},          {Ma
                                  {MainWindow::NetworkPage, "netChart"},      {MainWindow::NetworkPage, "netSelector"},
                                  {MainWindow::TemperaturePage, "temperatureChart"},
                                  {MainWindow::ProcessPage, "processFilter"}, {MainWindow::ProcessPage, "processTable"},
-                                 {MainWindow::CpuPage, "intervalCombo"},     {MainWindow::CpuPage, "rangeCombo"}};
+                                 {MainWindow::CpuPage, "rangeCombo"}};
 
 // What each page shows in the current Details state; problems for widgets
 // on the wrong side.
@@ -1365,6 +1366,26 @@ QStringList checkDetailState(MainWindow& w, bool details)
         auto* x = w.findChild<QWidget*>(QString::fromLatin1(e.name));
         if (!x || !x->isVisible() || x->width() <= 0 || x->height() <= 0)
             problems << QStringLiteral("%1: essential %2 not on screen").arg(state, QLatin1String(e.name));
+    }
+    // The update interval moved from the toolbar to View > Update Interval:
+    // still reachable from the menu bar in both views, all four choices.
+    {
+        auto* menu = w.findChild<QMenu*>(QStringLiteral("intervalMenu"));
+        bool inBar = false;
+        if (menu)
+            for (QAction* top : w.menuBar()->actions())
+                if (top->menu())
+                    for (QAction* a : top->menu()->actions())
+                        inBar = inBar || a->menu() == menu;
+        int enabled = 0;
+        if (menu)
+            for (QAction* a : menu->actions())
+                enabled += a->isEnabled() && a->isVisible() && a->isCheckable();
+        if (!menu || !inBar || enabled != 4 || !menu->menuAction()->isEnabled())
+            problems << QStringLiteral("%1: update interval menu not reachable (menu %2, in menu bar %3, %4 choices)")
+                            .arg(state).arg(menu != nullptr).arg(inBar).arg(enabled);
+        if (w.findChild<QWidget*>(QStringLiteral("intervalCombo")))
+            problems << QStringLiteral("%1: the removed interval combo box is back").arg(state);
     }
     w.showPage(MainWindow::ProcessPage);
     settle(10);

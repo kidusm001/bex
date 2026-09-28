@@ -130,7 +130,7 @@ QString ProcessModel::groupTitle(Group group, const ProcessGrouping& grouping)
         if (detected)
             return QStringLiteral("Apps");
         return grouping.state == ProcessGrouping::State::Pending ? QStringLiteral("Apps (detecting\u2026)")
-                                                                 : QStringLiteral("App detection unavailable");
+                                                                 : QStringLiteral("Apps (unavailable)");
     case Background: return detected ? QStringLiteral("Background processes") : QStringLiteral("Unclassified user processes");
     case Kernel: return QStringLiteral("Kernel processes");
     case GroupCount: break;

@@ -15,6 +15,7 @@
 #include <QAbstractItemModelTester>
 #include <QAccessible>
 #include <QAction>
+#include <QActionGroup>
 #include <QApplication>
 #include <QComboBox>
 #include <QDir>
@@ -23,10 +24,13 @@
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
+#include <QMenuBar>
 #include <QMouseEvent>
 #include <QMessageBox>
 #include <QPaintEvent>
 #include <QProcess>
+#include <QProxyStyle>
 #include <QRegularExpression>
 #include <QScreen>
 #include <QScrollArea>
@@ -36,9 +40,14 @@
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QStandardPaths>
+#include <QStatusBar>
+#include <QStyleFactory>
+#include <QStyledItemDelegate>
 #include <QTemporaryDir>
 #include <QTextStream>
 #include <QTimer>
+#include <QToolBar>
+#include <QToolButton>
 #include <QTreeView>
 #include <QTreeWidget>
 #include <QtTest/QtTest>
@@ -433,6 +442,8 @@ private Q_SLOTS:
     void processGroupsFollowTheWindowProbe();
     void processGroupsExpireAndExplain();
     void processGroupsNeedCompleteWindowLists();
+    void processCellsKeepAGutter();
+    void processCellsKeepTheStyleTextColours();
     void csvExportWritesUnitsAndBlanks();
     void csvExportFailureIsReported();
     void csvExportBusyThenCompletes();
@@ -447,6 +458,11 @@ private Q_SLOTS:
     void cliWindowSizeIsValidated();
     void simpleByDefaultDetailsRestoresEverything();
     void detailsAndSmoothPreferencesPersist();
+    void smoothGraphsShortcut();
+    void toolbarHoldsOnlyViewChoices();
+    void statusBarShowsOnlyExceptions();
+    void navDetailLineOnlyInDetails();
+    void pagesCarryNoFooterNotes();
     void headlinesFollowDataAndState();
     void seriesKeepColoursStylesAndFills();
     void frameDriverRunsOnlyWhenSomeoneCanSee();
@@ -531,7 +547,10 @@ void TestUi::warmupThenLiveValues()
     Env env;
     MainWindow w(env.options());
     w.applySnapshot(snapshot(10, false));
-    QVERIFY(w.statusText().startsWith(QStringLiteral("Warming up")));
+    // Waiting for a rate baseline is normal: the values say so, the status
+    // bar stays out of the way.
+    QVERIFY2(w.statusText().isEmpty(), qPrintable(w.statusText()));
+    QVERIFY(w.statusBar()->isHidden());
     QCOMPARE(child<MetricButton>(w, "navCpu")->valueText(), QString::fromUtf8("Measuring\u2026"));
     QCOMPARE(child<MetricButton>(w, "navDisks")->valueText(), QString::fromUtf8("Measuring\u2026"));
     QCOMPARE(factText(w, "cpu_total"), kDash);
@@ -539,7 +558,9 @@ void TestUi::warmupThenLiveValues()
     QVERIFY(child<MetricButton>(w, "navMemory")->valueText().contains(QStringLiteral("6.00 GiB")));
 
     w.applySnapshot(snapshot(11, true, 25));
-    QVERIFY(w.statusText().startsWith(QStringLiteral("Live, sampling every 1 s")));
+    QVERIFY2(w.statusText().isEmpty(), qPrintable(w.statusText()));
+    QVERIFY(w.statusDetail().isEmpty());
+    QVERIFY(w.statusBar()->isHidden());
     QVERIFY(factText(w, "cpu_total").contains(QStringLiteral("25")));
     QVERIFY(child<MetricButton>(w, "navCpu")->valueText().contains(QStringLiteral("25")));
     QVERIFY(factText(w, "mem_used").contains(QStringLiteral("6.00 GiB")));
@@ -551,7 +572,7 @@ void TestUi::warmupThenLiveValues()
     QVERIFY(!w.history().continuous(0));
     QVERIFY(w.history().continuous(1));
     QCOMPARE(w.snapshotsApplied(), 2);
-    QVERIFY(child<QLabel>(w, "timingLabel")->text().contains(QStringLiteral("2.5 ms")));
+    QVERIFY(!w.findChild<QLabel*>(QStringLiteral("timingLabel")));
 
     // Filesystems: capacity where readable, the reason where not.
     auto* fsTable = child<QTreeWidget>(w, "filesystemTable");
@@ -924,7 +945,18 @@ void TestUi::sensorListNamesAndRemovedPlaceholder()
     w2.applySnapshot(none);
     auto* note = child<QLabel>(w2, "temperatureNote");
     QVERIFY(!note->isHidden());
-    QVERIFY(note->text().contains(QStringLiteral("hwmon")));
+    // One short sentence on the page; the full reason in the tooltip and for
+    // assistive technology.
+    QCOMPARE(note->text(), QStringLiteral("No temperature sensors are exposed (no hwmon or thermal zones in /sys)"));
+    QCOMPARE(note->toolTip(), note->text());
+    QCOMPARE(note->accessibleDescription(), note->text());
+    auto later = snapshot(21, false);
+    later->temperatures.clear();
+    later->temperatureNote = "Temperature sensors were not found. The kernel exposes none in /sys/class/hwmon.";
+    w2.applySnapshot(later);
+    QCOMPARE(note->text(), QStringLiteral("Temperature sensors were not found."));
+    QCOMPARE(note->toolTip(), QString::fromStdString(later->temperatureNote));
+    QCOMPARE(note->accessibleDescription(), note->toolTip());
     QCOMPARE(child<MetricButton>(w2, "navTemperatures")->valueText(), QStringLiteral("Unavailable"));
     QCOMPARE(child<TimeChart>(w2, "temperatureChart")->accessibleDescription(), QStringLiteral("No temperature sensors"));
 }
@@ -1039,7 +1071,10 @@ void TestUi::pauseFreezesAndResumeLeavesGap()
     pause->trigger();
     QVERIFY(w.isPaused());
     QCOMPARE(pause->text(), QStringLiteral("Resume"));
-    QVERIFY(w.statusText().startsWith(QStringLiteral("Paused")));
+    QCOMPARE(w.statusText(), QStringLiteral("Paused (press P to resume)"));
+    QVERIFY(w.statusDetail().contains(QStringLiteral("leaves a gap")));
+    QCOMPARE(child<QLabel>(w, "statusLabel")->accessibleDescription(), w.statusDetail());
+    QVERIFY(!w.statusBar()->isHidden());
     for (auto* chart : w.findChildren<TimeChart*>())
         QCOMPARE(chart->notice(), QStringLiteral("Paused"));
     const QString frozen = factText(w, "cpu_total");
@@ -1055,6 +1090,8 @@ void TestUi::pauseFreezesAndResumeLeavesGap()
     QTest::keyClick(&w, Qt::Key_P);
     QVERIFY(!w.isPaused());
     QCOMPARE(pause->text(), QStringLiteral("Pause"));
+    QVERIFY(w.statusText().isEmpty());
+    QVERIFY(w.statusBar()->isHidden());
     for (auto* chart : w.findChildren<TimeChart*>())
         QVERIFY(chart->notice().isEmpty());
     // The collector's first sample after resume is a new baseline: a gap.
@@ -1073,20 +1110,35 @@ void TestUi::intervalAndRangeChangesKeepHistory()
     Env env;
     MainWindow w(env.options());
     feed(w, 1000, 10);
-    auto* interval = child<QComboBox>(w, "intervalCombo");
     auto* range = child<QComboBox>(w, "rangeCombo");
     QCOMPARE(w.intervalMs(), 1000);
     QCOMPARE(w.windowSeconds(), 300);
 
-    const int twoSec = interval->findData(2000);
-    interval->setCurrentIndex(twoSec);
-    Q_EMIT interval->activated(twoSec);
+    // The cadence is a View menu choice: exclusive checkable actions.
+    auto* menu = child<QMenu>(w, "intervalMenu");
+    QCOMPARE(menu->title(), QStringLiteral("Update Interval"));
+    QStringList texts;
+    for (auto* a : menu->actions())
+        texts << a->text();
+    QCOMPARE(texts, (QStringList {QStringLiteral("0.5 seconds"), QStringLiteral("1 second"),
+                                  QStringLiteral("2 seconds"), QStringLiteral("5 seconds")}));
+    auto* one = child<QAction>(w, "intervalAction1000");
+    auto* two = child<QAction>(w, "intervalAction2000");
+    auto* half = child<QAction>(w, "intervalAction500");
+    QVERIFY(one->isChecked() && !two->isChecked());
+    QVERIFY(one->actionGroup() && one->actionGroup()->isExclusive());
+    two->trigger();
+    QCOMPARE(w.intervalMs(), 2000);
+    QVERIFY(two->isChecked() && !one->isChecked());
+    two->trigger(); // an exclusive choice stays chosen
+    QVERIFY(two->isChecked());
     QCOMPARE(w.intervalMs(), 2000);
     w.setIntervalMs(1234); // not a choice: ignored
     QCOMPARE(w.intervalMs(), 2000);
+    QVERIFY(two->isChecked());
     w.setIntervalMs(500);
-    QCOMPARE(interval->currentData().toInt(), 500);
-    QVERIFY(w.statusText().contains(QStringLiteral("0.5 s")));
+    QVERIFY(half->isChecked() && !two->isChecked());
+    QVERIFY(w.statusText().isEmpty()); // a normal setting, not a status
 
     const int oneMin = range->findData(60);
     range->setCurrentIndex(oneMin);
@@ -1124,12 +1176,28 @@ void TestUi::processTableSortsAndFilters()
 
     // Without a window list nothing is called an app or a background process.
     QCOMPARE(w.processGrouping().state, ProcessGrouping::State::Unavailable);
-    QCOMPARE(groupTitles(table), (QStringList {QStringLiteral("App detection unavailable"),
+    QCOMPARE(groupTitles(table), (QStringList {QStringLiteral("Apps (unavailable)"),
                                                QStringLiteral("Unclassified user processes (4)"),
                                                QStringLiteral("Kernel processes (1)")}));
     QVERIFY(note->isVisibleTo(&w));
-    QVERIFY2(note->text().contains(QStringLiteral("App detection is off")), qPrintable(note->text()));
-    QCOMPARE(count->text(), QStringLiteral("5 processes, 42 threads"));
+    // One short line beside the count; the reason in the tooltip and for
+    // assistive technology.
+    QCOMPARE(note->text(), QStringLiteral("App detection unavailable"));
+    QVERIFY2(note->toolTip().contains(QStringLiteral("App detection is off")), qPrintable(note->toolTip()));
+    QCOMPARE(note->accessibleDescription(), note->toolTip());
+    // The noun-first header still tells assistive technology and the
+    // tooltip why, and counts nothing it could not classify.
+    {
+        const QModelIndex apps = groupRow(table, ProcessModel::Apps);
+        QCOMPARE(apps.data(Qt::AccessibleTextRole).toString(), QStringLiteral("Apps (unavailable), group"));
+        QVERIFY2(apps.data(Qt::ToolTipRole).toString().contains(QStringLiteral("App detection is off")),
+                 qPrintable(apps.data(Qt::ToolTipRole).toString()));
+        QVERIFY(!groupTitles(table).join(QLatin1Char('|')).contains(QStringLiteral("Background")));
+    }
+    // The thread total is a detail: tooltip and assistive technology.
+    QCOMPARE(count->text(), QStringLiteral("5 processes"));
+    QCOMPARE(count->toolTip(), QStringLiteral("42 threads"));
+    QCOMPARE(count->accessibleDescription(), count->toolTip());
     QCOMPARE(pidOrder(table, ProcessModel::Apps), QList<int>());
     QCOMPARE(pidOrder(table, ProcessModel::Kernel), QList<int> {2}); // PF_KTHREAD, not a name guess
 
@@ -1138,7 +1206,7 @@ void TestUi::processTableSortsAndFilters()
     QCOMPARE(groupTitles(table), (QStringList {QStringLiteral("Apps (2)"), QStringLiteral("Background processes (2)"),
                                                QStringLiteral("Kernel processes (1)")}));
     QVERIFY(!note->isVisibleTo(&w));
-    QCOMPARE(count->text(), QStringLiteral("5 processes, 42 threads")); // group rows are not processes
+    QCOMPARE(count->text(), QStringLiteral("5 processes")); // group rows are not processes
     QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Apps)));
     QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Background)));
     QVERIFY(!table->isExpanded(groupRow(table, ProcessModel::Kernel)));
@@ -1184,7 +1252,8 @@ void TestUi::processTableSortsAndFilters()
     QCOMPARE(pidOrder(table), (QList<int> {777}));
     QCOMPARE(groupTitles(table), (QStringList {QStringLiteral("Apps (1 of 2)"), QStringLiteral("Background processes (0 of 2)"),
                                                QStringLiteral("Kernel processes (0 of 1)")}));
-    QCOMPARE(count->text(), QStringLiteral("1 of 5 processes match, 42 threads"));
+    QCOMPARE(count->text(), QStringLiteral("1 of 5 processes match"));
+    QCOMPARE(count->toolTip(), QStringLiteral("42 threads"));
     filter->setText(QStringLiteral("kthreadd"));
     QCOMPARE(pidOrder(table), (QList<int> {2}));
     QVERIFY(table->isExpanded(groupRow(table, ProcessModel::Kernel)));
@@ -1198,7 +1267,7 @@ void TestUi::processTableSortsAndFilters()
     QCOMPARE(pidOrder(table).size(), 5);
     filter->clear();
     QCOMPARE(pidOrder(table).size(), 5);
-    QCOMPARE(count->text(), QStringLiteral("5 processes, 42 threads"));
+    QCOMPARE(count->text(), QStringLiteral("5 processes"));
     QVERIFY(!table->isExpanded(groupRow(table, ProcessModel::Kernel))); // as the user left it
 
     // Refresh with an exited and a reused PID: rows follow (PID, start
@@ -1211,7 +1280,7 @@ void TestUi::processTableSortsAndFilters()
     QCOMPARE(pidOrder(table), (QList<int> {4242, 1, 777, 2}));
     QCOMPARE(processRow(table, 777).data().toString(), QStringLiteral("newcomer"));
     QCOMPARE(groupTitles(table).first(), QStringLiteral("Apps (1)"));
-    QCOMPARE(count->text(), QStringLiteral("4 processes, 42 threads"));
+    QCOMPARE(count->text(), QStringLiteral("4 processes"));
 
     // A command line rewritten in place (same identity) is filtered by its
     // new text.
@@ -1496,7 +1565,7 @@ void TestUi::processGroupsFollowTheWindowProbe()
     clock->store(1010.0);
     QTRY_COMPARE_WITH_TIMEOUT(w.processGrouping().state, ProcessGrouping::State::Unavailable, 3000);
     QVERIFY2(w.processGrouping().reason.contains(QStringLiteral("out of date")), qPrintable(w.processGrouping().reason));
-    QCOMPARE(groupTitles(table).first(), QStringLiteral("App detection unavailable"));
+    QCOMPARE(groupTitles(table).first(), QStringLiteral("Apps (unavailable)"));
     QCOMPARE(pidOrder(table, ProcessModel::Apps), QList<int>());
     QElapsedTimer t;
     t.start();
@@ -1527,11 +1596,11 @@ void TestUi::processGroupsExpireAndExplain()
     // ...but once it has expired, the newest failure is the explanation.
     *clock = 103.5;
     QTRY_COMPARE_WITH_TIMEOUT(w.processGrouping().state, ProcessGrouping::State::Unavailable, 2000);
-    QCOMPARE(groupTitles(table), (QStringList {QStringLiteral("App detection unavailable"),
+    QCOMPARE(groupTitles(table), (QStringList {QStringLiteral("Apps (unavailable)"),
                                                QStringLiteral("Unclassified user processes (4)"),
                                                QStringLiteral("Kernel processes (1)")}));
     QVERIFY(note->isVisibleTo(&w));
-    QVERIFY2(note->text().contains(QStringLiteral("did not answer within 400 ms")), qPrintable(note->text()));
+    QVERIFY2(note->toolTip().contains(QStringLiteral("did not answer within 400 ms")), qPrintable(note->toolTip()));
     QVERIFY(groupRow(table, ProcessModel::Apps).data(Qt::ToolTipRole).toString().contains(QStringLiteral("did not answer")));
 
     // A result from the future or without a time is not trusted.
@@ -1562,8 +1631,8 @@ void TestUi::processGroupsExpireAndExplain()
     // A failure that cannot change within this run explains itself.
     w.applyWindowOwners(windowOwnersFailed(windows::Status::Unsupported,
                                            "This Wayland desktop does not share its window list", 200));
-    QVERIFY(note->text().contains(QStringLiteral("does not share its window list")));
-    QVERIFY(!note->text().contains(QChar(0x2014))); // no dashes in the copy
+    QVERIFY(note->toolTip().contains(QStringLiteral("does not share its window list")));
+    QVERIFY(!note->toolTip().contains(QChar(0x2014))); // no dashes in the copy
 }
 
 void TestUi::processGroupsNeedCompleteWindowLists()
@@ -1603,13 +1672,13 @@ void TestUi::processGroupsNeedCompleteWindowLists()
     *clock = 103.1;
     QTRY_COMPARE_WITH_TIMEOUT(w.processGrouping().state, ProcessGrouping::State::Unavailable, 2000);
     // ...and then it is the reason, with what was missing.
-    QCOMPARE(groupTitles(table), (QStringList {QStringLiteral("App detection unavailable"),
+    QCOMPARE(groupTitles(table), (QStringList {QStringLiteral("Apps (unavailable)"),
                                                QStringLiteral("Unclassified user processes (4)"),
                                                QStringLiteral("Kernel processes (1)")}));
     QVERIFY2(note->isVisibleTo(&w), "incomplete list without a note");
-    QVERIFY2(note->text().contains(QStringLiteral("The window list from Hyprland is incomplete (1 window has no "
+    QVERIFY2(note->toolTip().contains(QStringLiteral("The window list from Hyprland is incomplete (1 window has no "
                                                   "usable process ID)")),
-             qPrintable(note->text()));
+             qPrintable(note->toolTip()));
 
     // Each kind of gap, with or without identified owners, is not Detected.
     struct Gap {
@@ -1636,7 +1705,7 @@ void TestUi::processGroupsNeedCompleteWindowLists()
             QCOMPARE(w.processGrouping().state, ProcessGrouping::State::Unavailable);
             QVERIFY(pidOrder(table, ProcessModel::Apps).isEmpty());
             QCOMPARE(groupTitles(table).at(1), QStringLiteral("Unclassified user processes (4)"));
-            QVERIFY2(note->text().contains(QLatin1String(gap.text)), qPrintable(note->text()));
+            QVERIFY2(note->toolTip().contains(QLatin1String(gap.text)), qPrintable(note->toolTip()));
             QVERIFY(groupRow(table, ProcessModel::Apps).data(Qt::ToolTipRole).toString().contains(QLatin1String(gap.text)));
         }
     }
@@ -1655,6 +1724,250 @@ void TestUi::processGroupsNeedCompleteWindowLists()
     w.applyWindowOwners(incomplete({{4242, 1000 + 4242}}, t, 0, 0, 1));
     QCOMPARE(w.processGrouping().state, ProcessGrouping::State::Detected);
     QVERIFY(pidOrder(table, ProcessModel::Apps).isEmpty());
+}
+
+namespace {
+
+// The widget-pixel columns of `r` in `img` that hold text: any pixel away
+// from `bg`, the cell's background colour.
+std::pair<int, int> inkSpan(const QImage& img, const QRect& r, QRgb bg)
+{
+    const qreal dpr = img.devicePixelRatio();
+    int left = -1, right = -1;
+    for (int x = r.left(); x <= r.right(); ++x) {
+        for (int y = r.top() + 1; y < r.bottom(); ++y) {
+            const QRgb c = img.pixel(int(x * dpr), int(y * dpr));
+            if (std::abs(qRed(c) - qRed(bg)) + std::abs(qGreen(c) - qGreen(bg)) + std::abs(qBlue(c) - qBlue(bg)) > 24) {
+                if (left < 0)
+                    left = x;
+                right = x;
+                break;
+            }
+        }
+    }
+    return {left, right};
+}
+
+} // namespace
+
+void TestUi::processCellsKeepAGutter()
+{
+    for (const bool rtl : {false, true}) {
+        Env env;
+        MainWindow w(env.options());
+        w.applySnapshot(snapshot(10, false));
+        auto s = snapshot(11, true);
+        // The widest values each numeric column is sized for.
+        auto wide = proc(4194304, "wide", 1000.0, 999.0 * 1024 * 1024 * 1024);
+        wide.threads = 9999;
+        wide.nice = -20;
+        wide.ioReadBps = 1000.0 * 1024;
+        wide.ioWriteBps = 1000.0 * 1024;
+        wide.ageSeconds = 12 * 60 + 5;
+        s->processes.push_back(wide);
+        w.applySnapshot(s);
+        w.setDetailsVisible(true);
+        w.showPage(MainWindow::ProcessPage);
+        w.resize(1600, 800);
+        auto* table = child<QTreeView>(w, "processTable");
+        if (rtl)
+            table->setLayoutDirection(Qt::RightToLeft);
+        w.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&w));
+        child<QLineEdit>(w, "processFilter")->setFocus(); // no focus frame in the table
+        auto* ours = table->itemDelegate();
+        auto* plain = new QStyledItemDelegate(table);
+        const QFontMetrics fm(table->font());
+
+        const auto render = [&](QAbstractItemDelegate* d) {
+            table->setItemDelegate(d);
+            QApplication::processEvents();
+            return table->viewport()->grab().toImage().convertToFormat(QImage::Format_RGB32);
+        };
+        const QModelIndex bash = processRow(table, 500);
+        const QModelIndex web = processRow(table, 4242);
+        QVERIFY(bash.isValid() && web.isValid());
+        table->selectionModel()->select(web, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        const int rowHeight = table->visualRect(bash).height();
+        const QImage before = render(plain);
+        QCOMPARE(table->visualRect(bash).height(), rowHeight);
+        const QImage after = render(ours);
+        QCOMPARE(table->visualRect(bash).height(), rowHeight); // row height unchanged
+
+        // Every right-aligned number beside left-aligned text gains about
+        // one average character over the style's own spacing.
+        const struct {
+            int number, text;
+        } pairs[] = {{ProcessModel::Pid, ProcessModel::User},
+                     {ProcessModel::Threads, ProcessModel::State},
+                     {ProcessModel::Age, ProcessModel::Command}};
+        for (const QModelIndex& row : {bash, web}) {
+            for (const auto& pair : pairs) {
+                const QRect a = table->visualRect(row.siblingAtColumn(pair.number));
+                const QRect b = table->visualRect(row.siblingAtColumn(pair.text));
+                const QRect leftCell = rtl ? b : a, rightCell = rtl ? a : b;
+                const auto gap = [&](const QImage& img) {
+                    const QRgb bg = img.pixel(rightCell.left(), rightCell.center().y());
+                    const int end = inkSpan(img, leftCell, bg).second;
+                    const int start = inkSpan(img, rightCell, bg).first;
+                    return (end < 0 || start < 0) ? -1 : start - end - 1;
+                };
+                const int plainGap = gap(before), gutterGap = gap(after);
+                QVERIFY2(plainGap >= 0 && gutterGap >= 0, "no text found");
+                QVERIFY2(gutterGap - plainGap >= fm.averageCharWidth(),
+                         qPrintable(QStringLiteral("column %1|%2: %3 px, plain %4 px")
+                                        .arg(pair.number).arg(pair.text).arg(gutterGap).arg(plainGap)));
+            }
+        }
+
+        // Nothing but text moved: selection, alternating rows, group rows,
+        // branches and the name column are pixel-identical to the plain
+        // delegate.
+        int stray = 0;
+        const auto compareRow = [&](const QModelIndex& row) {
+            const QRect r = table->visualRect(row);
+            QList<std::pair<int, int>> allowed;
+            if (row.parent().isValid()) {
+                for (int c = 1; c < ProcessModel::ColumnCount; ++c) {
+                    const QRect cell = table->visualRect(row.siblingAtColumn(c));
+                    const QRgb bg = before.pixel(cell.left(), cell.center().y());
+                    const auto p = inkSpan(before, cell, bg), o = inkSpan(after, cell, bg);
+                    if (p.first >= 0 || o.first >= 0)
+                        allowed.append({std::min(p.first < 0 ? o.first : p.first, o.first < 0 ? p.first : o.first) - 1,
+                                        std::max(p.second, o.second) + 1});
+                }
+            }
+            for (int y = r.top(); y <= r.bottom(); ++y) {
+                for (int x = 0; x < table->viewport()->width(); ++x) {
+                    if (before.pixel(x, y) == after.pixel(x, y))
+                        continue;
+                    const bool inText = std::any_of(allowed.begin(), allowed.end(), [x](const auto& span) {
+                        return x >= span.first && x <= span.second;
+                    });
+                    stray += inText ? 0 : 1;
+                }
+            }
+        };
+        for (int g = 0; g < table->model()->rowCount(); ++g) {
+            const QModelIndex group = table->model()->index(g, 0);
+            compareRow(group);
+            if (table->isExpanded(group))
+                for (int r = 0; r < table->model()->rowCount(group); ++r)
+                    compareRow(table->model()->index(r, 0, group));
+        }
+        QCOMPARE(stray, 0);
+
+        // Numbers are never cut short, and the text itself is unchanged.
+        for (const QModelIndex& row : {bash, web, processRow(table, 4194304)}) {
+            for (const int c : {ProcessModel::Pid, ProcessModel::Cpu, ProcessModel::Memory, ProcessModel::Threads,
+                                ProcessModel::Nice, ProcessModel::IoRead, ProcessModel::IoWrite, ProcessModel::Age}) {
+                const QModelIndex cell = row.siblingAtColumn(c);
+                QStyleOptionViewItem opt;
+                opt.initFrom(table);
+                opt.widget = table;
+                opt.font = table->font();
+                opt.fontMetrics = fm;
+                const int need = ours->sizeHint(opt, cell).width();
+                QVERIFY2(need <= table->columnWidth(c),
+                         qPrintable(QStringLiteral("%1 needs %2 of %3").arg(cell.data().toString()).arg(need).arg(table->columnWidth(c))));
+                QVERIFY(need > plain->sizeHint(opt, cell).width());
+                QCOMPARE(ours->sizeHint(opt, cell).height(), plain->sizeHint(opt, cell).height());
+            }
+            QStyleOptionViewItem opt;
+            opt.initFrom(table);
+            opt.widget = table;
+            QCOMPARE(ours->sizeHint(opt, row).width(), plain->sizeHint(opt, row).width()); // name
+        }
+        QCOMPARE(web.siblingAtColumn(ProcessModel::Pid).data().toString(), QStringLiteral("4242"));
+        QCOMPARE(processRow(table, 4194304).siblingAtColumn(ProcessModel::Cpu).data().toString(),
+                 QStringLiteral("1000.0"));
+        {
+            QStyleOptionViewItem opt;
+            opt.initFrom(table);
+            opt.widget = table;
+            const QModelIndex apps = groupRow(table, ProcessModel::Background);
+            QCOMPARE(ours->sizeHint(opt, apps), plain->sizeHint(opt, apps));
+        }
+
+        // A click in the gutter selects that process.
+        const QRect pidCell = table->visualRect(bash.siblingAtColumn(ProcessModel::Pid));
+        QTest::mouseClick(table->viewport(), Qt::LeftButton, {}, QPoint(rtl ? pidCell.right() - 1 : pidCell.left() + 1,
+                                                                        pidCell.center().y()));
+        QCOMPARE(selectedPids(table), QList<int> {500});
+        const QRect userCell = table->visualRect(web.siblingAtColumn(ProcessModel::User));
+        QTest::mouseClick(table->viewport(), Qt::LeftButton, {}, QPoint(rtl ? userCell.right() - 1 : userCell.left() + 1,
+                                                                        userCell.center().y()));
+        QCOMPARE(selectedPids(table), QList<int> {4242});
+        w.close();
+    }
+}
+
+namespace {
+// Like Kvantum: the style picks item text colours of its own, per state.
+class ThemedItemTextStyle : public QProxyStyle {
+public:
+    static QColor normal() { return QColor(0x00, 0x52, 0xaa); }
+    static QColor selected() { return QColor(0xb0, 0x20, 0x00); }
+    ThemedItemTextStyle() : QProxyStyle(QStyleFactory::create(QStringLiteral("Fusion"))) {}
+    void drawControl(ControlElement element, const QStyleOption* option, QPainter* p, const QWidget* w) const override
+    {
+        if (const auto* item = qstyleoption_cast<const QStyleOptionViewItem*>(option);
+            element == CE_ItemViewItem && item) {
+            QStyleOptionViewItem themed = *item;
+            themed.palette.setColor(QPalette::Text, normal());
+            themed.palette.setColor(QPalette::HighlightedText, selected());
+            QProxyStyle::drawControl(element, &themed, p, w);
+            return;
+        }
+        QProxyStyle::drawControl(element, option, p, w);
+    }
+};
+} // namespace
+
+void TestUi::processCellsKeepTheStyleTextColours()
+{
+    Env env;
+    MainWindow w(env.options());
+    w.applySnapshot(snapshot(10, false));
+    w.applySnapshot(snapshot(11, true));
+    w.setDetailsVisible(true);
+    w.showPage(MainWindow::ProcessPage);
+    w.resize(1600, 800);
+    auto* table = child<QTreeView>(w, "processTable");
+    ThemedItemTextStyle style;
+    table->setStyle(&style);
+    QPalette pal = table->palette();
+    pal.setColor(QPalette::Text, Qt::black);
+    pal.setColor(QPalette::HighlightedText, Qt::white);
+    table->setPalette(pal);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    child<QLineEdit>(w, "processFilter")->setFocus();
+    const QModelIndex bash = processRow(table, 500);
+    const QModelIndex web = processRow(table, 4242);
+    QVERIFY(bash.isValid() && web.isValid());
+    table->selectionModel()->select(web, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    QApplication::processEvents();
+    const QImage img = table->viewport()->grab().toImage().convertToFormat(QImage::Format_RGB32);
+    const auto count = [&](const QRect& cell, const QColor& colour) {
+        int n = 0;
+        for (int y = cell.top(); y <= cell.bottom(); ++y)
+            for (int x = cell.left(); x <= cell.right(); ++x)
+                n += img.pixel(x, y) == colour.rgb();
+        return n;
+    };
+    for (const int c : {ProcessModel::Pid, ProcessModel::User, ProcessModel::Memory, ProcessModel::Threads,
+                        ProcessModel::State}) {
+        const QRect idle = table->visualRect(bash.siblingAtColumn(c));
+        const QRect chosen = table->visualRect(web.siblingAtColumn(c));
+        const QString what = bash.siblingAtColumn(c).data().toString();
+        QVERIFY2(count(idle, ThemedItemTextStyle::normal()) > 0, qPrintable(what));
+        QVERIFY2(count(idle, Qt::black) == 0, qPrintable(what));
+        QVERIFY2(count(chosen, ThemedItemTextStyle::selected()) > 0, qPrintable(what));
+        QVERIFY2(count(chosen, Qt::white) == 0, qPrintable(what));
+    }
+    table->setStyle(nullptr);
+    w.close();
 }
 
 void TestUi::csvExportWritesUnitsAndBlanks()
@@ -1814,9 +2127,11 @@ void TestUi::historyLimitIsExplained()
     for (auto key : {ps::keys::cpuTotal, ps::keys::memUsed, ps::keys::swapUsed, ps::keys::diskAllRead,
                      ps::keys::netAllRx})
         QVERIFY2(h.find(key), std::string(key).c_str());
-    QVERIFY2(w.statusText().contains(QStringLiteral("History limit reached, not recorded: 44 CPU cores")),
-             qPrintable(w.statusText()));
-    QVERIFY(w.statusText().contains(QStringLiteral("10 sensors")));
+    QCOMPARE(w.statusText(), QStringLiteral("History limit reached"));
+    QVERIFY2(w.statusDetail().contains(QStringLiteral("History limit reached, not recorded: 44 CPU cores")),
+             qPrintable(w.statusDetail()));
+    QVERIFY(w.statusDetail().contains(QStringLiteral("10 sensors")));
+    QVERIFY(!w.statusBar()->isHidden());
 
     // Omitted graphs say so instead of looking like they are still waiting.
     int notRecorded = 0;
@@ -1975,7 +2290,9 @@ void TestUi::blockedCollectorGoesStaleAndRecovers()
         QVERIFY(block->cv.wait_for(lock, std::chrono::seconds(5), [&] { return block->blocked; }));
     }
     QTRY_VERIFY_WITH_TIMEOUT(w.isStale(), 5000);
-    QVERIFY2(w.statusText().contains(QStringLiteral("blocked or starved")), qPrintable(w.statusText()));
+    QCOMPARE(w.statusText(), QStringLiteral("Readings unavailable"));
+    QVERIFY2(w.statusDetail().contains(QStringLiteral("blocked or starved")), qPrintable(w.statusDetail()));
+    QVERIFY(!w.statusBar()->isHidden());
     QCOMPARE(child<MetricButton>(w, "navMemory")->valueText(), kDash);
     QCOMPARE(factText(w, "mem_used"), kDash);
     auto* table = child<QTreeView>(w, "processTable");
@@ -1989,7 +2306,8 @@ void TestUi::blockedCollectorGoesStaleAndRecovers()
     w.setPaused(true);
     QVERIFY(w.isStale());
     QCOMPARE(child<TimeChart>(w, "cpuChart")->notice(), QStringLiteral("Paused, no recent samples"));
-    QVERIFY(w.statusText().contains(QStringLiteral("stay unavailable")));
+    QVERIFY(w.statusText().startsWith(QStringLiteral("Paused")));
+    QVERIFY(w.statusDetail().contains(QStringLiteral("stay unavailable")));
     QCOMPARE(factText(w, "mem_used"), kDash);
 
     // Recovery: release the thread and resume; the next snapshot clears it.
@@ -2021,7 +2339,8 @@ void TestUi::freshnessFollowsAcquisitionClock()
     QVERIFY(!w.isStale());
     *clock = 1005.0;
     QTRY_VERIFY_WITH_TIMEOUT(w.isStale(), 3000);
-    QVERIFY2(w.statusText().startsWith(QStringLiteral("Waiting 5 s")), qPrintable(w.statusText()));
+    QCOMPARE(w.statusText(), QStringLiteral("Readings unavailable"));
+    QVERIFY2(w.statusDetail().startsWith(QStringLiteral("Waiting 5 s")), qPrintable(w.statusDetail()));
 
     // A frame acquired 20 s ago is history, not current data.
     w.applySnapshot(snapshot(985, false));
@@ -2032,13 +2351,16 @@ void TestUi::freshnessFollowsAcquisitionClock()
     cpuChart->setCursorTime(985);
     QVERIFY2(cpuChart->readoutText().startsWith(QStringLiteral("20 s ago")), qPrintable(cpuChart->readoutText()));
     cpuChart->clearCursor();
-    QVERIFY2(w.statusText().startsWith(QStringLiteral("The newest sample is 20 s old")), qPrintable(w.statusText()));
+    QVERIFY2(w.statusDetail().startsWith(QStringLiteral("The newest sample is 20 s old")),
+             qPrintable(w.statusDetail()));
 
     // A recent frame restores the live view; the chart still ends at the clock.
     *clock = 1005.4;
     w.applySnapshot(snapshot(1005, true, 40));
     QVERIFY2(!w.isStale(), qPrintable(w.statusText()));
-    QVERIFY(w.statusText().startsWith(QStringLiteral("Live")));
+    QVERIFY(w.statusText().isEmpty());
+    QVERIFY(w.statusDetail().isEmpty());
+    QVERIFY(w.statusBar()->isHidden());
     QVERIFY(factText(w, "mem_used").contains(QStringLiteral("6.00 GiB")));
     QVERIFY(factText(w, "cpu_total").contains(QStringLiteral("40")));
     QCOMPARE(cpuChart->viewEnd(), 1005.4);
@@ -2064,7 +2386,8 @@ void TestUi::freshnessFollowsAcquisitionClock()
     QVERIFY(!w.isStale());
     *clock = 1008.7;
     QTRY_VERIFY_WITH_TIMEOUT(w.isStale(), 3000);
-    QVERIFY2(w.statusText().startsWith(QStringLiteral("The newest sample is 3 s old")), qPrintable(w.statusText()));
+    QVERIFY2(w.statusDetail().startsWith(QStringLiteral("The newest sample is 3 s old")),
+             qPrintable(w.statusDetail()));
     *clock = 1012;
     QTRY_COMPARE_WITH_TIMEOUT(cpuChart->viewEnd(), 1012.0, 3000);
     QCOMPARE(w.history().latestTime(), 1006.0);
@@ -2109,8 +2432,9 @@ void TestUi::freshnessFollowsAcquisitionClock()
     // not block the samples that follow.
     w.applySnapshot(snapshot(1200, true));
     QVERIFY(w.isStale());
-    QVERIFY2(w.statusText().startsWith(QStringLiteral("The newest sample has an inconsistent time")),
-             qPrintable(w.statusText()));
+    QCOMPARE(w.statusText(), QStringLiteral("Readings unavailable"));
+    QVERIFY2(w.statusDetail().startsWith(QStringLiteral("The newest sample has an inconsistent time")),
+             qPrintable(w.statusDetail()));
     QCOMPARE(w.history().latestTime(), 1100.0);
     *clock = 1101;
     w.applySnapshot(snapshot(1101, true, 43));
@@ -2358,7 +2682,10 @@ void TestUi::liveCollectorPopulatesAndShutsDown()
     QVERIFY(s && s->continuous);
     QVERIFY(ps::isValid(s->cpu.total));
     QVERIFY(s->memory.valid);
-    QVERIFY(w->statusText().startsWith(QStringLiteral("Live")));
+    // Live and healthy says nothing; a real host may lack some readings.
+    QVERIFY2(w->statusText().isEmpty() || w->statusText() == QStringLiteral("Some readings unavailable"),
+             qPrintable(w->statusText() + QStringLiteral(" | ") + w->statusDetail()));
+    QCOMPARE(w->statusBar()->isHidden(), w->statusText().isEmpty());
     for (int p = 0; p < MainWindow::PageCount; ++p) {
         w->showPage(static_cast<MainWindow::Page>(p));
         QApplication::processEvents();
@@ -2451,12 +2778,12 @@ void TestUi::simpleByDefaultDetailsRestoresEverything()
         std::vector<const char*> details; // shown only with details
     };
     const std::vector<PageWidgets> pages {
-        {MainWindow::CpuPage, {"cpuHeadValue0", "cpuHeadSummary", "cpuChart"}, {"cpu_total", "cpu_user", "coreHeader", "coreScroll"}},
+        {MainWindow::CpuPage, {"cpuHeadValue0", "cpuChart"}, {"cpu_total", "cpu_user", "coreHeader", "coreScroll"}},
         {MainWindow::MemoryPage, {"memoryHeadValue0", "memoryHeadSummary", "memoryChart"}, {"mem_cache", "swap_used", "swapChart"}},
         {MainWindow::DiskPage, {"diskHeadValue0", "diskHeadValue1", "diskSelector", "diskChart"}, {"disk_read", "filesystemTable"}},
         {MainWindow::NetworkPage, {"netHeadValue0", "netHeadValue1", "netSelector", "netChart"}, {"net_rx"}},
         {MainWindow::TemperaturePage, {"temperatureHeadValue0", "temperatureChart"}, {"sensorList"}},
-        {MainWindow::ProcessPage, {"processFilter", "processTable", "processShortNote"}, {}},
+        {MainWindow::ProcessPage, {"processFilter", "processTable", "processCount"}, {}},
     };
     auto checkView = [&](bool detailed) {
         QStringList problems;
@@ -2465,9 +2792,8 @@ void TestUi::simpleByDefaultDetailsRestoresEverything()
             QTest::qWait(30);
             for (const char* name : p.simple) {
                 auto* c = w.findChild<QWidget*>(QString::fromLatin1(name));
-                const bool wantShown = !(detailed && QLatin1String(name) == QLatin1String("processShortNote"));
-                if (wantShown != shownWithArea(c))
-                    problems << QStringLiteral("%1 %2").arg(QLatin1String(name), wantShown ? QStringLiteral("hidden") : QStringLiteral("shown"));
+                if (!shownWithArea(c))
+                    problems << QStringLiteral("%1 hidden").arg(QLatin1String(name));
             }
             for (const char* name : p.details) {
                 auto* c = w.findChild<QWidget*>(QString::fromLatin1(name));
@@ -2480,6 +2806,11 @@ void TestUi::simpleByDefaultDetailsRestoresEverything()
                                     .arg(c->height());
             }
         }
+        // The navigation's third line belongs to Details; its text stays in
+        // the tooltip and accessible description either way.
+        for (auto* b : w.findChildren<MetricButton*>())
+            if (b->isDetailLineVisible() != detailed)
+                problems << QStringLiteral("%1 detail line %2").arg(b->objectName(), detailed ? "hidden" : "shown");
         for (int c = 0; c < ProcessModel::ColumnCount; ++c) {
             const bool essential =
                 c == ProcessModel::Pid || c == ProcessModel::Name || c == ProcessModel::Cpu || c == ProcessModel::Memory;
@@ -2587,6 +2918,324 @@ void TestUi::detailsAndSmoothPreferencesPersist()
     }
 }
 
+void TestUi::smoothGraphsShortcut()
+{
+    Env env;
+    auto clock = std::make_shared<double>(1000.0);
+    auto o = env.options();
+    o.clock = [clock] { return *clock; };
+    const QKeySequence keys(Qt::CTRL | Qt::SHIFT | Qt::Key_M);
+    const auto press = [](QWidget* target) { QTest::keyClick(target, Qt::Key_M, Qt::ControlModifier | Qt::ShiftModifier); };
+    {
+        MainWindow w(o);
+        auto* smooth = child<QAction>(w, "smoothAction");
+        QVERIFY(smooth);
+        QCOMPARE(smooth->shortcut(), keys);
+        QVERIFY2(smooth->toolTip().contains(QLatin1Char('(') + keys.toString(QKeySequence::NativeText) + QLatin1Char(')')),
+                 qPrintable(smooth->toolTip()));
+        for (auto* a : w.findChildren<QAction*>())
+            if (a != smooth)
+                QVERIFY2(!a->shortcuts().contains(keys), qPrintable(a->text()));
+        // Still in the View menu, with its check mark.
+        bool inMenu = false;
+        for (auto* m : w.menuBar()->findChildren<QMenu*>())
+            inMenu = inMenu || m->actions().contains(smooth);
+        QVERIFY(inMenu);
+
+        for (int i = 0; i < 10; ++i)
+            w.applySnapshot(snapshot(991 + i, i > 0));
+        w.resize(1000, 700);
+        w.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&w));
+        QTRY_VERIFY(w.isAnimating());
+        const std::size_t samples = w.history().size();
+        const int interval = w.intervalMs();
+
+        // One press is one toggle, and a second press turns it back.
+        QSignalSpy toggled(smooth, &QAction::toggled);
+        press(&w);
+        QCOMPARE(toggled.count(), 1);
+        QVERIFY(!w.smoothGraphs());
+        QVERIFY(!smooth->isChecked());
+        QVERIFY(!w.isAnimating());
+        press(&w);
+        QCOMPARE(toggled.count(), 2);
+        QVERIFY(w.smoothGraphs());
+        QVERIFY(smooth->isChecked());
+        QTRY_VERIFY(w.isAnimating());
+
+        // From the process filter: it toggles and types nothing.
+        QTest::keyClick(&w, Qt::Key_F, Qt::ControlModifier);
+        auto* filter = child<QLineEdit>(w, "processFilter");
+        QVERIFY(filter->hasFocus());
+        press(filter);
+        QCOMPARE(toggled.count(), 3);
+        QVERIFY(!w.smoothGraphs());
+        QVERIFY(filter->text().isEmpty());
+        QVERIFY(filter->hasFocus());
+
+        // Paused: the preference changes, but nothing starts drawing or
+        // sampling, and the view stays paused.
+        w.setPaused(true);
+        press(filter);
+        QCOMPARE(toggled.count(), 4);
+        QVERIFY(w.smoothGraphs());
+        QVERIFY(w.isPaused());
+        QVERIFY(!w.isAnimating());
+        w.setPaused(false);
+        QTRY_VERIFY(w.isAnimating());
+
+        // Hidden: the same.
+        w.hide();
+        smooth->trigger();
+        QVERIFY(!w.smoothGraphs());
+        smooth->trigger();
+        QVERIFY(w.smoothGraphs());
+        QVERIFY(!w.isAnimating());
+        QCOMPARE(toggled.count(), 6);
+
+        // Measurements and cadence are untouched.
+        QCOMPARE(w.history().size(), samples);
+        QCOMPARE(w.intervalMs(), interval);
+        w.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&w));
+        press(&w);
+        QCOMPARE(toggled.count(), 7);
+        QVERIFY(!w.smoothGraphs());
+        w.close();
+    }
+    {
+        // The last choice made with the keys is remembered.
+        MainWindow w(o);
+        QVERIFY(!w.smoothGraphs());
+        QVERIFY(!child<QAction>(w, "smoothAction")->isChecked());
+    }
+}
+
+void TestUi::toolbarHoldsOnlyViewChoices()
+{
+    Env env;
+    MainWindow w(env.options());
+    feed(w, 100, 3);
+    w.resize(1180, 780);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    auto* tb = child<QToolBar>(w, "controlsToolbar");
+    auto* pause = child<QAction>(w, "pauseAction");
+    auto* exportCsv = child<QAction>(w, "exportAction");
+    auto* details = child<QAction>(w, "detailsAction");
+    QVERIFY(tb && pause && exportCsv && details);
+
+    // History range, a separator and Details; nothing else.
+    QStringList items;
+    for (auto* a : tb->actions()) {
+        if (a->isSeparator())
+            items << QStringLiteral("|");
+        else if (auto* widget = tb->widgetForAction(a); widget && !widget->objectName().isEmpty()
+                 && !qobject_cast<QToolButton*>(widget))
+            items << widget->objectName();
+        else
+            items << a->objectName();
+    }
+    QCOMPARE(items, (QStringList {QStringLiteral("rangeLabel"), QStringLiteral("rangeCombo"), QStringLiteral("|"),
+                                  QStringLiteral("detailsAction")}));
+    QCOMPARE(child<QLabel>(w, "rangeLabel")->text(), QStringLiteral("History"));
+    QCOMPARE(child<QLabel>(w, "rangeLabel")->buddy(), child<QComboBox>(w, "rangeCombo"));
+    QCOMPARE(child<QComboBox>(w, "rangeCombo")->accessibleName(), QStringLiteral("Chart time range"));
+    QVERIFY(!child<QComboBox>(w, "rangeCombo")->toolTip().isEmpty());
+    QVERIFY(!w.findChild<QComboBox*>(QStringLiteral("intervalCombo")));
+
+    // Pause and export keep their menu entries and window-wide shortcuts.
+    QVERIFY(w.actions().contains(pause) && w.actions().contains(exportCsv));
+    QCOMPARE(exportCsv->shortcut(), QKeySequence(Qt::CTRL | Qt::Key_E));
+    const auto inMenu = [&](QAction* a) {
+        for (auto* m : w.menuBar()->findChildren<QMenu*>())
+            if (m->actions().contains(a))
+                return m->title();
+        return QString();
+    };
+    QCOMPARE(inMenu(pause), QStringLiteral("&View"));
+    QCOMPARE(inMenu(exportCsv), QStringLiteral("&File"));
+    QCOMPARE(inMenu(details), QStringLiteral("&View"));
+    QCOMPARE(inMenu(child<QAction>(w, "intervalAction1000")), QStringLiteral("Update Interval"));
+    // The submenu sits in View, after Pause.
+    QMenu* view = nullptr;
+    for (auto* m : w.menuBar()->findChildren<QMenu*>())
+        if (m->title() == QStringLiteral("&View"))
+            view = m;
+    QVERIFY(view);
+    const auto viewActions = view->actions();
+    QCOMPARE(viewActions.indexOf(pause), 0);
+    QCOMPARE(viewActions.at(1)->menu(), child<QMenu>(w, "intervalMenu"));
+
+    QTest::keyClick(&w, Qt::Key_P);
+    QVERIFY(w.isPaused());
+    QTest::keyClick(&w, Qt::Key_P);
+    QVERIFY(!w.isPaused());
+
+    // The interval choice is the saved setting.
+    child<QAction>(w, "intervalAction5000")->trigger();
+    QCOMPARE(w.intervalMs(), 5000);
+    w.close();
+    MainWindow again(env.options());
+    QCOMPARE(again.intervalMs(), 5000);
+    QVERIFY(child<QAction>(again, "intervalAction5000")->isChecked());
+    QVERIFY(!child<QAction>(again, "intervalAction1000")->isChecked());
+}
+
+void TestUi::statusBarShowsOnlyExceptions()
+{
+    Env env;
+    auto clock = std::make_shared<double>(100.0);
+    auto o = env.options();
+    o.clock = [clock] { return *clock; };
+    MainWindow w(o);
+    auto* bar = w.statusBar();
+    auto* label = child<QLabel>(w, "statusLabel");
+    for (int i = 0; i < 3; ++i) {
+        *clock = 100 + i;
+        w.applySnapshot(snapshot(100 + i, i > 0));
+    }
+    w.resize(1180, 780);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    // Healthy: no bar at all, even after the window is shown.
+    QVERIFY(!bar->isVisible());
+    QVERIFY(label->text().isEmpty() && label->toolTip().isEmpty());
+
+    // An unreadable source: a few words, the list in the tooltip and for
+    // assistive technology.
+    auto broken = snapshot(103, true);
+    broken->problems = {"/proc/diskstats: permission denied", "/proc/net/dev: truncated"};
+    *clock = 103;
+    w.applySnapshot(broken);
+    QVERIFY(bar->isVisible());
+    QCOMPARE(w.statusText(), QStringLiteral("Some readings unavailable"));
+    QCOMPARE(w.statusDetail(),
+             QStringLiteral("Unavailable: /proc/diskstats: permission denied; /proc/net/dev: truncated."));
+    QCOMPARE(label->accessibleDescription(), w.statusDetail());
+    // The accessible name replaces the label's text, so it carries the cue.
+    QAccessibleInterface* ai = QAccessible::queryAccessibleInterface(label);
+    QVERIFY(ai);
+    QCOMPARE(ai->text(QAccessible::Name), QStringLiteral("Status: Some readings unavailable"));
+    QCOMPARE(ai->text(QAccessible::Description), w.statusDetail());
+
+    // Recovered: gone again.
+    *clock = 104;
+    w.applySnapshot(snapshot(104, true));
+    QVERIFY(!bar->isVisible());
+    QVERIFY(w.statusText().isEmpty() && w.statusDetail().isEmpty());
+    QVERIFY(label->accessibleDescription().isEmpty());
+    QCOMPARE(ai->text(QAccessible::Name), QStringLiteral("Status"));
+
+    // Paused: says how to resume, with the consequence in the detail.
+    w.setPaused(true);
+    QVERIFY(bar->isVisible());
+    QCOMPARE(w.statusText(), QStringLiteral("Paused (press P to resume)"));
+    QCOMPARE(ai->text(QAccessible::Name), QStringLiteral("Status: Paused (press P to resume)"));
+    w.setPaused(false);
+    QVERIFY(!bar->isVisible());
+    QCOMPARE(ai->text(QAccessible::Name), QStringLiteral("Status"));
+
+    // A transient message (an export result) shows the bar by itself and
+    // takes it away when it clears.
+    bar->showMessage(QStringLiteral("Saved"));
+    QVERIFY(bar->isVisible());
+    QVERIFY(w.statusText().isEmpty());
+    bar->clearMessage();
+    QVERIFY(!bar->isVisible());
+    // A message over an exception leaves the exception behind.
+    w.setPaused(true);
+    bar->showMessage(QStringLiteral("Saved"));
+    bar->clearMessage();
+    QVERIFY(bar->isVisible());
+    QVERIFY(label->isVisibleTo(bar));
+    w.setPaused(false);
+    QVERIFY(!bar->isVisible());
+    w.close();
+}
+
+void TestUi::navDetailLineOnlyInDetails()
+{
+    Env env;
+    MainWindow w(env.options());
+    feed(w, 100, 3);
+    w.resize(1180, 780);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    auto* net = child<MetricButton>(w, "navNetwork");
+    QVERIFY(!w.detailsVisible());
+    QVERIFY(!net->isDetailLineVisible());
+    const QString detail = net->detailText();
+    QVERIFY(!detail.isEmpty());
+    // Hidden from the eye, not from the tooltip or assistive technology.
+    QVERIFY2(net->toolTip().contains(detail), qPrintable(net->toolTip()));
+    QVERIFY2(net->accessibleDescription().contains(detail), qPrintable(net->accessibleDescription()));
+    const int simpleHeight = net->sizeHint().height();
+    w.setDetailsVisible(true);
+    QVERIFY(net->isDetailLineVisible());
+    const int detailHeight = net->sizeHint().height();
+    QVERIFY2(detailHeight > simpleHeight, qPrintable(QStringLiteral("%1 vs %2").arg(detailHeight).arg(simpleHeight)));
+    QCOMPARE(net->detailText(), detail);
+    // Every button follows the same switch, and it survives a restart.
+    for (auto* b : w.findChildren<MetricButton*>())
+        QVERIFY2(b->isDetailLineVisible(), qPrintable(b->objectName()));
+    w.close();
+    MainWindow again(env.options());
+    for (auto* b : again.findChildren<MetricButton*>())
+        QVERIFY2(b->isDetailLineVisible(), qPrintable(b->objectName()));
+    again.setDetailsVisible(false);
+    for (auto* b : again.findChildren<MetricButton*>())
+        QVERIFY2(!b->isDetailLineVisible(), qPrintable(b->objectName()));
+
+    // A standalone button draws its line unless told otherwise.
+    MetricButton plain(QStringLiteral("CPU"));
+    QVERIFY(plain.isDetailLineVisible());
+}
+
+void TestUi::pagesCarryNoFooterNotes()
+{
+    // Conventions live in tooltips and accessible descriptions; the pages
+    // hold values, pickers, charts and tables only.
+    Env env;
+    MainWindow w(env.options());
+    feed(w, 100, 3);
+    w.resize(1180, 780);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    const QStringList gone {QStringLiteral("/proc/stat"), QStringLiteral("guest time"),
+                            QStringLiteral("Degrees Celsius from"), QStringLiteral("multithreaded"),
+                            QStringLiteral("Read-only"), QStringLiteral("counted once"),
+                            QStringLiteral("0\u2013100% of one logical CPU")};
+    for (bool detailed : {false, true}) {
+        w.setDetailsVisible(detailed);
+        for (int p = 0; p < MainWindow::PageCount; ++p) {
+            w.showPage(static_cast<MainWindow::Page>(p));
+            QTest::qWait(20);
+            for (auto* label : w.findChildren<QLabel*>()) {
+                if (!label->isVisible())
+                    continue;
+                for (const QString& g : gone)
+                    QVERIFY2(!label->text().contains(g),
+                             qPrintable(QStringLiteral("page %1 %2: %3").arg(p).arg(label->objectName(), label->text())));
+            }
+        }
+    }
+    // The conventions are still one hover or one AT query away.
+    QLabel* perCpu = nullptr;
+    for (auto* label : w.findChildren<QLabel*>())
+        if (label->text() == QStringLiteral("Per logical CPU"))
+            perCpu = label;
+    QVERIFY(perCpu);
+    QCOMPARE(perCpu->toolTip(), QString::fromUtf8("Each chart is 0\u2013100% of one logical CPU"));
+    QCOMPARE(perCpu->accessibleDescription(), perCpu->toolTip());
+    const QString tableAt = child<QTreeView>(w, "processTable")->accessibleDescription();
+    QVERIFY2(tableAt.contains(QStringLiteral("Read-only")) && tableAt.contains(QStringLiteral("100%")),
+             qPrintable(tableAt));
+    QVERIFY(!w.findChild<QLabel*>(QStringLiteral("processShortNote")));
+    w.close();
+}
+
 void TestUi::headlinesFollowDataAndState()
 {
     Env env;
@@ -2610,25 +3259,29 @@ void TestUi::headlinesFollowDataAndState()
                  && mem.contains(QStringLiteral("swap 1.00 GiB of 8.00 GiB")),
              qPrintable(mem));
     QVERIFY(headText(w, "temperatureHeadValue0").startsWith(QStringLiteral("55")));
-    QCOMPARE(headText(w, "temperatureHeadSummary"), QStringLiteral("coretemp Package id 0, the hottest of 2 sensors reading"));
-    const QString disk = headText(w, "diskHeadSummary");
-    QVERIFY2(disk.contains(QStringLiteral("One physical disk")) && disk.contains(QStringLiteral("/ has 290 GiB free of 500 GiB")),
-             qPrintable(disk));
-    QVERIFY2(headText(w, "netHeadSummary").contains(QStringLiteral("loopback excluded")), qPrintable(headText(w, "netHeadSummary")));
+    // Summaries add only what the value, picker and chart do not say.
+    QCOMPARE(headText(w, "temperatureHeadSummary"), QStringLiteral("coretemp Package id 0"));
+    QCOMPARE(headText(w, "diskHeadSummary"), QStringLiteral("/ has 290 GiB free of 500 GiB"));
+    QCOMPARE(headText(w, "netHeadSummary"), QString());
+    QVERIFY(child<QLabel>(w, "netHeadSummary")->isHidden());
+    QCOMPARE(headText(w, "cpuHeadSummary"), QString());
 
     *clock = 101;
     w.applySnapshot(snapshot(101, true, 25));
     QVERIFY2(headText(w, "cpuHeadValue0").startsWith(QStringLiteral("25")), qPrintable(headText(w, "cpuHeadValue0")));
-    QCOMPARE(headText(w, "cpuHeadSummary"), QStringLiteral("Average of 4 logical CPUs, load average 0.50"));
+    QCOMPARE(headText(w, "cpuHeadSummary"), QString());
+    QVERIFY(child<QLabel>(w, "cpuHeadSummary")->isHidden());
     QCOMPARE(headText(w, "diskHeadValue0"), QStringLiteral("4.00 MiB/s"));
     QCOMPARE(headText(w, "diskHeadValue1"), QStringLiteral("1.00 MiB/s"));
     QVERIFY(headText(w, "netHeadValue0").endsWith(QStringLiteral("MiB/s")));
 
-    // A chosen device is named; a missing one is said to be missing.
+    // A chosen device is named by the picker; a missing one is said to be
+    // missing.
     auto* disks = child<QComboBox>(w, "diskSelector");
     disks->setCurrentIndex(1);
     Q_EMIT disks->activated(1);
-    QVERIFY2(headText(w, "diskHeadSummary").startsWith(QStringLiteral("nvme0n1, ")), qPrintable(headText(w, "diskHeadSummary")));
+    QVERIFY(disks->currentText().startsWith(QStringLiteral("nvme0n1")));
+    QCOMPARE(headText(w, "diskHeadSummary"), QStringLiteral("/ has 290 GiB free of 500 GiB"));
     auto noNvme = snapshot(102, true);
     noNvme->disks.erase(noNvme->disks.begin());
     *clock = 102;
@@ -2650,7 +3303,9 @@ void TestUi::headlinesFollowDataAndState()
 
     // Paused and stale states are said, not hidden.
     w.setPaused(true);
-    QVERIFY2(headText(w, "cpuHeadSummary").startsWith(QStringLiteral("Paused. ")), qPrintable(headText(w, "cpuHeadSummary")));
+    QCOMPARE(headText(w, "cpuHeadSummary"), QStringLiteral("Paused"));
+    QVERIFY2(headText(w, "memoryHeadSummary").startsWith(QStringLiteral("Paused. ")),
+             qPrintable(headText(w, "memoryHeadSummary")));
     QVERIFY(headText(w, "cpuHeadValue0").startsWith(QStringLiteral("25")) || headText(w, "cpuHeadValue0").contains(QLatin1Char('%')));
     w.setPaused(false);
     *clock = 120;
@@ -4224,14 +4879,16 @@ int runThreadStartChild()
     while (t.elapsed() < 300)
         QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
     const QString status = w->statusText();
+    const QString detail = w->statusDetail();
     const ProcessGrouping grouping = w->processGrouping();
     const int applied = w->snapshotsApplied();
     ::setrlimit(RLIMIT_NPROC, &old);
     out << "INFO: while limited: status \"" << status << "\"; app detection: \"" << grouping.reason << "\""
         << Qt::endl;
-    if (!status.contains(QStringLiteral("The collector thread could not be started"))
-        || !status.contains(QStringLiteral("retrying automatically")))
-        fail(QStringLiteral("status does not explain the collector start failure: \"%1\"").arg(status));
+    if (status != QStringLiteral("The collector thread could not be started; retrying")
+        || !detail.startsWith(QStringLiteral("The collector thread could not be started: "))
+        || !detail.contains(QStringLiteral("retrying automatically")))
+        fail(QStringLiteral("status does not explain the collector start failure: \"%1\" (%2)").arg(status, detail));
     if (grouping.state != ProcessGrouping::State::Unavailable
         || !grouping.reason.startsWith(QStringLiteral("Could not start the window-list thread")))
         fail(QStringLiteral("app detection does not explain the probe start failure: \"%1\"").arg(grouping.reason));

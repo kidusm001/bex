@@ -20,10 +20,19 @@
 #include "core/snapshot.h"
 
 #include <QAbstractItemModelTester>
+#include <QAccessible>
 #include <QAction>
+#include <QApplication>
+#include <QImage>
+#include <QRegularExpression>
+#include <QStyle>
+#include <QStyleFactory>
+#include <QStyledItemDelegate>
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
+#include <QMenuBar>
 #include <QSettings>
 #include <QTreeView>
 #include <QDir>
@@ -43,9 +52,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -499,6 +511,12 @@ private Q_SLOTS:
     void selectionFollowsIdentityThroughRegroupAndFilter();
     void groupRowsStaySpannedWithoutValues();
     void probeIdlesWhileProcessListHidden();
+
+    // Council follow-up: the unknown Apps header, cell gutters, shortcut.
+    void unknownAppsHeaderIsAGroupName();
+    void processCellsKeepAGutterBetweenNumbersAndText_data();
+    void processCellsKeepAGutterBetweenNumbersAndText();
+    void smoothGraphsShortcutTogglesOnce();
 };
 
 void TestProcessGroups::initTestCase()
@@ -1714,7 +1732,12 @@ void TestProcessGroups::failureKeepsListUntilExpiryThenExplains()
     QTRY_COMPARE_WITH_TIMEOUT(int(w.processGrouping().state), int(ProcessGrouping::State::Unavailable), 1500);
     QCOMPARE(w.processGrouping().reason, windows::describe(*timeout));
     QVERIFY(note->isVisibleTo(&w));
-    QVERIFY2(note->text().contains(windows::describe(*timeout)), qPrintable(note->text()));
+    QVERIFY2(!note->text().isEmpty(), "no visible cue for the unknown grouping");
+    // The note is one short line; the failure's own reason is its tooltip and
+    // accessible description.
+    QVERIFY2(note->toolTip().contains(windows::describe(*timeout)), qPrintable(note->toolTip()));
+    QVERIFY2(note->accessibleDescription().contains(windows::describe(*timeout)),
+             qPrintable(note->accessibleDescription()));
     QVERIFY(pidsOf(t, ProcessModel::Apps).isEmpty());
     QCOMPARE(pidsOf(t, ProcessModel::Background), (QList<int> {1, 500, 777, 4242}));
     QCOMPARE(pidsOf(t, ProcessModel::Kernel), QList<int> {2});
@@ -2056,6 +2079,637 @@ void TestProcessGroups::completeEmptyListIsDetectedWithNoApps()
     QCOMPARE(pidsOf(t, ProcessModel::Kernel), QList<int> {2});
     QVERIFY2(titles(t).contains(QStringLiteral("Background")), qPrintable(titles(t)));
     QVERIFY(!note->isVisibleTo(&w));
+    w.close();
+}
+
+// ---------------------------------------------------------------------------
+// Council follow-up (UX-202, UX-203, smooth-graphs shortcut). Only the
+// wording of the unknown Apps header, the gutter between a right-aligned
+// number and the left-aligned text next to it, and one shortcut change; the
+// classification, the three groups and the frame driver stay as they are.
+
+namespace {
+
+// Name of every accessible child of a widget (the tree's cells and rows).
+QStringList accessibleNames(QWidget* widget)
+{
+    QStringList out;
+    QAccessibleInterface* root = QAccessible::queryAccessibleInterface(widget);
+    if (!root)
+        return out;
+    for (int i = 0; i < root->childCount(); ++i) {
+        QAccessibleInterface* c = root->child(i);
+        if (!c)
+            continue;
+        out << c->text(QAccessible::Name);
+        for (int j = 0; j < c->childCount(); ++j)
+            if (QAccessibleInterface* cc = c->child(j))
+                out << cc->text(QAccessible::Name);
+    }
+    return out;
+}
+
+} // namespace
+
+void TestProcessGroups::unknownAppsHeaderIsAGroupName()
+{
+    using State = ProcessGrouping::State;
+    // The header stays a group name, like the other two; the reason stays in
+    // the note and the header tooltip, and nothing else about the unknown
+    // state changes (no count, no Background, kernel threads still apart).
+    const QString unknownApps = QStringLiteral("Apps (unavailable)");
+    const QString reason = QStringLiteral("App detection is unavailable: test compositor");
+    const auto app = proc(500, 100, "editor", 1);
+    const auto kthread = proc(2, 1, "kthreadd", 0, 0, true);
+    QStringList problems;
+    const auto expect = [&](const QString& what, const QString& actual, const QString& wanted) {
+        if (actual != wanted)
+            problems << QStringLiteral("%1: \"%2\", expected \"%3\"").arg(what, actual, wanted);
+    };
+    {
+        ProcessModel m;
+        m.setGrouping(unavailable(reason));
+        m.setProcesses({app, kthread});
+        const QModelIndex apps = m.groupIndex(ProcessModel::Apps);
+        expect(QStringLiteral("unavailable groupTitle"), ProcessModel::groupTitle(ProcessModel::Apps, unavailable(reason)),
+               unknownApps);
+        expect(QStringLiteral("unavailable GroupTitleRole"), apps.data(ProcessModel::GroupTitleRole).toString(), unknownApps);
+        expect(QStringLiteral("unavailable display (uncounted)"), apps.data().toString(), unknownApps);
+        expect(QStringLiteral("unavailable accessible text"), apps.data(Qt::AccessibleTextRole).toString(),
+               unknownApps + QStringLiteral(", group"));
+        if (apps.data(ProcessModel::CountedRole).toBool() || ProcessModel::groupCounted(ProcessModel::Apps, m.grouping()))
+            problems << QStringLiteral("unavailable Apps is counted");
+        if (!apps.data(Qt::ToolTipRole).toString().contains(reason))
+            problems << QStringLiteral("header tooltip lost the reason: \"%1\"").arg(apps.data(Qt::ToolTipRole).toString());
+        expect(QStringLiteral("unavailable Background"), m.groupIndex(ProcessModel::Background).data().toString(),
+               QStringLiteral("Unclassified user processes (1)"));
+        expect(QStringLiteral("unavailable Kernel"), m.groupIndex(ProcessModel::Kernel).data().toString(),
+               QStringLiteral("Kernel processes (1)"));
+        if (m.rowCount() != ProcessModel::GroupCount || m.groupSize(ProcessModel::Apps) != 0)
+            problems << QStringLiteral("unavailable: %1 roots, %2 apps").arg(m.rowCount()).arg(m.groupSize(ProcessModel::Apps));
+
+        // The other states keep their wording.
+        ProcessGrouping pending;
+        pending.state = State::Pending;
+        m.setGrouping(pending);
+        expect(QStringLiteral("pending display"), m.groupIndex(ProcessModel::Apps).data().toString(),
+               QString::fromUtf8("Apps (detecting\u2026)"));
+        expect(QStringLiteral("pending Background"), m.groupIndex(ProcessModel::Background).data().toString(),
+               QStringLiteral("Unclassified user processes (1)"));
+        m.setGrouping(detected({{500, 100}}));
+        expect(QStringLiteral("detected display"), m.groupIndex(ProcessModel::Apps).data().toString(), QStringLiteral("Apps (1)"));
+        expect(QStringLiteral("detected Background"), m.groupIndex(ProcessModel::Background).data().toString(),
+               QStringLiteral("Background processes (0)"));
+        m.setGrouping(detected({}));
+        expect(QStringLiteral("detected, no windows"), m.groupIndex(ProcessModel::Apps).data().toString(),
+               QStringLiteral("Apps (0)"));
+    }
+
+    // The main window: the same header through every unknown path, with the
+    // full reason in the note; recovery and a complete empty list are counted.
+    WindowEnv env;
+    MainWindow w(env.options());
+    w.resize(1000, 700);
+    w.applySnapshot(snap(99.5));
+    w.showPage(MainWindow::ProcessPage);
+    w.show(); // the accessible tree lists the rows it has laid out
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    QTreeView* t = treeOf(w);
+    auto* note = w.findChild<QLabel*>(QStringLiteral("processGroupNote"));
+    auto* filter = w.findChild<QLineEdit*>(QStringLiteral("processFilter"));
+    auto* count = w.findChild<QLabel*>(QStringLiteral("processCount"));
+    QVERIFY(t && note && filter && count);
+    const QString countText = count->text();
+    const QString unknownRoots =
+        unknownApps + QStringLiteral(" | Unclassified user processes (4) | Kernel processes (1)");
+    const auto unknown = [&](const char* when) {
+        const ProcessGrouping& g = w.processGrouping();
+        const QString what = QLatin1String(when);
+        if (g.state != State::Unavailable)
+            problems << what + QStringLiteral(": state %1").arg(int(g.state));
+        expect(what + QStringLiteral(" roots"), titles(t), unknownRoots);
+        if (!pidsOf(t, ProcessModel::Apps).isEmpty())
+            problems << what + QStringLiteral(": processes in Apps");
+        // A short visible note; the full reason in its tooltip and for AT.
+        if (g.reason.isEmpty() || !note->isVisibleTo(&w) || note->text().isEmpty()
+            || !note->toolTip().contains(g.reason) || !note->accessibleDescription().contains(g.reason))
+            problems << what + QStringLiteral(": note \"%1\" (visible %2, tooltip \"%3\", AT \"%4\") lacks the reason \"%5\"")
+                                   .arg(note->text())
+                                   .arg(note->isVisibleTo(&w))
+                                   .arg(note->toolTip(), note->accessibleDescription(), g.reason);
+        const QModelIndex apps = groupAt(t, ProcessModel::Apps);
+        if (!apps.data(Qt::ToolTipRole).toString().contains(g.reason))
+            problems << what + QStringLiteral(": header tooltip lacks the reason");
+        // What a screen reader hears for the header row.
+        t->doItemsLayout();
+        QCoreApplication::processEvents();
+        const QStringList names = accessibleNames(t);
+        const QString spoken = apps.data(Qt::AccessibleTextRole).toString();
+        if (!spoken.startsWith(unknownApps) || !names.contains(spoken))
+            problems << what + QStringLiteral(": accessible header \"%1\" not among [%2]").arg(spoken, names.mid(0, 8).join(QStringLiteral(", ")));
+        for (const QString& n : names)
+            if (n.contains(QLatin1String("App detection unavailable")) || n.startsWith(QLatin1String("Background")))
+                problems << what + QStringLiteral(": accessible \"%1\"").arg(n);
+        if (pidsOf(t, ProcessModel::Kernel) != QList<int> {2})
+            problems << what + QStringLiteral(": kernel threads moved");
+        if (!count->text().startsWith(countText))
+            problems << what + QStringLiteral(": count \"%1\"").arg(count->text());
+    };
+    unknown("no window list yet");
+    // A partial list is not complete: still unknown, with its own reason.
+    w.applyWindowOwners(partialOwners({{4242, 5242}}, 100.0, 30.0, QStringLiteral("ambiguous")));
+    unknown("partial list");
+    // The group word is not process text: filtering by it shows no process
+    // and does not rename or count the header.
+    filter->setText(QStringLiteral("unavailable"));
+    expect(QStringLiteral("filtered by the header word, Apps"), groupAt(t, ProcessModel::Apps).data().toString(), unknownApps);
+    {
+        int shown = 0;
+        for (auto g : {ProcessModel::Apps, ProcessModel::Background, ProcessModel::Kernel})
+            shown += t->model()->rowCount(groupAt(t, g));
+        if (shown != 0)
+            problems << QStringLiteral("filter \"unavailable\" matched %1 processes").arg(shown);
+    }
+    filter->clear();
+    unknown("filter cleared");
+    // Recovery.
+    *env.clock = 101.0;
+    w.applyWindowOwners(owners({{4242, 5242}}, 101.0, 3.0));
+    expect(QStringLiteral("complete list roots"), titles(t),
+           QStringLiteral("Apps (1) | Background processes (3) | Kernel processes (1)"));
+    if (note->isVisibleTo(&w))
+        problems << QStringLiteral("complete list: note still shown: \"%1\"").arg(note->text());
+    // Expired: unknown again, never an empty Apps.
+    *env.clock = 104.5;
+    QTRY_VERIFY_WITH_TIMEOUT(w.processGrouping().state != State::Detected, 1500);
+    unknown("complete list expired");
+    // A complete, empty list is an answer: Apps (0).
+    *env.clock = 105.0;
+    w.applyWindowOwners(owners({}, 105.0, 3.0));
+    expect(QStringLiteral("complete empty list roots"), titles(t),
+           QStringLiteral("Apps (0) | Background processes (4) | Kernel processes (1)"));
+    w.close();
+    QVERIFY2(problems.isEmpty(), qPrintable(problems.join(QStringLiteral("\n  "))));
+}
+
+namespace {
+
+struct Span {
+    int left = INT_MAX;
+    int right = INT_MIN;
+    bool any() const { return left <= right; }
+    int width() const { return any() ? right - left + 1 : 0; }
+};
+
+int colourDistance(QRgb a, QRgb b)
+{
+    return std::abs(qRed(a) - qRed(b)) + std::abs(qGreen(a) - qGreen(b)) + std::abs(qBlue(a) - qBlue(b));
+}
+
+// Horizontal extent of the text in a cell: pixels clearly unlike the most
+// common colour of their own scanline in that cell (the cell background,
+// whatever the style draws there).
+Span inkIn(const QImage& img, const QRect& cell)
+{
+    Span s;
+    const QRect r = cell.intersected(img.rect());
+    for (int y = r.top(); y <= r.bottom(); ++y) {
+        std::map<QRgb, int> freq;
+        for (int x = r.left(); x <= r.right(); ++x)
+            ++freq[img.pixel(x, y)];
+        QRgb bg = 0;
+        int best = -1;
+        for (const auto& [c, n] : freq)
+            if (n > best) {
+                best = n;
+                bg = c;
+            }
+        for (int x = r.left(); x <= r.right(); ++x)
+            if (colourDistance(img.pixel(x, y), bg) > 150) {
+                s.left = std::min(s.left, x);
+                s.right = std::max(s.right, x);
+            }
+    }
+    return s;
+}
+
+// Temporarily paints the tree with a plain QStyledItemDelegate: the style's
+// own cell drawing, to compare the production cells against.
+struct PlainCells {
+    QTreeView* tree;
+    QAbstractItemDelegate* original;
+    std::vector<QAbstractItemDelegate*> columns;
+    QStyledItemDelegate plain;
+    explicit PlainCells(QTreeView* t) : tree(t), original(t->itemDelegate())
+    {
+        for (int c = 0; c < ProcessModel::ColumnCount; ++c) {
+            columns.push_back(t->itemDelegateForColumn(c));
+            t->setItemDelegateForColumn(c, nullptr);
+        }
+        t->setItemDelegate(&plain);
+    }
+    ~PlainCells()
+    {
+        tree->setItemDelegate(original);
+        for (int c = 0; c < ProcessModel::ColumnCount; ++c)
+            tree->setItemDelegateForColumn(c, columns[std::size_t(c)]);
+    }
+};
+
+QImage grabRows(QTreeView* t)
+{
+    t->viewport()->update();
+    QCoreApplication::processEvents();
+    QImage img = t->viewport()->grab().toImage().convertToFormat(QImage::Format_RGB32);
+    img.setDevicePixelRatio(1.0); // compared in device pixels, see scale below
+    return img;
+}
+
+struct FontGuard {
+    QFont saved = QApplication::font();
+    ~FontGuard() { QApplication::setFont(saved); }
+};
+
+} // namespace
+
+void TestProcessGroups::processCellsKeepAGutterBetweenNumbersAndText_data()
+{
+    QTest::addColumn<QString>("style");
+    QTest::addColumn<bool>("rtl");
+    QTest::addColumn<double>("fontScale");
+    QTest::addColumn<bool>("dark");
+    QTest::newRow("Fusion light") << QStringLiteral("Fusion") << false << 1.0 << false;
+    QTest::newRow("Fusion light, right to left") << QStringLiteral("Fusion") << true << 1.0 << false;
+    QTest::newRow("Fusion light, font 130%") << QStringLiteral("Fusion") << false << 1.3 << false;
+    QTest::newRow("Fusion dark") << QStringLiteral("Fusion") << false << 1.0 << true;
+    QTest::newRow("Kvantum (default theme)") << QStringLiteral("kvantum") << false << 1.0 << false;
+}
+
+void TestProcessGroups::processCellsKeepAGutterBetweenNumbersAndText()
+{
+    QFETCH(QString, style);
+    QFETCH(bool, rtl);
+    QFETCH(double, fontScale);
+    QFETCH(bool, dark);
+    std::unique_ptr<QStyle> ownStyle;
+    {
+        // Kvantum reads its theme from $XDG_CONFIG_HOME/Kvantum when created.
+        // This row is its built-in default theme: an empty configuration
+        // directory, whatever theme the person running the tests uses (a
+        // user theme's own selection colours are not this row's oracle).
+        QTemporaryDir noUserTheme;
+        QVERIFY(noUserTheme.isValid());
+        const QByteArray savedConfig = qgetenv("XDG_CONFIG_HOME");
+        const bool hadConfig = qEnvironmentVariableIsSet("XDG_CONFIG_HOME");
+        if (style == QLatin1String("kvantum"))
+            qputenv("XDG_CONFIG_HOME", QFile::encodeName(noUserTheme.path()));
+        ownStyle.reset(QStyleFactory::create(style));
+        if (hadConfig)
+            qputenv("XDG_CONFIG_HOME", savedConfig);
+        else
+            qunsetenv("XDG_CONFIG_HOME");
+    }
+    if (!ownStyle)
+        QSKIP(qPrintable(QStringLiteral("style %1 is not installed").arg(style)));
+    FontGuard fontGuard;
+    if (fontScale != 1.0) {
+        QFont f = QApplication::font();
+        f.setPointSizeF(f.pointSizeF() * fontScale);
+        QApplication::setFont(f); // before the window, so its column widths follow
+    }
+    // Processes whose numbers fill their columns next to long text.
+    auto wide = proc(4194304, 900, "wide", 12.5, 5e6);
+    wide.user = "abcdefghijklmnopqrstuvwxyz";
+    wide.threads = 8888;
+    wide.state = 'D';
+    wide.ageSeconds = 99 * 3600 + 59 * 60;
+    wide.command = "/usr/bin/wide --a-long-argument";
+    auto other = proc(4194303, 901, "other", 1.0, 7e6);
+    other.user = "mmmmmmmmmmmmmmmmmmmm";
+    other.threads = 1024;
+    other.state = 'R';
+    other.ageSeconds = 3599;
+    auto bg = proc(999999, 902, "daemon", 0.5, 3e6);
+    bg.threads = 77;
+    WindowEnv env;
+    MainWindow w(env.options());
+    if (rtl)
+        w.setLayoutDirection(Qt::RightToLeft);
+    w.resize(1400, 700);
+    w.applySnapshot(snap(99.5, {wide, other, bg, proc(2, 5, "kthreadd", 0.0, 0, true)}));
+    w.applyWindowOwners(owners({{4194304, 900}}, 100.0, 30.0));
+    w.showPage(MainWindow::ProcessPage);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    QTreeView* t = treeOf(w);
+    auto* filter = w.findChild<QLineEdit*>(QStringLiteral("processFilter"));
+    QVERIFY(t && filter);
+    t->setStyle(ownStyle.get());
+    QPalette pal = t->palette();
+    for (auto group : {QPalette::Active, QPalette::Inactive}) {
+        pal.setColor(group, QPalette::Base, dark ? QColor(0x20, 0x20, 0x20) : Qt::white);
+        pal.setColor(group, QPalette::AlternateBase, dark ? QColor(0x28, 0x28, 0x28) : QColor(0xf2, 0xf2, 0xf2));
+        pal.setColor(group, QPalette::Text, dark ? QColor(0xe8, 0xe8, 0xe8) : Qt::black);
+        pal.setColor(group, QPalette::Highlight, dark ? QColor(0x40, 0x60, 0xd0) : QColor(0x00, 0x30, 0xa0));
+        pal.setColor(group, QPalette::HighlightedText, QColor(0xff, 0xff, 0x40));
+    }
+    t->setPalette(pal);
+    const QFontMetrics fm(t->font());
+    const int need = std::max(1, fm.averageCharWidth() - 1);
+    QStringList problems;
+    const auto* m = t->model();
+
+    // Every visible process row, and the visual column order.
+    const auto leaves = [&] {
+        QList<QModelIndex> out;
+        for (int g = 0; g < m->rowCount(); ++g) {
+            const QModelIndex gi = m->index(g, 0);
+            if (t->isExpanded(gi))
+                for (int r = 0; r < m->rowCount(gi); ++r)
+                    out << m->index(r, 0, gi);
+        }
+        return out;
+    };
+    const auto visualColumns = [&] {
+        QList<int> cols;
+        for (int c = 0; c < ProcessModel::ColumnCount; ++c)
+            if (!t->isColumnHidden(c))
+                cols << c;
+        std::sort(cols.begin(), cols.end(), [&](int a, int b) { return t->visualRect(leaves().first().siblingAtColumn(a)).left()
+                                                                          < t->visualRect(leaves().first().siblingAtColumn(b)).left(); });
+        return cols;
+    };
+    // Horizontal alignment as drawn: right to left mirrors Left and Right.
+    const auto drawnRight = [&](const QModelIndex& i) {
+        const auto a = Qt::Alignment(i.data(Qt::TextAlignmentRole).toInt());
+        return QStyle::visualAlignment(t->layoutDirection(), a) & Qt::AlignRight;
+    };
+    const auto drawnLeft = [&](const QModelIndex& i) {
+        const auto a = Qt::Alignment(i.data(Qt::TextAlignmentRole).toInt());
+        return QStyle::visualAlignment(t->layoutDirection(), a) & Qt::AlignLeft;
+    };
+
+    const auto analyse = [&](const char* when) {
+        QVERIFY(!leaves().isEmpty());
+        const QImage prod = grabRows(t);
+        std::map<int, int> prodHeights;
+        for (const QModelIndex& i : leaves())
+            prodHeights[i.row() * 100 + i.parent().row()] = t->visualRect(i).height();
+        QImage ref;
+        {
+            PlainCells plain(t);
+            ref = grabRows(t);
+            for (const QModelIndex& i : leaves())
+                if (t->visualRect(i).height() != prodHeights[i.row() * 100 + i.parent().row()])
+                    problems << QStringLiteral("%1: row height %2 with the style's cells, %3 in the app")
+                                    .arg(QLatin1String(when))
+                                    .arg(t->visualRect(i).height())
+                                    .arg(prodHeights[i.row() * 100 + i.parent().row()]);
+        }
+        const double scale = double(prod.width()) / t->viewport()->width();
+        const auto dev = [&](const QRect& r) {
+            return QRect(qRound(r.x() * scale), qRound(r.y() * scale), qRound(r.width() * scale), qRound(r.height() * scale));
+        };
+        const QRect vp = dev(t->viewport()->rect());
+        if (prod.size() != ref.size()) {
+            problems << QStringLiteral("%1: grabs differ in size").arg(QLatin1String(when));
+            return;
+        }
+        const QList<int> cols = visualColumns();
+        int pairs = 0;
+        for (const QModelIndex& leaf : leaves()) {
+            const int pid = leaf.data(ProcessModel::PidRole).toInt();
+            std::map<int, Span> inkP, inkR;
+            std::map<int, QRect> cell;
+            for (int c : cols) {
+                cell[c] = dev(t->visualRect(leaf.siblingAtColumn(c)));
+                inkP[c] = inkIn(prod, cell[c]);
+                inkR[c] = inkIn(ref, cell[c]);
+                // Outside the text, the cell must look exactly as the style
+                // draws it: no unpainted inset, shrunken selection, hover or
+                // focus frame.
+                const int lo = std::min(inkP[c].left, inkR[c].left) - 1;
+                const int hi = std::max(inkP[c].right, inkR[c].right) + 1;
+                const QRect r = cell[c].intersected(vp);
+                int differ = 0;
+                QPoint first;
+                for (int y = r.top(); y <= r.bottom(); ++y)
+                    for (int x = r.left(); x <= r.right(); ++x)
+                        if ((x < lo || x > hi) && prod.pixel(x, y) != ref.pixel(x, y) && differ++ == 0)
+                            first = QPoint(x, y);
+                if (differ)
+                    problems << QStringLiteral("%1: pid %2 column %3: %4 background pixels differ from the style's cell (first at %5,%6)")
+                                    .arg(QLatin1String(when))
+                                    .arg(pid)
+                                    .arg(c)
+                                    .arg(differ)
+                                    .arg(first.x())
+                                    .arg(first.y());
+                // A number never loses digits to the gutter. Numeric columns
+                // are those that sort by a number, whatever their drawn side.
+                const QVariant sortValue = leaf.siblingAtColumn(c).data(ProcessModel::SortRole);
+                const bool numeric = sortValue.isValid() && sortValue.typeId() != QMetaType::QString;
+                if (numeric && inkP[c].width() + 1 < inkR[c].width())
+                    problems << QStringLiteral("%1: pid %2 column %3 \"%4\": text %5 px wide, %6 px with the style's cells (clipped or elided)")
+                                    .arg(QLatin1String(when))
+                                    .arg(pid)
+                                    .arg(c)
+                                    .arg(leaf.siblingAtColumn(c).data().toString())
+                                    .arg(inkP[c].width())
+                                    .arg(inkR[c].width());
+            }
+            // The branch area left of (or, mirrored, right of) the name.
+            const QRect row = dev(t->visualRect(leaf));
+            for (int y = row.top(); y <= row.bottom(); ++y) {
+                int differ = 0;
+                for (int x = 0; x < prod.width(); ++x) {
+                    bool inCell = false;
+                    for (int c : cols)
+                        inCell |= x >= cell[c].left() && x <= cell[c].right();
+                    if (!inCell && prod.pixel(x, y) != ref.pixel(x, y))
+                        ++differ;
+                }
+                if (differ) {
+                    problems << QStringLiteral("%1: pid %2: branch/indent area differs (%3 px on line %4)")
+                                    .arg(QLatin1String(when))
+                                    .arg(pid)
+                                    .arg(differ)
+                                    .arg(y);
+                    break;
+                }
+            }
+            // Each number followed (as drawn) by text aligned toward it.
+            for (int k = 0; k + 1 < cols.size(); ++k) {
+                const int a = cols[k], b = cols[k + 1];
+                if (!drawnRight(leaf.siblingAtColumn(a)) || !drawnLeft(leaf.siblingAtColumn(b)))
+                    continue;
+                if (!inkP[a].any() || !inkP[b].any() || !cell[a].intersected(vp).contains(cell[a])
+                    || !vp.contains(cell[b]))
+                    continue;
+                ++pairs;
+                const int gapP = inkP[b].left - inkP[a].right - 1;
+                const int gapR = inkR[b].left - inkR[a].right - 1;
+                if (gapP < gapR + qRound(need * scale))
+                    problems << QStringLiteral("%1: pid %2: \"%3\" | \"%4\" (columns %5|%6) %7 px apart, the style alone gives %8; "
+                                               "want at least one average character (%9 px) more")
+                                    .arg(QLatin1String(when))
+                                    .arg(pid)
+                                    .arg(leaf.siblingAtColumn(a).data().toString(), leaf.siblingAtColumn(b).data().toString())
+                                    .arg(a)
+                                    .arg(b)
+                                    .arg(gapP)
+                                    .arg(gapR)
+                                    .arg(qRound(need * scale) + 1);
+            }
+        }
+        if (w.detailsVisible() && pairs == 0)
+            problems << QStringLiteral("%1: no number/text neighbours measured").arg(QLatin1String(when));
+        // Group headers are drawn exactly as before.
+        for (int g = 0; g < m->rowCount(); ++g) {
+            const QRect r = dev(t->visualRect(m->index(g, 0))).intersected(vp);
+            int differ = 0;
+            for (int y = r.top(); y <= r.bottom(); ++y)
+                for (int x = 0; x < prod.width(); ++x)
+                    differ += prod.pixel(x, y) != ref.pixel(x, y);
+            if (differ)
+                problems << QStringLiteral("%1: group header %2 differs in %3 px").arg(QLatin1String(when)).arg(g).arg(differ);
+        }
+    };
+
+    for (bool details : {false, true}) {
+        w.setDetailsVisible(details);
+        QCoreApplication::processEvents();
+        const char* mode = details ? "Details" : "Simple";
+        if (!details) {
+            // Simple: the name still takes what the numbers leave.
+            int total = 0;
+            for (int c = 0; c < ProcessModel::ColumnCount; ++c)
+                if (!t->isColumnHidden(c))
+                    total += t->header()->sectionSize(c);
+            if (total < t->viewport()->width() - 1)
+                problems << QStringLiteral("Simple: columns fill %1 of %2 px").arg(total).arg(t->viewport()->width());
+        }
+        filter->setFocus();
+        t->selectionModel()->clearSelection();
+        analyse(qPrintable(QStringLiteral("%1, idle").arg(QLatin1String(mode))));
+        // Selected, current and focused.
+        const QModelIndex row = rowOf(t, 4194304);
+        t->setFocus();
+        t->setCurrentIndex(row);
+        t->selectionModel()->select(row, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        analyse(qPrintable(QStringLiteral("%1, selected").arg(QLatin1String(mode))));
+        // Hovered (styles that draw hover do so from the mouse position).
+        const QRect otherRect = t->visualRect(rowOf(t, 4194303).siblingAtColumn(ProcessModel::Pid));
+        QTest::mouseMove(t->viewport(), otherRect.center());
+        analyse(qPrintable(QStringLiteral("%1, hovered").arg(QLatin1String(mode))));
+        if (QTest::currentTestFailed())
+            return;
+    }
+
+    // The gutter is part of the row: a click there picks that process.
+    w.setDetailsVisible(true);
+    QCoreApplication::processEvents();
+    for (int pid : {4194303, 999999, 4194304}) {
+        const QModelIndex leaf = rowOf(t, pid);
+        for (int c : {int(ProcessModel::Pid), int(ProcessModel::User), int(ProcessModel::Threads), int(ProcessModel::State)}) {
+            if (t->isColumnHidden(c))
+                continue;
+            const QRect r = t->visualRect(leaf.siblingAtColumn(c));
+            for (const QPoint p : {QPoint(r.left() + 1, r.center().y()), QPoint(r.right() - 1, r.center().y())}) {
+                if (!t->viewport()->rect().contains(p))
+                    continue;
+                t->selectionModel()->clearSelection();
+                QTest::mouseClick(t->viewport(), Qt::LeftButton, {}, p);
+                if (selected(t) != QList<QPair<int, qulonglong>> {qMakePair(pid, leaf.data(ProcessModel::StartTicksRole).toULongLong())})
+                    problems << QStringLiteral("click at the edge of pid %1 column %2 (%3,%4) did not select it").arg(pid).arg(c).arg(p.x()).arg(p.y());
+            }
+        }
+    }
+    w.close();
+    QVERIFY2(problems.isEmpty(), qPrintable(problems.mid(0, 30).join(QStringLiteral("\n  "))
+                                                + (problems.size() > 30 ? QStringLiteral("\n  … %1 more").arg(problems.size() - 30) : QString())));
+}
+
+void TestProcessGroups::smoothGraphsShortcutTogglesOnce()
+{
+    WindowEnv env;
+    MainWindow w(env.options());
+    w.resize(1000, 700);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    w.activateWindow();
+    QVERIFY(QTest::qWaitForWindowActive(&w));
+    w.applySnapshot(snap(99.5));
+    w.showPage(MainWindow::ProcessPage);
+    auto* action = w.findChild<QAction*>(QStringLiteral("smoothAction"));
+    auto* filter = w.findChild<QLineEdit*>(QStringLiteral("processFilter"));
+    QVERIFY(action && filter);
+    const QKeySequence key(Qt::CTRL | Qt::SHIFT | Qt::Key_M);
+    QCOMPARE(action->shortcuts(), QList<QKeySequence> {key});
+    // Nothing else in the window answers the same keys (Qt would then run
+    // neither), and the action stays where it is found: in a menu.
+    for (QAction* other : w.findChildren<QAction*>())
+        if (other != action)
+            QVERIFY2(!other->shortcuts().contains(key), qPrintable(other->objectName() + QLatin1Char(' ') + other->text()));
+    bool inMenu = false;
+    for (QMenu* menu : w.menuBar()->findChildren<QMenu*>())
+        inMenu |= menu->actions().contains(action);
+    QVERIFY(inMenu);
+    QVERIFY(w.smoothGraphs() && action->isChecked());
+    QTRY_VERIFY(w.isAnimating());
+
+    const int interval = w.intervalMs();
+    const int applied = w.snapshotsApplied();
+    const auto historySize = w.history().size();
+    const bool paused = w.isPaused();
+    const auto saved = [&] {
+        QSettings s(env.settings(), QSettings::IniFormat);
+        return s.value(QStringLiteral("smoothGraphs"));
+    };
+    filter->setFocus();
+    QTRY_VERIFY(filter->hasFocus());
+    QTest::keyClicks(filter, QStringLiteral("abc"));
+    QCOMPARE(filter->text(), QStringLiteral("abc"));
+    QSignalSpy toggled(action, &QAction::toggled);
+    const auto press = [&](bool expectOn, const char* when) {
+        const int before = toggled.count();
+        QTest::keyClick(filter, Qt::Key_M, Qt::ControlModifier | Qt::ShiftModifier);
+        QVERIFY2(toggled.count() == before + 1, qPrintable(QStringLiteral("%1: %2 toggles for one key press")
+                                                              .arg(QLatin1String(when))
+                                                              .arg(toggled.count() - before)));
+        QVERIFY2(w.smoothGraphs() == expectOn && action->isChecked() == expectOn, when);
+        QVERIFY2(saved().toBool() == expectOn && saved().isValid(), when);
+        QVERIFY2(filter->text() == QStringLiteral("abc") && filter->hasFocus(), qPrintable(filter->text()));
+    };
+    press(false, "live, off");
+    QVERIFY(!w.isAnimating());
+    press(true, "live, on");
+    QTRY_VERIFY(w.isAnimating());
+    // Paused: the choice changes, the frame clock does not start.
+    w.setPaused(true);
+    QTRY_VERIFY(!w.isAnimating());
+    press(false, "paused, off");
+    press(true, "paused, on");
+    QTest::qWait(200);
+    QVERIFY(!w.isAnimating());
+    w.setPaused(false);
+    QTRY_VERIFY(w.isAnimating());
+    // Hidden: the same through the action.
+    w.hide();
+    QTRY_VERIFY(!w.isAnimating());
+    action->trigger();
+    action->trigger();
+    QVERIFY(w.smoothGraphs());
+    QTest::qWait(200);
+    QVERIFY(!w.isAnimating());
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    QTRY_VERIFY(w.isAnimating());
+    // Sampling and history are untouched.
+    QCOMPARE(w.intervalMs(), interval);
+    QCOMPARE(w.snapshotsApplied(), applied);
+    QCOMPARE(w.history().size(), historySize);
+    QCOMPARE(w.isPaused(), paused);
     w.close();
 }
 

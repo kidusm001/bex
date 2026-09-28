@@ -17,6 +17,10 @@ public:
     // accessibleValue replaces symbols (arrows) for screen readers.
     void setValueText(const QString& value, const QString& accessibleValue = {});
     void setDetailText(const QString& detail);
+    // Whether the detail line is drawn (and has room); the detail stays in
+    // the tooltip and accessible description either way. Default on.
+    void setDetailLineVisible(bool visible);
+    bool isDetailLineVisible() const { return m_detailLine; }
     // Widest value expected (e.g. "R 0000 MiB/s  W 0000 MiB/s"). The layout is
     // chosen from it rather than from the live value, so it never jumps as
     // values change: the sparkline moves to the title row, and then a smaller
@@ -65,6 +69,7 @@ private:
     double m_seconds = 60;
     double m_viewEnd = ps::kNaN;
     bool m_stale = false;
+    bool m_detailLine = true;
     std::vector<std::pair<int, Qt::PenStyle>> m_visuals;
     // What the last paint showed.
     mutable QRectF m_sparkRect;

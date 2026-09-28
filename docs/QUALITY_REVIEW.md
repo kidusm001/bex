@@ -120,8 +120,10 @@ Deferred on purpose. These are decisions, not defects waiting to be fixed:
 - SYS-INV-02: an abandoned thread racing static destruction at exit is
   unproven; exit semantics stay unchanged without a reproducer.
 - P-1: Smooth graphs already has a keyboard route through the View menu.
+  Implemented later; see [Follow-up](#follow-up-28-september-2026).
 - clang-tidy's `History` divide-by-zero note: capacity is always 2 or more.
 - UX-202 and UX-203: small wording and column-alignment polish.
+  Implemented later; see [Follow-up](#follow-up-28-september-2026).
 
 Investigated:
 
@@ -213,6 +215,8 @@ specialist C review workflow needed an unavailable runtime and was not run.
 
 - Tested with Qt 6.11.2 only; the declared Qt 6.4 minimum is unverified.
 - X11 window detection compiles but was not run against an X server.
+  (Both as of the review; the follow-up below adds a Qt 6.4.3 build and a
+  private Xvfb run.)
 - Accessibility was checked through `QAccessible`; no screen reader such as
   Orca was run.
 - Closing waits a bounded time for workers, but the kernel may still delay
@@ -236,3 +240,70 @@ specialist C review workflow needed an unavailable runtime and was not run.
 - Test against the app's own windows and synthetic data; never log window
   titles or command lines.
 - Keep logs, screenshots and binaries out of commits, under `build/`.
+
+## Follow-up, 28 September 2026
+
+The user then asked to act on the council's remaining low-risk items and to
+make the healthy view quieter. The ratings above are from the review and
+were not re-scored.
+
+| ID | Change | Verification |
+| --- | --- | --- |
+| UX-202 | A failed or unsupported window list names the group "Apps (unavailable)"; while waiting it is "Apps (detecting…)". Still three groups; the reason stays in the group note, tooltip and accessible text; processes stay unclassified, never Background | `tst_ui processGroupsNeedCompleteWindowLists` and related tests; `tst_process_groups unknownAppsHeaderIsAGroupName` |
+| UX-203 | Process cells other than Name get a gutter from the style's own item layout: an empty decoration on the aligned side (right for numbers, left for text; logical, so right-to-left mirrors). The style still draws background, selection, focus and text in one pass, so theme text colours are kept. Row height, alignment, elision and column order are unchanged | `tst_ui processCellsKeepAGutter`, `processCellsKeepTheStyleTextColours`; `tst_process_groups processCellsKeepAGutterBetweenNumbersAndText` (Fusion and Kvantum) |
+| P-1 | Ctrl+Shift+M toggles **View > Smooth Graphs**, also from the process filter without typing into it. It changes only that saved setting, never pause or sampling | `tst_ui smoothGraphsShortcut`; `tst_process_groups smoothGraphsShortcutTogglesOnce` |
+| SYS-012 | Found in the compatibility run: after an X11 request timed out, the probe disconnected, and reconnecting could then block in `xcb_connect()` while the server was still stalled. A timed-out connection is kept and its late replies are discarded | Private Xvfb run: 14 of 14 checks pass; the previous source fails 1 of 14 |
+
+Quieter healthy view (the user's request, reviewed by GPT-6 Astra and
+checked by QA's tests):
+
+- The toolbar holds only **History** and **Details**. Pause and **Update
+  Interval** are in the View menu, export in the File menu; shortcuts are
+  unchanged.
+- The status bar is hidden while everything is healthy. For paused,
+  unavailable or out-of-date readings, a collector that cannot start or a
+  series over the history limit it shows a few words; the full reason is its
+  tooltip and accessible description, and its accessible name includes the
+  words shown.
+- Page footers are gone; units and conventions are in the tooltips of
+  headings, pickers and columns. Trade-off: they are no longer visible
+  without hovering.
+- The navigation entries' third line appears only in Details, and page
+  summaries no longer repeat what the value, picker or graph shows.
+- Tests: `tst_ui toolbarHoldsOnlyViewChoices`, `statusBarShowsOnlyExceptions`,
+  `navDetailLineOnlyInDetails`, `pagesCarryNoFooterNotes`; QA's
+  `tst_council declutter*`.
+
+Compatibility, from a separate run on a private copy:
+
+- Qt 6.4.3 (the official qtbase build for RHEL 8.4 with its ICU, host
+  GCC 16), on the frozen production sources: all 51 build steps pass with
+  warnings as errors, and the app loads the Qt 6.4.3 libraries and starts
+  offscreen. Five short suites ran: `tst_core` 13, `tst_ui` 65 and
+  `desktop_entry` pass; `tst_process_groups` 79 pass and 1 skips (no
+  Kvantum plugin in that SDK); `tst_council` 22 pass and 2 skip
+  (`QAccessible` event counts that offscreen Qt up to 6.9 cannot observe).
+  `tst_adversarial`, `tst_graph_upgrade` and `tst_live` were not run there.
+  The Qt 6.4.3 run used the earlier `tst_process_groups` source (`0c11c268`);
+  its final version (`a23d8252`, which only isolates the Kvantum row, already
+  skipped there) was compiled with warnings as errors but not run on 6.4.3.
+  This is not a Debian 12 or GCC 12 result.
+- X11 against a private Xvfb server with test windows: the SYS-009 XRes
+  checks (present, missing extension, cancelled) and the SYS-012 checks pass.
+  Xvfb has no user window manager, so this is not a live X11 desktop run.
+
+Author results, debug build with warnings as errors: `tst_ui` 65,
+`tst_process_groups` 80, `tst_council` 24, `tst_adversarial` 361, `tst_core`
+13 and `tst_live` 8, all passing. Address, undefined-behaviour and leak
+sanitizers: all of `tst_ui` (65) and the new `tst_process_groups` and
+`tst_council` rows pass with no reports. `tst_graph_upgrade` was not rerun by
+the author for this UI-only change.
+
+Limitations added:
+
+- The first `xcb_connect()` to an already stalled X server can still block
+  the app-detection thread (not the window); the README describes it.
+- QA's gutter pixel check uses a fixed ink threshold. Its "default Kvantum
+  theme" row now isolates the theme when the style is created, because the
+  desktop's own Kvantum theme has lower selected-row text contrast than
+  that threshold. The app's colours were not changed to suit the check.
