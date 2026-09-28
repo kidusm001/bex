@@ -4,6 +4,7 @@
 
 #include "app/collector.h"
 #include "app/csvexporter.h"
+#include "app/endtaskrunner.h"
 #include "app/processmodel.h"
 #include "app/windowowners.h"
 #include "core/history.h"
@@ -16,15 +17,19 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 class QAction;
 class QActionGroup;
 class QComboBox;
+class QContextMenuEvent;
 class QGridLayout;
 class QLabel;
 class QLineEdit;
+class QMessageBox;
+class QPushButton;
 class QSettings;
 class QStackedWidget;
 class QTimer;
@@ -58,6 +63,11 @@ struct MainWindowOptions {
     // it, results only arrive via applyWindowOwners(). Its clock defaults to
     // `clock`, which is then also called on the probe thread.
     windows::ProbeOptions windowProbe;
+    // Ending tasks from the Processes page; runs on a worker thread. Empty:
+    // ps::endtask::send, offered only while the collector reads the real
+    // /proc (with injected snapshots or another procRoot the controls stay
+    // disabled). A replacement (tests) is always offered.
+    EndTaskRunner::Backend endTask;
 };
 
 class MainWindow : public QMainWindow {
@@ -100,6 +110,8 @@ public:
     // or an export is already running; csvExportFinished() reports the end.
     bool startCsvExport(const QString& path, QString* error = nullptr);
     bool isExporting() const { return m_exporter && m_exporter->isBusy(); }
+    // An End task confirmation is open or its request is running.
+    bool isEndTaskPending() const;
 
     const ps::History& history() const { return m_history; }
     Collector* collector() const { return m_collector; }
@@ -131,6 +143,9 @@ Q_SIGNALS:
     void snapshotApplied();
     void windowOwnersApplied();
     void csvExportFinished(bool ok, const QString& path, const QString& error);
+    // A confirmed End task request ended: signal is a ps::endtask::Signal and
+    // outcome a ps::endtask::Outcome; message is what the user was shown.
+    void endTaskFinished(int pid, qulonglong startTicks, int signal, int outcome, const QString& message);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -188,6 +203,16 @@ private:
     void exportCsvInteractive();
     void onCsvExportFinished(bool ok, const QString& path, const QString& error, qulonglong samples);
     void updateProcessCount();
+    // End task: the target is copied from the model when chosen and never
+    // looked up again.
+    QModelIndex selectedProcessIndex() const;
+    std::optional<ps::endtask::Target> processTargetAt(const QModelIndex& index) const;
+    QString endTaskBlocked(const std::optional<ps::endtask::Target>& target) const;
+    void updateEndTaskActions();
+    bool processContextMenu(QObject* watched, QContextMenuEvent* event);
+    void confirmEndTask(const ps::endtask::Target& target, ps::endtask::Signal signal);
+    void onEndTaskDone(const ps::endtask::Target& target, ps::endtask::Signal signal, const ps::endtask::Result& result,
+                       const QString& message = QString());
     void showAbout();
     void updateHeadlines();
     void applyDetails();
@@ -270,6 +295,11 @@ private:
     bool m_procNameFitted = false; // Simple: the Name column fills the width
     ProcessModel* m_procModel = nullptr;
     ProcessFilterModel* m_procProxy = nullptr;
+    QPushButton* m_endTaskButton = nullptr;
+    QAction* m_endTaskAction = nullptr;
+    QPointer<QMessageBox> m_endTaskBox; // open confirmation
+    EndTaskRunner* m_endTaskRunner = nullptr;
+    QString m_endTaskUnavailable; // why there is no backend
     // Window owners: the newest successful list and the newest failure
     // (each may be null), and the grouping derived from them.
     windows::ResultPtr m_ownersOk;

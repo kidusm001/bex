@@ -59,6 +59,8 @@ endif()
 # ---------------------------------------------------------------------------
 # Core: kernel parsing, delta math, sampling and bounded history. No Qt.
 add_library(pulsescope_core STATIC
+    src/core/endtask.cpp
+    src/core/endtask.h
     src/core/format.cpp
     src/core/format.h
     src/core/history.cpp
@@ -85,6 +87,8 @@ add_library(pulsescope_ui STATIC
     src/app/collector.h
     src/app/csvexporter.cpp
     src/app/csvexporter.h
+    src/app/endtaskrunner.cpp
+    src/app/endtaskrunner.h
     src/app/mainwindow.cpp
     src/app/mainwindow.h
     src/app/metricbutton.cpp
@@ -234,4 +238,14 @@ if(PULSESCOPE_BUILD_TESTS)
     # independent QA.
     pulsescope_add_test(tst_council)
     set_tests_properties(tst_council PROPERTIES LABELS "unit;host")
+    # End task: the pidfd backend against the test's own children, and the
+    # Processes page controls with an injected backend (and once with the
+    # real one, on its own child).
+    pulsescope_add_test(tst_endtask)
+    set_tests_properties(tst_endtask PROPERTIES LABELS "ui;unit;host")
+    # End task backend and controls, written by independent QA. It re-runs
+    # itself in child modes (PS_ET_CHILD) for the processes it signals.
+    pulsescope_add_test(tst_end_task_adversarial)
+    target_compile_definitions(tst_end_task_adversarial PRIVATE PS_ET_CORE=1 PS_ET_APP=1)
+    set_tests_properties(tst_end_task_adversarial PROPERTIES LABELS "ui;unit;host")
 endif()

@@ -3230,7 +3230,8 @@ void TestUi::pagesCarryNoFooterNotes()
     QCOMPARE(perCpu->toolTip(), QString::fromUtf8("Each chart is 0\u2013100% of one logical CPU"));
     QCOMPARE(perCpu->accessibleDescription(), perCpu->toolTip());
     const QString tableAt = child<QTreeView>(w, "processTable")->accessibleDescription();
-    QVERIFY2(tableAt.contains(QStringLiteral("Read-only")) && tableAt.contains(QStringLiteral("100%")),
+    QVERIFY2(tableAt.contains(QStringLiteral("Delete or the context menu ends the selected process"))
+                 && tableAt.contains(QStringLiteral("100%")) && !tableAt.contains(QStringLiteral("Read-only")),
              qPrintable(tableAt));
     QVERIFY(!w.findChild<QLabel*>(QStringLiteral("processShortNote")));
     w.close();

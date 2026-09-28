@@ -11,10 +11,10 @@ graphs and current values for:
 - **Network**: receive and transmit throughput per interface.
 - **Temperatures**: every hwmon and thermal-zone sensor the kernel exposes, in
   °C.
-- **Processes**: a filterable, sortable, read-only list of PID, name, user,
-  CPU, resident memory, threads, state, nice, disk I/O, age and command line,
+- **Processes**: a filterable, sortable list of PID, name, user, CPU,
+  resident memory, threads, state, nice, disk I/O, age and command line,
   grouped like a task manager into apps, background processes and kernel
-  processes.
+  processes. **End task** asks one of your own processes to quit.
 
 Each page opens in a Simple view that reads at a glance: the main value, one
 filled graph and a short summary. **Details** (Ctrl+D) adds every other
@@ -164,6 +164,10 @@ Controls, left to right:
 - **File menu**: **Export History as CSV** and **Quit**.
 - **View menu**: **Pause**, **Update Interval** (0.5, 1, 2 or 5 seconds),
   **Details**, **Smooth Graphs** (Ctrl+Shift+M) and the pages.
+- **Processes page**: the filter, **End task…** for the selected process, and
+  the process count. Right-clicking a process (or the Menu key or Shift+F10)
+  offers **End task…** and **Force end task…**; see
+  [Ending a process](#ending-a-process).
 
 The status bar appears only when something needs attention: paused, readings
 unavailable or out of date, a collector that cannot start, or a history limit
@@ -184,6 +188,7 @@ Keyboard shortcuts:
 | Ctrl+Shift+M | Turn smooth graphs on or off |
 | Ctrl+E | Export history to CSV |
 | Ctrl+F | Filter processes (switches to the Processes page) |
+| Delete in the process list | End the selected process, after confirmation |
 | Ctrl+Q | Quit |
 | Left / Right, Home / End | Move the sample readout in a focused graph |
 | Escape | Hide the graph readout |
@@ -220,6 +225,34 @@ Both views show the same live data. Switching never discards history,
 selections or anything CSV export writes, and does not change how often
 PulseScope samples. Warnings such as paused, stale, warming up or a missing
 sensor are shown in both.
+
+### Ending a process
+
+Like a task manager's End task, PulseScope can end one process: the one you
+select, never its children, its group or other processes with the same name.
+
+- **End task…** (the button, Delete in the list, or the row's context menu)
+  sends `SIGTERM`: the process is asked to quit and may save or clean up
+  first.
+- **Force end task…** (context menu only) sends `SIGKILL`, which cannot be
+  caught or ignored: the process cannot save or clean up. PulseScope never
+  escalates from one to the other by itself.
+- Both ask first, naming the process and its PID. Cancel is the default, and
+  Escape cancels. Unsaved work in the process may be lost.
+- A short status message says the signal was *sent*; it does not mean the
+  process has ended yet. The row goes away when a later sample no longer
+  lists it (after resuming, if the list is paused). If nothing could be sent,
+  a message says why.
+- Only your own processes can be ended: the controls are disabled for other
+  users' processes, processes whose owner is unknown, kernel threads, PID 1
+  and PulseScope itself. PulseScope never asks for more privileges.
+- Just before sending, PulseScope checks again that the PID still names the
+  process you chose: same start time, name and owner, still running, and not
+  a kernel thread. The signal goes through a process file descriptor
+  (`pidfd`) opened before that check, so if the process has exited and its
+  PID been reused, the newcomer cannot receive it. Without pidfd support
+  (Linux 5.3 or later) nothing is sent; there is no fallback to a signal by
+  PID number.
 
 ### Smooth graphs
 
@@ -365,8 +398,9 @@ automatically. Their graphs show gaps rather than zeros.
     zero.
   - Having no sensors is normal in virtual machines and on some hardware. The
     Temperatures page then explains why.
-- **Processes**: the list is read-only; PulseScope never signals or changes
-  processes.
+- **Processes**: PulseScope signals a process only when you confirm End task
+  or Force end task for it (see [Ending a process](#ending-a-process)); it
+  never changes processes otherwise.
   - **CPU %** is per-process CPU time over the last interval, where **100% is
     one logical CPU fully busy**. A multi-threaded process can exceed 100%, up
     to 100% × the number of CPUs.
@@ -550,6 +584,9 @@ pulsescope [--interval 0.5|1|2|5]
   filesystem capacity (`statvfs`) of local mounts. To tell apps apart it asks
   your own desktop session for its window list: Hyprland over its local IPC
   socket, or the local X server. It keeps only process IDs from the answer.
+- The one thing it changes is a process you confirm End task for: it sends
+  that one process of yours `SIGTERM` or `SIGKILL`, with your normal user's
+  permissions. The kernel has the final say.
 - It does not run subprocesses, tune the system or generate load.
 - Everything it shows is what any user on the machine can already read.
   - Some per-process fields, such as disk I/O counters, are restricted by the
@@ -561,6 +598,14 @@ pulsescope [--interval 0.5|1|2|5]
 - Linux only, by design.
 - Per-process I/O counters are unavailable for other users' processes without
   privileges. PulseScope does not try to work around this.
+- **End task**:
+  - Needs pidfds (Linux 5.3 or later) and a `/proc` mounted for PulseScope's
+    own PID namespace. Otherwise nothing is sent and a message says why.
+  - Ends your own processes only. There is no way to end another user's or a
+    system process, by design.
+  - It is offered only for the live list PulseScope reads from this system's
+    `/proc`. With recorded or synthetic process lists (as in the tests), the
+    IDs may not name this system's processes, so the controls stay disabled.
 - **Disk throughput**:
   - Throughput is per whole block device. Per-partition and per-filesystem
     I/O rates are not shown.
@@ -601,11 +646,13 @@ pulsescope [--interval 0.5|1|2|5]
     capacity. Its only file access is the settings file, written
     synchronously when a setting changes and at exit, and the CSV file
     chooser, which is synchronous and can be slow on an unresponsive mount.
-    The CSV file itself is written on a worker thread.
+    The CSV file itself is written on a worker thread, and so is a confirmed
+    End task (its checks read `/proc`).
   - When the window closes, PulseScope waits up to two seconds in total for
     its worker threads: first the collector, which gives its capacity-check
-    thread 200 ms, then the window-list thread, then any running export, for
-    at most one second each of what remains. A worker still stuck in a blocked kernel call after that is
+    thread 200 ms, then the window-list thread, then any running export and
+    any End task request, for at most one second each of what remains. A
+    confirmation still open is closed without sending anything. A worker still stuck in a blocked kernel call after that is
     abandoned instead of waited for.
   - This limits PulseScope's own waiting, not the process exit. Saving
     settings is synchronous, and the kernel may delay the exit of a process

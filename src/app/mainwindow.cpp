@@ -12,6 +12,7 @@
 #include <QButtonGroup>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QContextMenuEvent>
 #include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
@@ -20,6 +21,8 @@
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QItemSelectionModel>
+#include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
@@ -27,6 +30,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPainter>
+#include <QPushButton>
 #include <QResizeEvent>
 #include <QSet>
 #include <QScrollArea>
@@ -50,6 +54,8 @@
 #include <map>
 #include <new>
 #include <set>
+
+#include <unistd.h>
 
 namespace {
 
@@ -771,6 +777,22 @@ MainWindow::MainWindow(MainWindowOptions options, QWidget* parent)
         m_settings = std::make_unique<QSettings>(m_options.settingsFile, QSettings::IniFormat);
     loadSettings();
 
+    // End task; see MainWindowOptions::endTask. Only the live /proc may
+    // authorize a signal: numbers from injected snapshots or another tree
+    // could name an unrelated process here.
+    EndTaskRunner::Backend endTask = m_options.endTask;
+    if (!endTask && m_options.startCollector && m_options.sampler.procRoot == "/proc")
+        endTask = [](const ps::endtask::Target& t, ps::endtask::Signal s) { return ps::endtask::send(t, s); };
+    if (endTask)
+        m_endTaskRunner = new EndTaskRunner(
+            std::move(endTask),
+            [this](const ps::endtask::Target& t, ps::endtask::Signal s, const ps::endtask::Result& r) {
+                onEndTaskDone(t, s, r);
+            },
+            this);
+    else
+        m_endTaskUnavailable = QStringLiteral("Ending tasks needs the live process list of this system's /proc");
+
     // One clock drives all scrolling between samples; see updateFrameDriver().
     m_frameTimer = new QTimer(this);
     m_frameTimer->setObjectName(QStringLiteral("frameTimer"));
@@ -885,6 +907,18 @@ bool MainWindow::shutdown(int timeoutMs)
                      qUtf8Printable(path), qUtf8Printable(QFileInfo(path).fileName()));
         }
     }
+    // An open confirmation is dropped unanswered. A confirmed request is
+    // normally done in microseconds; one still blocked in the kernel is left
+    // to finish on its own, without showing its result.
+    if (m_endTaskBox) {
+        m_endTaskBox->hide();
+        m_endTaskBox->deleteLater();
+        m_endTaskBox = nullptr;
+    }
+    if (m_endTaskRunner && m_endTaskRunner->isBusy()) {
+        const int remaining = static_cast<int>(std::max<qint64>(0, timeoutMs - clock.elapsed()));
+        clean = m_endTaskRunner->shutdown(std::min(remaining, 1000)) && clean;
+    }
     return clean;
 }
 
@@ -905,6 +939,19 @@ bool MainWindow::event(QEvent* event)
 
 bool MainWindow::eventFilter(QObject* watched, QEvent* event)
 {
+    if (m_procTable && event->type() == QEvent::ContextMenu
+        && (watched == m_procTable || watched == m_procTable->viewport()))
+        return processContextMenu(watched, static_cast<QContextMenuEvent*>(event));
+    // The platform turns the Menu key into a context menu event; Shift+F10,
+    // the other usual key for it, is left to applications.
+    if (m_procTable && watched == m_procTable && event->type() == QEvent::KeyPress) {
+        const auto* key = static_cast<QKeyEvent*>(event);
+        if (key->key() == Qt::Key_F10 && key->modifiers() == Qt::ShiftModifier) {
+            QContextMenuEvent menu(QContextMenuEvent::Keyboard, QPoint(),
+                                   m_procTable->viewport()->mapToGlobal(QPoint()));
+            return processContextMenu(watched, &menu);
+        }
+    }
     // Exposure of the native window: covered, on another workspace, or (on
     // Wayland) no longer given frames by the compositor.
     if (watched == m_watchedWindow && event->type() == QEvent::Expose)
@@ -1463,6 +1510,11 @@ QWidget* MainWindow::buildProcessPage()
     m_procFilter->setClearButtonEnabled(true);
     m_procFilter->setMinimumWidth(200);
     header->addWidget(m_procFilter, 1);
+    // End task acts on the selected process; Force end task is only in the
+    // row's context menu.
+    m_endTaskButton = new QPushButton(QStringLiteral("End task\u2026"), page);
+    m_endTaskButton->setObjectName(QStringLiteral("endTaskButton"));
+    header->addWidget(m_endTaskButton);
     m_procCount = new QLabel(page);
     m_procCount->setObjectName(QStringLiteral("processCount"));
     m_procCount->setForegroundRole(QPalette::PlaceholderText);
@@ -1502,6 +1554,7 @@ QWidget* MainWindow::buildProcessPage()
             m_filterExpanded = {true, true, true};
         syncGroupExpansion();
         updateProcessCount();
+        updateEndTaskActions();
     });
 
     // Groups: saved expansion; a showKernelThreads=true from before groups
@@ -1527,7 +1580,8 @@ QWidget* MainWindow::buildProcessPage()
     m_procTable->setAccessibleName(QStringLiteral("Processes"));
     m_procTable->setAccessibleDescription(QStringLiteral("Grouped as apps, background processes and kernel "
                                                          "processes. CPU % is of one logical CPU, so it can exceed "
-                                                         "100%. Read-only."));
+                                                         "100%. Delete or the context menu ends the selected "
+                                                         "process, after confirmation."));
     m_procTable->setModel(m_procProxy);
     m_procTable->setItemDelegate(new ProcessCellDelegate(m_procTable));
     m_procTable->setSortingEnabled(true);
@@ -1596,6 +1650,26 @@ QWidget* MainWindow::buildProcessPage()
             [this](const QModelIndex& index) { onGroupExpansion(index, false); });
     syncGroupExpansion();
     v->addWidget(m_procTable, 1);
+
+    m_endTaskAction = new QAction(QStringLiteral("End task\u2026"), m_procTable);
+    m_endTaskAction->setObjectName(QStringLiteral("endTaskAction"));
+    // Only while the list has focus: Delete keeps editing the filter.
+    m_endTaskAction->setShortcut(QKeySequence::Delete);
+    m_endTaskAction->setShortcutContext(Qt::WidgetShortcut);
+    m_procTable->addAction(m_endTaskAction);
+    connect(m_endTaskAction, &QAction::triggered, this, [this] {
+        if (const auto target = processTargetAt(selectedProcessIndex()))
+            confirmEndTask(*target, ps::endtask::Signal::Terminate);
+    });
+    connect(m_endTaskButton, &QPushButton::clicked, m_endTaskAction, &QAction::trigger);
+    m_procTable->installEventFilter(this); // context menus; see processContextMenu()
+    QItemSelectionModel* selection = m_procTable->selectionModel();
+    connect(selection, &QItemSelectionModel::selectionChanged, this, &MainWindow::updateEndTaskActions);
+    connect(selection, &QItemSelectionModel::currentChanged, this, &MainWindow::updateEndTaskActions);
+    connect(m_procProxy, &QAbstractItemModel::rowsRemoved, this, &MainWindow::updateEndTaskActions);
+    connect(m_procProxy, &QAbstractItemModel::layoutChanged, this, &MainWindow::updateEndTaskActions);
+    connect(m_procProxy, &QAbstractItemModel::modelReset, this, &MainWindow::updateEndTaskActions);
+    updateEndTaskActions();
     return page;
 }
 
@@ -2833,6 +2907,7 @@ void MainWindow::updateProcesses()
     }
     syncGroupExpansion();
     updateProcessCount();
+    updateEndTaskActions();
 }
 
 void MainWindow::updateProcessCount()
@@ -2864,6 +2939,195 @@ void MainWindow::updateProcessCount()
         m_procCount->setToolTip(tip);
         m_procCount->setAccessibleDescription(tip);
     }
+}
+
+bool MainWindow::isEndTaskPending() const
+{
+    return m_endTaskBox || (m_endTaskRunner && m_endTaskRunner->isBusy());
+}
+
+QModelIndex MainWindow::selectedProcessIndex() const
+{
+    const QItemSelectionModel* selection = m_procTable ? m_procTable->selectionModel() : nullptr;
+    if (!selection)
+        return {};
+    const QModelIndexList rows = selection->selectedRows();
+    return rows.size() == 1 ? rows.first() : QModelIndex();
+}
+
+std::optional<ps::endtask::Target> MainWindow::processTargetAt(const QModelIndex& index) const
+{
+    if (!index.isValid() || index.model() != m_procProxy)
+        return std::nullopt;
+    const ps::ProcessInfo* process = m_procModel->process(m_procProxy->mapToSource(index.siblingAtColumn(0)));
+    if (!process)
+        return std::nullopt; // a group row
+    return ps::endtask::targetOf(*process);
+}
+
+// Why the target cannot be ended now; empty when it may be tried.
+QString MainWindow::endTaskBlocked(const std::optional<ps::endtask::Target>& target) const
+{
+    using ps::endtask::Outcome;
+    if (!m_endTaskRunner)
+        return m_endTaskUnavailable;
+    if (m_shutdown)
+        return QStringLiteral("PulseScope is closing");
+    if (isEndTaskPending())
+        return QStringLiteral("An end task request is already open");
+    if (!target)
+        return QStringLiteral("Select a process to end it");
+    switch (ps::endtask::precheck(*target, static_cast<uint32_t>(::getuid()), static_cast<int>(::getpid()))) {
+    case Outcome::Sent:
+        return {};
+    case Outcome::Protected:
+        if (target->pid == 1)
+            return QStringLiteral("PID 1, the system's init process, is not ended from here");
+        if (target->kernelThread)
+            return QStringLiteral("Kernel threads cannot be ended");
+        return QStringLiteral("PulseScope does not end itself; quit it instead");
+    case Outcome::NotOwned:
+        return target->uidKnown ? QStringLiteral("Only your own processes can be ended")
+                                : QStringLiteral("Its owner is unknown, so it cannot be ended");
+    default:
+        return QStringLiteral("This row has no usable process identity");
+    }
+}
+
+void MainWindow::updateEndTaskActions()
+{
+    if (!m_endTaskAction)
+        return;
+    const QString blocked = endTaskBlocked(processTargetAt(selectedProcessIndex()));
+    const bool enabled = blocked.isEmpty();
+    const QString tip = enabled
+        ? QStringLiteral("Ask the selected process to quit (Delete). Force end task is in its context menu.")
+        : blocked;
+    m_endTaskAction->setEnabled(enabled);
+    m_endTaskButton->setEnabled(enabled);
+    if (m_endTaskButton->toolTip() != tip) {
+        m_endTaskButton->setToolTip(tip);
+        m_endTaskButton->setAccessibleDescription(tip);
+    }
+}
+
+// The menu is for the row it was opened on: under the pointer, or the
+// selected one from the keyboard. Nothing opens on group rows or empty space.
+bool MainWindow::processContextMenu(QObject* watched, QContextMenuEvent* event)
+{
+    QWidget* viewport = m_procTable->viewport();
+    QModelIndex index;
+    QPoint at = event->globalPos();
+    if (event->reason() == QContextMenuEvent::Keyboard) {
+        index = selectedProcessIndex();
+        const QRect rect = m_procTable->visualRect(index).intersected(viewport->rect());
+        if (!rect.isEmpty())
+            at = viewport->mapToGlobal(QPoint(rect.left(), rect.bottom()));
+    } else {
+        const QPoint pos = watched == viewport ? event->pos() : viewport->mapFrom(m_procTable, event->pos());
+        if (viewport->rect().contains(pos))
+            index = m_procTable->indexAt(pos);
+    }
+    event->accept();
+    const auto target = processTargetAt(index);
+    if (!target)
+        return true;
+
+    auto* menu = new QMenu(m_procTable);
+    menu->setObjectName(QStringLiteral("processContextMenu"));
+    menu->setAttribute(Qt::WA_DeleteOnClose);
+    menu->setToolTipsVisible(true);
+    const QString blocked = endTaskBlocked(target);
+    const auto add = [&](const QString& text, const QString& name, ps::endtask::Signal signal) {
+        QAction* action = menu->addAction(text);
+        action->setObjectName(name);
+        action->setEnabled(blocked.isEmpty());
+        action->setToolTip(blocked);
+        connect(action, &QAction::triggered, this, [this, t = *target, signal] { confirmEndTask(t, signal); });
+    };
+    add(QStringLiteral("End task\u2026"), QStringLiteral("endTaskMenuAction"), ps::endtask::Signal::Terminate);
+    menu->addSeparator();
+    add(QStringLiteral("Force end task\u2026"), QStringLiteral("forceEndTaskMenuAction"), ps::endtask::Signal::Kill);
+    menu->popup(at);
+    return true;
+}
+
+void MainWindow::confirmEndTask(const ps::endtask::Target& target, ps::endtask::Signal signal)
+{
+    if (const QString blocked = endTaskBlocked(target); !blocked.isEmpty()) {
+        statusBar()->showMessage(blocked, 5000);
+        return;
+    }
+    const bool force = signal == ps::endtask::Signal::Kill;
+    const QString name = q(target.name);
+    const QString pid = QString::number(target.pid);
+    // Plain text: the name is whatever the process chose to call itself.
+    auto* box = new QMessageBox(this);
+    box->setObjectName(QStringLiteral("endTaskConfirmBox"));
+    box->setAttribute(Qt::WA_DeleteOnClose);
+    box->setIcon(QMessageBox::Warning);
+    box->setTextFormat(Qt::PlainText);
+    box->setWindowTitle(force ? QStringLiteral("Force End Task") : QStringLiteral("End Task"));
+    box->setText(force ? QStringLiteral("Force end \u201c%1\u201d (PID %2)?").arg(name, pid)
+                       : QStringLiteral("End \u201c%1\u201d (PID %2)?").arg(name, pid));
+    box->setInformativeText(force ? QStringLiteral("SIGKILL cannot be caught or ignored, so it cannot save or "
+                                                   "clean up. Unsaved work in it will be lost.")
+                                  : QStringLiteral("It is asked to quit (SIGTERM) and may save or clean up first. "
+                                                   "Unsaved work in it may be lost."));
+    box->setProperty("psForce", force);
+    QPushButton* ok = box->addButton(force ? QStringLiteral("Force end task") : QStringLiteral("End task"),
+                                     QMessageBox::AcceptRole);
+    ok->setObjectName(QStringLiteral("endTaskConfirmButton"));
+    QPushButton* cancel = box->addButton(QMessageBox::Cancel);
+    box->setDefaultButton(cancel);
+    box->setEscapeButton(cancel);
+    connect(box, &QMessageBox::finished, this, [this, box, ok, target, signal] {
+        const bool confirmed = box->clickedButton() == ok;
+        m_endTaskBox = nullptr;
+        if (confirmed && !m_shutdown && m_endTaskRunner) {
+            QString why;
+            if (!m_endTaskRunner->start(target, signal, &why)) {
+                const QString who = QStringLiteral("\u201c%1\u201d (PID %2)").arg(q(target.name)).arg(target.pid);
+                onEndTaskDone(target, signal, {},
+                              QStringLiteral("Could not end %1: %2 Nothing was sent.").arg(who, why));
+                return;
+            }
+        }
+        updateEndTaskActions();
+    });
+    m_endTaskBox = box;
+    updateEndTaskActions();
+    box->open();
+}
+
+void MainWindow::onEndTaskDone(const ps::endtask::Target& target, ps::endtask::Signal signal,
+                               const ps::endtask::Result& result, const QString& message)
+{
+    if (m_shutdown)
+        return;
+    const bool sent = result.outcome == ps::endtask::Outcome::Sent;
+    QString shown = message.isEmpty() ? q(ps::endtask::describe(result, target, signal)) : message;
+    // The row stays until a new sample no longer lists the process.
+    if (sent && m_paused)
+        shown += QStringLiteral(" The list is paused.");
+    else if (sent && m_stale)
+        shown += QStringLiteral(" The list is not updating.");
+    statusBar()->showMessage(shown, sent ? 8000 : 15000);
+    if (!sent) {
+        const bool force = signal == ps::endtask::Signal::Kill;
+        auto* box = new QMessageBox(this);
+        box->setObjectName(QStringLiteral("endTaskErrorBox"));
+        box->setAttribute(Qt::WA_DeleteOnClose);
+        box->setIcon(QMessageBox::Warning);
+        box->setTextFormat(Qt::PlainText);
+        box->setWindowTitle(force ? QStringLiteral("Could Not Force End Task") : QStringLiteral("Could Not End Task"));
+        box->setText(shown);
+        box->setStandardButtons(QMessageBox::Ok);
+        box->open();
+    }
+    updateEndTaskActions();
+    Q_EMIT endTaskFinished(target.pid, static_cast<qulonglong>(target.startTicks), static_cast<int>(signal),
+                           static_cast<int>(result.outcome), shown);
 }
 
 void MainWindow::applyWindowOwners(windows::ResultPtr result)
@@ -2933,6 +3197,7 @@ bool MainWindow::updateGrouping()
     if (m_procModel && currentPage() == ProcessPage) {
         m_procModel->setGrouping(m_grouping);
         syncGroupExpansion();
+        updateEndTaskActions();
     }
     updateGroupNote();
     if (m_procCount)
@@ -3291,7 +3556,8 @@ void MainWindow::showAbout()
         this, QStringLiteral("About PulseScope"),
         QStringLiteral("<p><b>PulseScope %1</b></p>"
                        "<p>A native Linux performance monitor. It reads /proc and /sys locally; it needs no "
-                       "privileges, never changes the system and sends nothing over the network.</p>"
+                       "privileges and sends nothing over the network. It changes nothing on the system, except "
+                       "that End task signals one of your own processes after you confirm.</p>"
                        "<p>History is kept in memory for 15 minutes and discarded on exit unless exported.</p>"
                        "<p>Qt style: %2%3. %4</p>")
             .arg(QStringLiteral(PULSESCOPE_VERSION),
