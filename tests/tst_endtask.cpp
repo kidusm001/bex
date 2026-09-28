@@ -342,7 +342,7 @@ struct Env {
     {
         MainWindowOptions o;
         o.startCollector = false;
-        o.settingsFile = dir.filePath(QStringLiteral("pulsescope.ini"));
+        o.settingsFile = dir.filePath(QStringLiteral("bex.ini"));
         o.windowProbe.enabled = false;
         if (injected)
             o.endTask = fake.backend();
@@ -1337,7 +1337,7 @@ void TestEndTask::liveEndTaskEndsOwnChild()
     QVERIFY(c.owned());
     QTemporaryDir dir;
     MainWindowOptions o;
-    o.settingsFile = dir.filePath(QStringLiteral("pulsescope.ini"));
+    o.settingsFile = dir.filePath(QStringLiteral("bex.ini"));
     o.initialIntervalMs = 500;
     o.windowProbe.enabled = false;
     MainWindow w(o); // the real collector and backend

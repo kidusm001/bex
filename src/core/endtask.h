@@ -37,7 +37,7 @@ enum class Outcome {
     Exited,      // it had already exited (gone, or a zombie waiting for its parent)
     Changed,     // the PID now names another process, or its name or owner changed
     NotOwned,    // another user's process, or its owner is unknown
-    Protected,   // PID 1, PulseScope itself, or a kernel thread
+    Protected,   // PID 1, bex itself, or a kernel thread
     Invalid,     // no usable identity (PID 0 or negative), or not a Signal value
     Denied,      // the kernel refused the signal (EPERM)
     Unsupported, // no pidfd support, or /proc is not this PID namespace's procfs

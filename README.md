@@ -1,6 +1,6 @@
-# PulseScope
+# bex
 
-PulseScope is a native Linux performance monitor. It is a small Qt 6 Widgets
+bex is a native Linux performance monitor. It is a small Qt 6 Widgets
 desktop app for keeping an eye on a machine while you work. It shows live
 graphs and current values for:
 
@@ -26,13 +26,13 @@ libxcb for telling apps apart on X11).
 
 ## Requirements
 
-- Linux. PulseScope reads Linux-specific kernel interfaces, and configuring
+- Linux. bex reads Linux-specific kernel interfaces, and configuring
   the project on any other OS stops with an error.
 - A C++20 compiler: GCC 11 or newer, or Clang 14 or newer.
 - CMake 3.21 or newer. Ninja is optional but recommended.
 - Qt 6.4 or newer: Core, Gui and Widgets, plus Test for the test suites.
 - Optional: `xcb` and `xcb-res` (libxcb 1.14 or newer, found with
-  `pkg-config`) to find app windows on X11. Without them PulseScope builds
+  `pkg-config`) to find app windows on X11. Without them bex builds
   and runs the same, and on X11 the Processes page says app detection is
   unavailable. Hyprland needs nothing extra.
 
@@ -52,7 +52,7 @@ sudo apt install build-essential cmake ninja-build qt6-base-dev libxcb1-dev libx
 is too old: use a newer release, or install Qt 6.4 or newer from another
 source. The configure step checks the Qt version and stops if it is too old.
 
-Running PulseScope needs only the Qt runtime libraries (`qt6-base` on Arch;
+Running bex needs only the Qt runtime libraries (`qt6-base` on Arch;
 `libqt6widgets6` on Debian/Ubuntu), `libxcb` and `libxcb-res` if it was built
 with them, and a Qt platform plugin for your session.
 Wayland and X11 both work. On Debian/Ubuntu Wayland sessions,
@@ -61,18 +61,25 @@ XWayland.
 
 ## Build, test and run
 
+Get the source:
+
+```sh
+git clone https://github.com/kidusm001/bex.git
+cd bex
+```
+
 Release build (the version you would use day to day):
 
 ```sh
-cmake -S . -B build/release -G Ninja -DCMAKE_BUILD_TYPE=Release -DPULSESCOPE_BUILD_TESTS=OFF
+cmake -S . -B build/release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBEX_BUILD_TESTS=OFF
 cmake --build build/release
-./build/release/pulsescope
+./build/release/bex
 ```
 
 Debug build with the test suites:
 
 ```sh
-cmake -S . -B build/debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPULSESCOPE_BUILD_TESTS=ON
+cmake -S . -B build/debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBEX_BUILD_TESTS=ON
 cmake --build build/debug
 ctest --test-dir build/debug --output-on-failure
 ```
@@ -89,6 +96,7 @@ The test suites:
 | `tst_council` | Review regressions: a capped read is not a complete table, per-process read timing, refreshing process metadata, worker threads that cannot start, and per-core graph accessibility |
 | `tst_graph_upgrade` | Smooth scrolling between samples, area fills, gaps and signed temperatures in the drawn pixels, and that animation never changes measurements |
 | `desktop_entry` | Escaping of the installed desktop entry's `Exec` line |
+| `tst_settings_import`, `tst_rename_adversarial` | The one-time import of settings saved under the former name PulseScope, and the app's name in its command line, messages and window, each with a private settings folder |
 
 - CTest runs the Qt tests with `QT_QPA_PLATFORM=offscreen`, so they need no
   display and never open windows on your desktop.
@@ -97,9 +105,9 @@ The test suites:
 
   | Label | Meaning | Tests |
   | --- | --- | --- |
-  | `unit` | Synthetic `/proc` and `/sys` trees, injected clocks, local test sockets, at most the test's own `/proc` entries | `tst_adversarial`, `tst_core`, `tst_council`, `tst_process_groups`, `desktop_entry` |
-  | `ui` | Widgets, offscreen | `tst_ui`, `tst_process_groups`, `tst_graph_upgrade` |
-  | `host` | Also depends on this machine: its mount table, real `/proc` and `/sys`, process limits and privileges, or your Qt theme files | `tst_adversarial`, `tst_core`, `tst_council`, `tst_live`, `tst_ui`, `tst_graph_upgrade` |
+  | `unit` | Synthetic `/proc` and `/sys` trees, injected clocks, local test sockets, at most the test's own `/proc` entries | `tst_adversarial`, `tst_core`, `tst_council`, `tst_process_groups`, `desktop_entry`, `tst_settings_import`, `tst_rename_adversarial` |
+  | `ui` | Widgets, offscreen | `tst_ui`, `tst_process_groups`, `tst_graph_upgrade`, `tst_settings_import` |
+  | `host` | Also depends on this machine: its mount table, real `/proc` and `/sys`, process limits and privileges, or your Qt theme files | `tst_adversarial`, `tst_core`, `tst_council`, `tst_live`, `tst_ui`, `tst_graph_upgrade`, `tst_settings_import`, `tst_rename_adversarial` |
   | `live` | Only this host's real `/proc` and `/sys` | `tst_live` |
   | `slow` | Several minutes | `tst_graph_upgrade` |
   | `install` | Installed files | `desktop_entry` |
@@ -112,14 +120,14 @@ The test suites:
 
 Useful CMake options:
 
-- `-DPULSESCOPE_WERROR=ON` treats warnings as errors.
-- `-DPULSESCOPE_SANITIZE="address;undefined"` builds with sanitizers. Use a
+- `-DBEX_WERROR=ON` treats warnings as errors.
+- `-DBEX_SANITIZE="address;undefined"` builds with sanitizers. Use a
   separate build directory for this. Sanitizer reports are not recoverable,
   so any report, including undefined behaviour, fails the test that hit it.
   For the slower code, the CTest time limit for `tst_graph_upgrade` grows
   from 1800 s to 3600 s and its Qt Test limit per test function from 300 s
   to 1800 s; the other suites keep 120 s.
-- `-DPULSESCOPE_X11=AUTO|ON|OFF` controls X11 app detection. `AUTO` (the
+- `-DBEX_X11=AUTO|ON|OFF` controls X11 app detection. `AUTO` (the
   default) uses `xcb` and `xcb-res` when `pkg-config` finds them, `ON` stops
   with an error when they are missing, `OFF` leaves them out. The value is
   case-insensitive; anything else stops with an error.
@@ -132,13 +140,13 @@ cmake --install build/release --prefix ~/.local
 
 This installs:
 
-- `~/.local/bin/pulsescope`
-- `~/.local/share/applications/io.github.kidusm001.PulseScope.desktop`
-- `~/.local/share/icons/hicolor/scalable/apps/io.github.kidusm001.PulseScope.svg`
-- `~/.local/share/metainfo/io.github.kidusm001.PulseScope.metainfo.xml`
+- `~/.local/bin/bex`
+- `~/.local/share/applications/io.github.kidusm001.bex.desktop`
+- `~/.local/share/icons/hicolor/scalable/apps/io.github.kidusm001.bex.svg`
+- `~/.local/share/metainfo/io.github.kidusm001.bex.metainfo.xml`
 
 The desktop entry's `Exec` line holds the absolute path of the installed
-binary, so PulseScope appears in your application launcher even when
+binary, so bex appears in your application launcher even when
 `~/.local/bin` is not on `PATH`. Some launchers only pick up new entries after
 you log out and back in, or after running
 `update-desktop-database ~/.local/share/applications`.
@@ -150,10 +158,23 @@ To uninstall, remove exactly the files recorded in the build tree's
 cmake --build build/release --target uninstall
 ```
 
+bex used to be called PulseScope. Installing bex does not remove an earlier
+PulseScope install, which would stay in the launcher as a second entry. Run
+the `uninstall` target in the build tree that installed PulseScope, or remove
+its four files:
+
+- `~/.local/bin/pulsescope`
+- `~/.local/share/applications/io.github.kidusm001.PulseScope.desktop`
+- `~/.local/share/icons/hicolor/scalable/apps/io.github.kidusm001.PulseScope.svg`
+- `~/.local/share/metainfo/io.github.kidusm001.PulseScope.metainfo.xml`
+
+Its settings are kept and imported once; see
+[Settings from PulseScope](#settings-from-pulsescope).
+
 No step needs `sudo`. Installing to a system prefix such as `/usr/local` works
 too, but is not required.
 
-## Using PulseScope
+## Using bex
 
 Controls, left to right:
 
@@ -198,14 +219,37 @@ Keyboard shortcuts:
 Hovering over a graph shows the exact values at that moment. With a graph
 focused, the arrow keys do the same.
 
-Your choices are remembered in `~/.config/PulseScope/PulseScope.conf`: page,
-interval, graph window, Details and Smooth Graphs, selected disk, interface
-and sensors, process sort order, which process groups are open, and window
-geometry.
+Your choices are remembered in `~/.config/bex/bex.conf` (under
+`$XDG_CONFIG_HOME` when that is set): page, interval, graph window, Details
+and Smooth Graphs, selected disk, interface and sensors, process sort order,
+which process groups are open, and window geometry.
+
+### Settings from PulseScope
+
+bex used to be called PulseScope, which kept its settings in
+`~/.config/PulseScope/PulseScope.conf`. The first time bex opens its window
+without a `bex.conf`, it copies every setting from that file into a new
+`bex.conf` and prints one line saying so. After that it never reads the old
+file again:
+
+- An existing `bex.conf` always wins. It is never overwritten or merged,
+  even when it is empty.
+- The old file is only read. It is never changed, moved or deleted; remove
+  it yourself once you no longer need it.
+- `--help`, `--version`, `--theme-info` and rejected options exit before any
+  settings are read, so they neither import nor create anything.
+- If the old file cannot be found for certain (a folder on its path cannot
+  be searched), cannot be read, is damaged or is larger than 8 MiB, or
+  `bex.conf` cannot be written, nothing is imported. bex prints why to its
+  standard error, shows it in the status bar for 15 seconds, and starts with
+  its default settings, which it then saves as its own: fix the problem and
+  delete `bex.conf` to import again.
+- Deleting `bex.conf` while the old file still exists makes the next start
+  import it again.
 
 ### Simple view and Details
 
-PulseScope starts in the Simple view: each page shows its main reading in
+bex starts in the Simple view: each page shows its main reading in
 large type and one graph with a filled area under its line. A line of text
 under the reading appears only where it adds something (memory of total and
 swap, root filesystem free space, the hottest sensor) or when a reading is
@@ -223,19 +267,19 @@ Turn on **Details** (toolbar, View menu or Ctrl+D) for everything else:
 
 Both views show the same live data. Switching never discards history,
 selections or anything CSV export writes, and does not change how often
-PulseScope samples. Warnings such as paused, stale, warming up or a missing
+bex samples. Warnings such as paused, stale, warming up or a missing
 sensor are shown in both.
 
 ### Ending a process
 
-Like a task manager's End task, PulseScope can end one process: the one you
+Like a task manager's End task, bex can end one process: the one you
 select, never its children, its group or other processes with the same name.
 
 - **End task…** (the button, Delete in the list, or the row's context menu)
   sends `SIGTERM`: the process is asked to quit and may save or clean up
   first.
 - **Force end task…** (context menu only) sends `SIGKILL`, which cannot be
-  caught or ignored: the process cannot save or clean up. PulseScope never
+  caught or ignored: the process cannot save or clean up. bex never
   escalates from one to the other by itself.
 - Both ask first, naming the process and its PID. Cancel is the default, and
   Escape cancels. Unsaved work in the process may be lost.
@@ -245,8 +289,8 @@ select, never its children, its group or other processes with the same name.
   a message says why.
 - Only your own processes can be ended: the controls are disabled for other
   users' processes, processes whose owner is unknown, kernel threads, PID 1
-  and PulseScope itself. PulseScope never asks for more privileges.
-- Just before sending, PulseScope checks again that the PID still names the
+  and bex itself. bex never asks for more privileges.
+- Just before sending, bex checks again that the PID still names the
   process you chose: same start time, name and owner, still running, and not
   a kernel thread. The signal goes through a process file descriptor
   (`pidfd`) opened before that check, so if the process has exited and its
@@ -276,12 +320,12 @@ of jumping once per sample.
   less motion: the graphs then move once per sample. Smooth graphs on a
   visible window cost a few percent of one core; see
   [Design notes](#design-notes) for measurements. Qt 6 offers no system
-  "reduce motion" preference for PulseScope to follow, so this switch is the
+  "reduce motion" preference for bex to follow, so this switch is the
   way to choose.
 
 ### Look and theme
 
-PulseScope uses your Qt style, palette, fonts and icons; graph colours are
+bex uses your Qt style, palette, fonts and icons; graph colours are
 chosen to suit the palette's lightness.
 
 - An explicit choice always wins. `-platformtheme` or `QT_QPA_PLATFORMTHEME`
@@ -291,22 +335,22 @@ chosen to suit the palette's lightness.
   picks the theme itself. Arguments are read as Qt reads them, so on the xcb
   platform `-title`, `-geometry` and `-icon` take the next argument as their
   value. If that matters and the platform is not known before start-up (no
-  `QT_QPA_PLATFORM`, `DISPLAY` or `WAYLAND_DISPLAY`), PulseScope leaves the
+  `QT_QPA_PLATFORM`, `DISPLAY` or `WAYLAND_DISPLAY`), bex leaves the
   theme to Qt and says the choice is not known. On desktops that integrate Qt
   themselves (KDE, GNOME, Xfce, LXQt and others) Qt's own choice is used.
 - Some compositor sessions, such as Hyprland or Sway, leave
   `QT_QPA_PLATFORMTHEME` unset even when Qt apps are configured with qt6ct,
   so Qt apps started from a launcher get Qt's built-in look. When
   `~/.config/qt6ct/qt6ct.conf` exists and the qt6ct Qt 6 plugin is installed,
-  PulseScope then asks for the qt6ct platform theme for itself only, by adding
+  bex then asks for the qt6ct platform theme for itself only, by adding
   `-platformtheme qt6ct` to its own arguments. That brings in the style (for
   example Kvantum), palette, fonts, icon theme and style sheets configured in
   qt6ct. Nothing global changes: no environment of other programs and no
   configuration file is touched.
-- If qt6ct is configured but its plugin is missing, PulseScope uses Qt's
+- If qt6ct is configured but its plugin is missing, bex uses Qt's
   default look and says so on standard error, in **Help > About** and in
   `--theme-info`.
-- `pulsescope --theme-info` prints the platform, how the theme was chosen,
+- `bex --theme-info` prints the platform, how the theme was chosen,
   and the style, font, icon theme, style sheet size, main palette colours and
   platform theme plugin actually loaded.
 
@@ -398,7 +442,7 @@ automatically. Their graphs show gaps rather than zeros.
     zero.
   - Having no sensors is normal in virtual machines and on some hardware. The
     Temperatures page then explains why.
-- **Processes**: PulseScope signals a process only when you confirm End task
+- **Processes**: bex signals a process only when you confirm End task
   or Force end task for it (see [Ending a process](#ending-a-process)); it
   never changes processes otherwise.
   - **CPU %** is per-process CPU time over the last interval, where **100% is
@@ -447,7 +491,7 @@ stay in this order, whichever column you sort by:
   process with several windows is listed once. Only the process the
   compositor names as the window's owner counts. Helpers without windows of
   their own, such as a browser's content processes, stay in Background:
-  PulseScope does not guess family ties from parent PIDs or names.
+  bex does not guess family ties from parent PIDs or names.
 - **Background processes**: every other user-space process.
 - **Kernel processes**: kernel threads, which the kernel marks itself
   (`PF_KTHREAD` in `/proc/PID/stat`).
@@ -469,7 +513,7 @@ Finding app windows depends on the desktop:
 
 | Desktop | How |
 | --- | --- |
-| Hyprland | Asks Hyprland for its window list over its own IPC socket (`$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock`, request `j/clients`). This is read-only: PulseScope never focuses, moves or changes windows. |
+| Hyprland | Asks Hyprland for its window list over its own IPC socket (`$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock`, request `j/clients`). This is read-only: bex never focuses, moves or changes windows. |
 | X11 | Reads the window manager's `_NET_CLIENT_LIST` and asks the X server which process owns each window (the X-Resource extension), when built with `xcb` and `xcb-res` and connected to a local X server. |
 | Other Wayland desktops | Not supported yet. |
 
@@ -478,7 +522,7 @@ When the window list cannot be read, the Apps header reads **Apps
 User processes are then listed together as **Unclassified user processes**
 instead of calling them all background. Until the first list arrives, the
 header reads **Apps (detecting…)**. Kernel processes are still shown
-separately. PulseScope never uses XWayland's window list on a Wayland
+separately. bex never uses XWayland's window list on a Wayland
 desktop, because that only knows about X11 apps.
 
 How the window list is fetched:
@@ -503,7 +547,7 @@ How the window list is fetched:
   still valid is kept until it expires, and after that user processes are
   unclassified, with what was missing as the reason. A complete list with no
   windows at all is still an answer: Apps (0).
-- If Hyprland's socket is busy (its connection queue is full), PulseScope
+- If Hyprland's socket is busy (its connection queue is full), bex
   retries within the 400 ms and otherwise tries again at the next interval.
 - Only process IDs are kept. Window titles, classes and commands are never
   stored or logged.
@@ -532,7 +576,7 @@ recorded series to a CSV file.
   name. Errors are reported in the window.
 - **Quitting during an export**: an export still blocked when you quit (for
   example on an unresponsive network mount) cannot be cancelled. It is
-  abandoned, and PulseScope prints one line naming the destination to its
+  abandoned, and bex prints one line naming the destination to its
   standard error. The file at that name is either complete or unchanged. On a
   filesystem without unnamed temporary files, a `<name>.XXXXXX` temporary may
   be left beside it.
@@ -552,13 +596,13 @@ they are not recorded.
 ### Command-line options
 
 ```text
-pulsescope [--interval 0.5|1|2|5]
-           [--page cpu|memory|disks|network|temperatures|processes]
-           [--size WIDTHxHEIGHT]
-           [--screenshot FILE.png [--screenshot-delay SECONDS]]
-           [--quit-after SECONDS]
-           [--theme-info]
-           [--frame-stats]
+bex [--interval 0.5|1|2|5]
+    [--page cpu|memory|disks|network|temperatures|processes]
+    [--size WIDTHxHEIGHT]
+    [--screenshot FILE.png [--screenshot-delay SECONDS]]
+    [--quit-after SECONDS]
+    [--theme-info]
+    [--frame-stats]
 ```
 
 - `--interval` replaces the saved interval at startup. Like a choice made in
@@ -576,7 +620,7 @@ pulsescope [--interval 0.5|1|2|5]
 
 ## Privacy and permissions
 
-- PulseScope runs as your normal user and never asks for or uses elevated
+- bex runs as your normal user and never asks for or uses elevated
   privileges.
 - It makes no network connections, has no telemetry and writes nothing except
   its settings file and the CSV files you explicitly export.
@@ -597,13 +641,13 @@ pulsescope [--interval 0.5|1|2|5]
 
 - Linux only, by design.
 - Per-process I/O counters are unavailable for other users' processes without
-  privileges. PulseScope does not try to work around this.
+  privileges. bex does not try to work around this.
 - **End task**:
-  - Needs pidfds (Linux 5.3 or later) and a `/proc` mounted for PulseScope's
+  - Needs pidfds (Linux 5.3 or later) and a `/proc` mounted for bex's
     own PID namespace. Otherwise nothing is sent and a message says why.
   - Ends your own processes only. There is no way to end another user's or a
     system process, by design.
-  - It is offered only for the live list PulseScope reads from this system's
+  - It is offered only for the live list bex reads from this system's
     `/proc`. With recorded or synthetic process lists (as in the tests), the
     IDs may not name this system's processes, so the controls stay disabled.
 - **Disk throughput**:
@@ -623,7 +667,7 @@ pulsescope [--interval 0.5|1|2|5]
 - The X11 path is built and unit-tested, and was run against a private Xvfb
   server with test windows, but not on a live X11 desktop with a real window
   manager (the development machine runs Hyprland). If the X server is already
-  unresponsive when PulseScope first connects, `xcb_connect()` can block the
+  unresponsive when bex first connects, `xcb_connect()` can block the
   app-detection thread (never the window); after 5 s the group reads "Apps
   (unavailable)" and user processes stay unclassified. On quit that thread is
   abandoned after a bounded wait.
@@ -648,13 +692,13 @@ pulsescope [--interval 0.5|1|2|5]
     chooser, which is synchronous and can be slow on an unresponsive mount.
     The CSV file itself is written on a worker thread, and so is a confirmed
     End task (its checks read `/proc`).
-  - When the window closes, PulseScope waits up to two seconds in total for
+  - When the window closes, bex waits up to two seconds in total for
     its worker threads: first the collector, which gives its capacity-check
     thread 200 ms, then the window-list thread, then any running export and
     any End task request, for at most one second each of what remains. A
     confirmation still open is closed without sending anything. A worker still stuck in a blocked kernel call after that is
     abandoned instead of waited for.
-  - This limits PulseScope's own waiting, not the process exit. Saving
+  - This limits bex's own waiting, not the process exit. Saving
     settings is synchronous, and the kernel may delay the exit of a process
     whose thread is stuck in uninterruptible I/O.
   - If the system refuses to create a worker thread (the per-user process

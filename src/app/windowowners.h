@@ -36,7 +36,7 @@ enum class Backend { None, Hyprland, X11 };
 
 enum class Status {
     Ok,
-    Unsupported,      // this desktop offers no window list PulseScope can read
+    Unsupported,      // this desktop offers no window list bex can read
     MissingSession,   // session variables are set but unusable
     NotRunning,       // no socket, or nobody listening on it
     PermissionDenied,

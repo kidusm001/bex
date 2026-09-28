@@ -1,12 +1,13 @@
-// PulseScope entry point.
+// bex entry point.
 #ifndef __linux__
-#error "PulseScope reads Linux /proc and /sys interfaces and only supports Linux."
+#error "bex reads Linux /proc and /sys interfaces and only supports Linux."
 #endif
 
 #include "app/appicon.h"
 #include "app/cli.h"
 #include "app/mainwindow.h"
 #include "app/metricbutton.h"
+#include "app/settingsimport.h"
 #include "app/timechart.h"
 
 #include <QApplication>
@@ -20,6 +21,7 @@
 #include <QPaintEvent>
 #include <QPixmap>
 #include <QSocketNotifier>
+#include <QStatusBar>
 #include <QStyle>
 #include <QTimer>
 #include <QWindow>
@@ -179,7 +181,7 @@ private:
         std::sort(m_costs.begin(), m_costs.end());
         auto at = [&](double q) { return m_costs.empty() ? 0.0 : m_costs[std::size_t(q * (m_costs.size() - 1))]; };
         std::fprintf(stderr,
-                     "pulsescope: frames %.1f/s, frame cost median %.2f ms, p95 %.2f ms, max %.2f ms; chart paints "
+                     "bex: frames %.1f/s, frame cost median %.2f ms, p95 %.2f ms, max %.2f ms; chart paints "
                      "%.1f/s (%.1f ms/s, %.0f kpx each); navigation paints %.1f/s (%.1f ms/s); animation ticks %.1f/s, longest gap "
                      "%.1f ms\n",
                      m_costs.size() / secs, at(0.5), at(0.95), m_costs.empty() ? 0.0 : m_costs.back(),
@@ -229,12 +231,12 @@ int main(int argc, char* argv[])
     args.push_back(nullptr);
     QApplication app(appArgc, args.data());
     if (theme.pluginMissing)
-        std::fprintf(stderr, "pulsescope: %s\n", qPrintable(theme.note));
-    QApplication::setApplicationName(QStringLiteral("PulseScope"));
-    QApplication::setOrganizationName(QStringLiteral("PulseScope"));
-    QApplication::setApplicationVersion(QStringLiteral(PULSESCOPE_VERSION));
-    QApplication::setDesktopFileName(QStringLiteral(PULSESCOPE_APP_ID));
-    QApplication::setWindowIcon(pulseScopeIcon());
+        std::fprintf(stderr, "bex: %s\n", qPrintable(theme.note));
+    QApplication::setApplicationName(QStringLiteral("bex"));
+    QApplication::setOrganizationName(QStringLiteral("bex"));
+    QApplication::setApplicationVersion(QStringLiteral(BEX_VERSION));
+    QApplication::setDesktopFileName(QStringLiteral(BEX_APP_ID));
+    QApplication::setWindowIcon(bexIcon());
     // The style Qt chose; a style sheet applied later (qt6ct applies its own)
     // wraps it in an unnamed QStyleSheetStyle.
     const QStyle* startStyle = QApplication::style();
@@ -297,7 +299,7 @@ int main(int argc, char* argv[])
     if (parser.isSet(intervalOpt)) {
         const auto ms = cli::parseIntervalMs(parser.value(intervalOpt));
         if (!ms) {
-            std::fprintf(stderr, "pulsescope: --interval must be one of 0.5, 1, 2 or 5 (got '%s')\n",
+            std::fprintf(stderr, "bex: --interval must be one of 0.5, 1, 2 or 5 (got '%s')\n",
                          qPrintable(parser.value(intervalOpt)));
             return 2;
         }
@@ -309,7 +311,7 @@ int main(int argc, char* argv[])
                                  QStringLiteral("network"), QStringLiteral("temperatures"), QStringLiteral("processes")};
         page = static_cast<int>(pages.indexOf(parser.value(pageOpt).toLower()));
         if (page < 0) {
-            std::fprintf(stderr, "pulsescope: unknown --page '%s'\n", qPrintable(parser.value(pageOpt)));
+            std::fprintf(stderr, "bex: unknown --page '%s'\n", qPrintable(parser.value(pageOpt)));
             return 2;
         }
     }
@@ -317,7 +319,7 @@ int main(int argc, char* argv[])
     if (parser.isSet(screenshotOpt) || parser.isSet(delayOpt)) {
         screenshotDelayMs = cli::parseDelayMs(parser.value(delayOpt));
         if (!screenshotDelayMs) {
-            std::fprintf(stderr, "pulsescope: --screenshot-delay must be a number of seconds from 0 to %.0f (got '%s')\n",
+            std::fprintf(stderr, "bex: --screenshot-delay must be a number of seconds from 0 to %.0f (got '%s')\n",
                          cli::kMaxDelaySeconds, qPrintable(parser.value(delayOpt)));
             return 2;
         }
@@ -326,7 +328,7 @@ int main(int argc, char* argv[])
     if (parser.isSet(quitOpt)) {
         quitAfterMs = cli::parseDelayMs(parser.value(quitOpt));
         if (!quitAfterMs) {
-            std::fprintf(stderr, "pulsescope: --quit-after must be a number of seconds from 0 to %.0f (got '%s')\n",
+            std::fprintf(stderr, "bex: --quit-after must be a number of seconds from 0 to %.0f (got '%s')\n",
                          cli::kMaxDelaySeconds, qPrintable(parser.value(quitOpt)));
             return 2;
         }
@@ -336,17 +338,30 @@ int main(int argc, char* argv[])
     if (parser.isSet(sizeOpt)) {
         size = cli::parseWindowSize(parser.value(sizeOpt));
         if (!size) {
-            std::fprintf(stderr, "pulsescope: --size must be WIDTHxHEIGHT with each side from %d to %d (got '%s')\n",
+            std::fprintf(stderr, "bex: --size must be WIDTHxHEIGHT with each side from %d to %d (got '%s')\n",
                          cli::kMinWindowSide, cli::kMaxWindowSide, qPrintable(parser.value(sizeOpt)));
             return 2;
         }
     }
 
     if (::access("/proc/stat", R_OK) != 0) {
-        QMessageBox::critical(nullptr, QStringLiteral("PulseScope"),
-                              QStringLiteral("PulseScope needs the Linux /proc filesystem, but /proc/stat cannot be "
+        QMessageBox::critical(nullptr, QStringLiteral("bex"),
+                              QStringLiteral("bex needs the Linux /proc filesystem, but /proc/stat cannot be "
                                              "read. Is /proc mounted?"));
         return 1;
+    }
+
+    // Settings saved while the app was called PulseScope are copied once, as
+    // the window is about to read its own: never over existing bex settings,
+    // and never for the options that exit above.
+    QString importFailure;
+    if (options.settingsFile.isEmpty()) {
+        const settingsimport::Result imported =
+            settingsimport::importLegacy(settingsimport::legacyFile(), settingsimport::defaultFile());
+        if (!imported.message.isEmpty())
+            std::fprintf(stderr, "bex: %s\n", qPrintable(imported.message));
+        if (imported.outcome == settingsimport::Outcome::Failed)
+            importFailure = imported.message;
     }
 
     MainWindow window(std::move(options));
@@ -358,15 +373,17 @@ int main(int argc, char* argv[])
     if (parser.isSet(frameStatsOpt))
         new FrameStats(&window);
     window.show();
+    if (!importFailure.isEmpty())
+        window.statusBar()->showMessage(importFailure, 15000);
 
     if (parser.isSet(screenshotOpt)) {
         const QString path = QFileInfo(parser.value(screenshotOpt)).absoluteFilePath();
         QTimer::singleShot(*screenshotDelayMs, &window, [&window, path] {
             QDir().mkpath(QFileInfo(path).absolutePath());
             if (!window.grab().save(path, "PNG"))
-                std::fprintf(stderr, "pulsescope: could not save screenshot to %s\n", qPrintable(path));
+                std::fprintf(stderr, "bex: could not save screenshot to %s\n", qPrintable(path));
             else
-                std::fprintf(stderr, "pulsescope: screenshot saved to %s\n", qPrintable(path));
+                std::fprintf(stderr, "bex: screenshot saved to %s\n", qPrintable(path));
         });
     }
     if (quitAfterMs)

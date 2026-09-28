@@ -4,6 +4,11 @@ One review of PulseScope: what was examined, the findings and their
 outcome, ratings per area, and what was not verified. It is not a
 certification, an accessibility conformance claim or an overall grade.
 
+The app has since been renamed bex. This review is left as it was written
+for the commits it names, so it uses the old names: PulseScope,
+`PULSESCOPE_X11` and `-DPULSESCOPE_WERROR` are now bex, `BEX_X11` and
+`-DBEX_WERROR`. The rename itself was not part of this review.
+
 ## Scope
 
 - Commit `30fd20ee` (smooth filled graphs, native Qt theming), plus

@@ -27,7 +27,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#ifdef PULSESCOPE_HAVE_X11
+#ifdef BEX_HAVE_X11
 #include <xcb/res.h>
 #include <xcb/xcb.h>
 #include <xcb/xcbext.h> // xcb_poll_for_reply
@@ -208,7 +208,7 @@ Environment Environment::fromProcess()
 
 bool x11Built()
 {
-#ifdef PULSESCOPE_HAVE_X11
+#ifdef BEX_HAVE_X11
     return true;
 #else
     return false;
@@ -243,14 +243,14 @@ Selection selectBackend(const Environment& env, bool x11Available)
         return s;
     }
     if (!env.waylandDisplay.empty() || env.sessionType == "wayland") {
-        s.detail = QStringLiteral("This Wayland desktop does not share its window list; PulseScope can read it "
+        s.detail = QStringLiteral("This Wayland desktop does not share its window list; bex can read it "
                                   "from Hyprland or an X11 session");
         return s;
     }
     if (!env.display.empty()) {
         s.backend = Backend::X11;
         if (!x11Available) {
-            s.detail = QStringLiteral("This build of PulseScope has no X11 support");
+            s.detail = QStringLiteral("This build of bex has no X11 support");
             return s;
         }
         s.address = env.display;
@@ -395,7 +395,7 @@ Query queryHyprland(const std::string& socketPath, const Limits& limits, int can
         return fail(Status::OtherUser, QStringLiteral("Hyprland's socket is served by another user"));
     if (cred.pid <= 0 || !sameNamespace(procRoot, cred.pid))
         return fail(Status::OtherNamespace,
-                    QStringLiteral("Hyprland runs in another process namespace (for example, PulseScope is sandboxed), "
+                    QStringLiteral("Hyprland runs in another process namespace (for example, bex is sandboxed), "
                                    "so its process IDs cannot be matched"));
 
     static constexpr char kRequest[] = "j/clients";
@@ -461,7 +461,7 @@ Query queryHyprland(const std::string& socketPath, const Limits& limits, int can
 // PID from the X server itself (XRes 1.2, local clients only). _NET_WM_PID
 // is not used: clients set it themselves and it may name a remote host.
 
-#ifdef PULSESCOPE_HAVE_X11
+#ifdef BEX_HAVE_X11
 class X11Client {
 public:
     ~X11Client() { disconnect(); }
@@ -853,7 +853,7 @@ Query ProbeWorker::runQuery(const Selection& selection)
     case Backend::Hyprland:
         return queryHyprland(selection.address, m_options.limits, m_link->cancelFd, m_options.procRoot);
     case Backend::X11:
-#ifdef PULSESCOPE_HAVE_X11
+#ifdef BEX_HAVE_X11
         if (!m_x11)
             m_x11 = std::make_unique<X11Client>();
         return m_x11->query(selection.address, m_options.limits, m_link->cancelFd, m_options.procRoot);
@@ -910,7 +910,7 @@ WindowProbe::WindowProbe(ProbeOptions options, QObject* parent)
     qRegisterMetaType<windows::ResultPtr>();
     m_clock = options.clock;
     m_thread = new QThread; // deliberately unparented, see stop()
-    m_thread->setObjectName(QStringLiteral("pulsescope-windows"));
+    m_thread->setObjectName(QStringLiteral("bex-windows"));
     auto* worker = new ProbeWorker(std::move(options), m_link);
     worker->moveToThread(m_thread);
     m_worker = worker;
@@ -1073,7 +1073,7 @@ bool WindowProbe::stop(int timeoutMs)
         if (!m_thread->wait(timeoutMs)) {
             // Stuck outside a cancellable wait (xcb_connect on a hung X
             // server): abandoned as in Collector::stop().
-            qWarning("PulseScope: window probe thread did not stop within %d ms; abandoning it", timeoutMs);
+            qWarning("bex: window probe thread did not stop within %d ms; abandoning it", timeoutMs);
             QThread* thread = m_thread;
             m_worker = nullptr;
             m_thread = nullptr;

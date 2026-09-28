@@ -31,7 +31,7 @@ std::optional<QSize> parseWindowSize(const QString& text);
 // many others set QT_QPA_PLATFORMTHEME in the session. Some (Hyprland, Sway
 // and other compositors started from a login shell) leave it unset even
 // though the user configured qt6ct, so Qt applications started from a
-// launcher fall back to Qt's built-in look. PulseScope then asks for qt6ct
+// launcher fall back to Qt's built-in look. bex then asks for qt6ct
 // for itself only, through its own command line; nothing global changes.
 struct ThemeEnvironment {
     QString platformThemeVariable; // QT_QPA_PLATFORMTHEME

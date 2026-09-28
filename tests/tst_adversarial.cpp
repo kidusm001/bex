@@ -906,7 +906,7 @@ void TestAdversarial::meminfoRejectsBadValues()
 
 void TestAdversarial::meminfoMissingUnitIsNotBytes()
 {
-    // Every field PulseScope reads is printed by the kernel with a " kB"
+    // Every field bex reads is printed by the kernel with a " kB"
     // suffix. A line that lost its unit (truncated read, corrupted input) must
     // not be taken as raw bytes: that silently reports 1/1024 of the real RAM.
     const auto m = parse::parseMeminfo("MemTotal:       16303428\nMemAvailable:    9541156 kB\n");
@@ -3336,8 +3336,8 @@ void TestAdversarial::samplerFailedProcessScanInvalidatesBaselines()
 
 namespace {
 
-// Threads of this test process named after the collector thread (comm is
-// truncated to 15 bytes: "pulsescope-coll").
+// Threads of this test process named after the collector thread
+// ("bex-collector" fits comm's 15 bytes, so it is compared whole).
 int collectorThreadCount()
 {
     int n = 0;
@@ -3346,7 +3346,7 @@ int collectorThreadCount()
         std::ifstream f(e.path() / "comm");
         std::string comm;
         std::getline(f, comm);
-        n += comm.rfind("pulsescope-col", 0) == 0;
+        n += comm == "bex-collector";
     }
     return n;
 }
@@ -5690,7 +5690,7 @@ void TestAdversarial::mainWindowInteractiveExportUsesChooser()
     auto* action = w.findChild<QAction*>(QStringLiteral("exportAction"));
     QVERIFY(action);
     QSignalSpy done(&w, &MainWindow::csvExportFinished);
-    const QRegularExpression defaultName(QStringLiteral("^pulsescope-\\d{8}-\\d{6}\\.csv$"));
+    const QRegularExpression defaultName(QStringLiteral("^bex-\\d{8}-\\d{6}\\.csv$"));
 
     { // No samples: no chooser, an explanation instead.
         FileDialogDriver drv([](QFileDialog* fd) { fd->reject(); });

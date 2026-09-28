@@ -3,7 +3,7 @@
 #include "core/metrics.h"
 
 #ifndef __linux__
-#error "PulseScope's sampler reads Linux /proc and /sys and only supports Linux."
+#error "bex's sampler reads Linux /proc and /sys and only supports Linux."
 #endif
 
 #include <algorithm>

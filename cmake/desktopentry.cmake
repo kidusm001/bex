@@ -1,7 +1,7 @@
 # Writes the desktop entry with an absolute, correctly escaped Exec path.
 # Runs at install time (so `cmake --install --prefix` is honoured) and from the
 # desktop_entry test. Inputs:
-#   PS_DESKTOP_IN       template containing @PULSESCOPE_EXEC@
+#   PS_DESKTOP_IN       template containing @BEX_EXEC@
 #   PS_DESKTOP_OUT      output file
 #   PS_BINDIR           CMAKE_INSTALL_BINDIR (relative to the prefix, or absolute)
 #   CMAKE_INSTALL_PREFIX
@@ -14,9 +14,9 @@ foreach(_var PS_DESKTOP_IN PS_DESKTOP_OUT PS_BINDIR CMAKE_INSTALL_PREFIX)
 endforeach()
 
 if(IS_ABSOLUTE "${PS_BINDIR}")
-    set(_exec "${PS_BINDIR}/pulsescope")
+    set(_exec "${PS_BINDIR}/bex")
 else()
-    set(_exec "${CMAKE_INSTALL_PREFIX}/${PS_BINDIR}/pulsescope")
+    set(_exec "${CMAKE_INSTALL_PREFIX}/${PS_BINDIR}/bex")
 endif()
 string(REGEX REPLACE "/+" "/" _exec "${_exec}")
 
@@ -48,5 +48,5 @@ set(_arg "\"${_arg}\"")
 string(REPLACE "\\" "\\\\" _arg "${_arg}")
 
 file(READ "${PS_DESKTOP_IN}" _desktop)
-string(REPLACE "@PULSESCOPE_EXEC@" "${_arg}" _desktop "${_desktop}")
+string(REPLACE "@BEX_EXEC@" "${_arg}" _desktop "${_desktop}")
 file(WRITE "${PS_DESKTOP_OUT}" "${_desktop}")

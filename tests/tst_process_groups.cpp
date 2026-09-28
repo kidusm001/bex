@@ -386,7 +386,7 @@ windows::ResultPtr failed(Status status, const char* detail, double time)
 struct WindowEnv {
     QTemporaryDir dir;
     std::shared_ptr<double> clock = std::make_shared<double>(100.0);
-    QString settings() const { return dir.filePath(QStringLiteral("pulsescope.ini")); }
+    QString settings() const { return dir.filePath(QStringLiteral("bex.ini")); }
     MainWindowOptions options(bool withClock = true) const
     {
         MainWindowOptions o;

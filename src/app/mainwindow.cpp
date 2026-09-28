@@ -768,8 +768,8 @@ MainWindow::MainWindow(MainWindowOptions options, QWidget* parent)
     : QMainWindow(parent)
     , m_options(std::move(options))
 {
-    setWindowTitle(QStringLiteral("PulseScope"));
-    setWindowIcon(pulseScopeIcon());
+    setWindowTitle(QStringLiteral("bex"));
+    setWindowIcon(bexIcon());
     setObjectName(QStringLiteral("mainWindow"));
     if (m_options.settingsFile.isEmpty())
         m_settings = std::make_unique<QSettings>();
@@ -901,7 +901,7 @@ bool MainWindow::shutdown(int timeoutMs)
             clean = false;
             // The worker cannot be cancelled inside a blocked write; say so
             // rather than let the export vanish silently.
-            qWarning("PulseScope: the CSV export to \"%s\" was still blocked at exit and was abandoned. That file is "
+            qWarning("bex: the CSV export to \"%s\" was still blocked at exit and was abandoned. That file is "
                      "either complete or unchanged; on a filesystem without unnamed temporary files a leftover "
                      "\"%s.XXXXXX\" temporary may remain beside it.",
                      qUtf8Printable(path), qUtf8Printable(QFileInfo(path).fileName()));
@@ -1049,7 +1049,7 @@ void MainWindow::buildActions()
     m_quitAction->setShortcutContext(Qt::ApplicationShortcut);
     connect(m_quitAction, &QAction::triggered, this, &QWidget::close);
 
-    m_aboutAction = new QAction(QStringLiteral("About PulseScope"), this);
+    m_aboutAction = new QAction(QStringLiteral("About bex"), this);
     connect(m_aboutAction, &QAction::triggered, this, &MainWindow::showAbout);
 
     m_detailsAction = new QAction(QStringLiteral("Details"), this);
@@ -2972,7 +2972,7 @@ QString MainWindow::endTaskBlocked(const std::optional<ps::endtask::Target>& tar
     if (!m_endTaskRunner)
         return m_endTaskUnavailable;
     if (m_shutdown)
-        return QStringLiteral("PulseScope is closing");
+        return QStringLiteral("bex is closing");
     if (isEndTaskPending())
         return QStringLiteral("An end task request is already open");
     if (!target)
@@ -2985,7 +2985,7 @@ QString MainWindow::endTaskBlocked(const std::optional<ps::endtask::Target>& tar
             return QStringLiteral("PID 1, the system's init process, is not ended from here");
         if (target->kernelThread)
             return QStringLiteral("Kernel threads cannot be ended");
-        return QStringLiteral("PulseScope does not end itself; quit it instead");
+        return QStringLiteral("bex does not end itself; quit it instead");
     case Outcome::NotOwned:
         return target->uidKnown ? QStringLiteral("Only your own processes can be ended")
                                 : QStringLiteral("Its owner is unknown, so it cannot be ended");
@@ -3539,7 +3539,7 @@ void MainWindow::exportCsvInteractive()
     QString dir = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
     if (dir.isEmpty())
         dir = QDir::homePath();
-    const QString name = QStringLiteral("pulsescope-%1.csv")
+    const QString name = QStringLiteral("bex-%1.csv")
                              .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")));
     const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export History as CSV"),
                                                       QDir(dir).filePath(name),
@@ -3553,14 +3553,14 @@ void MainWindow::exportCsvInteractive()
 void MainWindow::showAbout()
 {
     QMessageBox::about(
-        this, QStringLiteral("About PulseScope"),
-        QStringLiteral("<p><b>PulseScope %1</b></p>"
+        this, QStringLiteral("About bex"),
+        QStringLiteral("<p><b>bex %1</b></p>"
                        "<p>A native Linux performance monitor. It reads /proc and /sys locally; it needs no "
                        "privileges and sends nothing over the network. It changes nothing on the system, except "
                        "that End task signals one of your own processes after you confirm.</p>"
                        "<p>History is kept in memory for 15 minutes and discarded on exit unless exported.</p>"
                        "<p>Qt style: %2%3. %4</p>")
-            .arg(QStringLiteral(PULSESCOPE_VERSION),
+            .arg(QStringLiteral(BEX_VERSION),
                  (m_options.styleName.isEmpty() ? style()->name() : m_options.styleName).toHtmlEscaped(),
                  qApp->styleSheet().isEmpty() ? QString() : QStringLiteral(", with a style sheet"),
                  m_options.themeNote.toHtmlEscaped()));

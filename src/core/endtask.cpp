@@ -118,7 +118,7 @@ int openProc(int& err)
     return fd;
 }
 
-// nullopt if this /proc numbers processes as PulseScope's own PID namespace
+// nullopt if this /proc numbers processes as bex's own PID namespace
 // does: /proc/self is our PID, and its NSpid line has that single entry (the
 // procfs of an ancestor namespace lists one entry per level). Otherwise why
 // not, with err set for Failed.
@@ -131,7 +131,7 @@ std::optional<Outcome> foreignProc(int procfd, int selfPid, int& err)
         err = errno;
         if (err != ENOENT)
             return Outcome::Failed;
-        err = 0; // PulseScope is not visible in this /proc's namespace
+        err = 0; // bex is not visible in this /proc's namespace
         return Outcome::Unsupported;
     }
     const auto self = static_cast<std::size_t>(n) < sizeof buf
@@ -350,14 +350,14 @@ std::string describe(const Result& r, const Target& t, Signal signal)
             + ": the process was replaced or changed after it was listed." + none;
     case Outcome::NotOwned:
         if (!t.uidKnown)
-            return "The owner of " + who(t) + " is unknown, and PulseScope only ends your own processes." + none;
-        return who(t) + " belongs to another user, and PulseScope only ends your own processes." + none;
+            return "The owner of " + who(t) + " is unknown, and bex only ends your own processes." + none;
+        return who(t) + " belongs to another user, and bex only ends your own processes." + none;
     case Outcome::Protected:
         if (t.pid == 1)
             return "PID 1 is the system's init process and is not ended from here." + none;
         if (t.kernelThread || r.kernelThread)
             return who(t) + " is a kernel thread and cannot be ended." + none;
-        return who(t) + " is PulseScope itself; quit it instead." + none;
+        return who(t) + " is bex itself; quit it instead." + none;
     case Outcome::Invalid:
         return "The selected row has no usable process identity." + none;
     case Outcome::Denied:
@@ -368,7 +368,7 @@ std::string describe(const Result& r, const Target& t, Signal signal)
         if (r.error != 0)
             return "The system does not allow process file descriptors (pidfd) here: " + errorText(r.error) + "."
                 + none;
-        return "/proc does not match PulseScope's PID namespace, so " + who(t) + " cannot be matched safely."
+        return "/proc does not match bex's PID namespace, so " + who(t) + " cannot be matched safely."
             + none;
     case Outcome::Failed:
         break;

@@ -204,7 +204,7 @@ std::shared_ptr<ps::Snapshot> snapshot(double time, bool continuous, double load
 // Isolated settings file per window.
 struct Env {
     QTemporaryDir dir;
-    QString settings() const { return dir.filePath(QStringLiteral("pulsescope.ini")); }
+    QString settings() const { return dir.filePath(QStringLiteral("bex.ini")); }
     MainWindowOptions options() const
     {
         MainWindowOptions o;
@@ -330,9 +330,9 @@ void feed(MainWindow& w, double t0, int n, double step = 1.0)
 
 QString artifactDir()
 {
-    QString dir = qEnvironmentVariable("PULSESCOPE_ARTIFACT_DIR");
+    QString dir = qEnvironmentVariable("BEX_ARTIFACT_DIR");
     if (dir.isEmpty())
-        dir = QDir::temp().filePath(QStringLiteral("pulsescope-artifacts"));
+        dir = QDir::temp().filePath(QStringLiteral("bex-artifacts"));
     QDir().mkpath(dir);
     return dir;
 }
@@ -484,7 +484,7 @@ private Q_SLOTS:
 void TestUi::initTestCase()
 {
     QStandardPaths::setTestModeEnabled(true);
-    QCoreApplication::setOrganizationName(QStringLiteral("PulseScopeTest"));
+    QCoreApplication::setOrganizationName(QStringLiteral("bexTest"));
     QCoreApplication::setApplicationName(QStringLiteral("tst_ui"));
 }
 
@@ -3584,7 +3584,7 @@ void TestUi::themeProbeFindsConfigAndPlugin()
     qputenv("QT_PLUGIN_PATH", dir.filePath(QStringLiteral("plugins")).toLocal8Bit());
     qunsetenv("QT_QPA_PLATFORMTHEME");
 
-    const char* plain[] = {"pulsescope", "--page", "cpu"};
+    const char* plain[] = {"bex", "--page", "cpu"};
     auto env = cli::probeThemeEnvironment(3, plain);
     QVERIFY(!env.themeArgument);
     QVERIFY(env.platformThemeVariable.isEmpty());
@@ -3600,9 +3600,9 @@ void TestUi::themeProbeFindsConfigAndPlugin()
     QCOMPARE(env.qt6ctConfig, conf.fileName());
     QCOMPARE(env.qt6ctPlugin, lib.fileName());
 
-    const char* explicitTheme[] = {"pulsescope", "-platformtheme", "xdgdesktopportal"};
+    const char* explicitTheme[] = {"bex", "-platformtheme", "xdgdesktopportal"};
     QVERIFY(cli::probeThemeEnvironment(3, explicitTheme).themeArgument);
-    const char* joined[] = {"pulsescope", "--platformtheme=gtk3"};
+    const char* joined[] = {"bex", "--platformtheme=gtk3"};
     QVERIFY(cli::probeThemeEnvironment(2, joined).themeArgument);
     qputenv("QT_QPA_PLATFORMTHEME", "gtk3");
     QCOMPARE(cli::probeThemeEnvironment(3, plain).platformThemeVariable, QStringLiteral("gtk3"));
@@ -3614,16 +3614,16 @@ void TestUi::themeProbeFindsConfigAndPlugin()
     QCOMPARE(env.platformThemeVariable, QStringLiteral("gtk3"));
     QCOMPARE(env.themeArgumentValue, QStringLiteral("xdgdesktopportal"));
     QVERIFY(cli::chooseTheme(env).note.contains(QStringLiteral("overrides QT_QPA_PLATFORMTHEME (gtk3)")));
-    const char* twice[] = {"pulsescope", "--platformtheme", "gtk3", "--page", "cpu", "-platformtheme", "qt6ct"};
+    const char* twice[] = {"bex", "--platformtheme", "gtk3", "--page", "cpu", "-platformtheme", "qt6ct"};
     env = cli::probeThemeEnvironment(7, twice);
     QVERIFY(env.themeArgument);
     QCOMPARE(env.themeArgumentValue, QStringLiteral("qt6ct"));
     QVERIFY(cli::probeThemeEnvironment(2, joined).themeArgumentValue.isEmpty());
-    const char* consumed[] = {"pulsescope", "-qwindowtitle", "-platformtheme", "--platform", "-platformtheme"};
+    const char* consumed[] = {"bex", "-qwindowtitle", "-platformtheme", "--platform", "-platformtheme"};
     env = cli::probeThemeEnvironment(5, consumed);
     QVERIFY(!env.themeArgument);
     QVERIFY(env.themeArgumentValue.isEmpty());
-    const char* trailing[] = {"pulsescope", "-platformtheme"};
+    const char* trailing[] = {"bex", "-platformtheme"};
     env = cli::probeThemeEnvironment(2, trailing);
     QVERIFY(env.themeArgument);
     QVERIFY(env.themeArgumentValue.isEmpty());
@@ -3631,16 +3631,16 @@ void TestUi::themeProbeFindsConfigAndPlugin()
     QVERIFY(cli::chooseTheme(env).note.startsWith(QStringLiteral("Platform theme from QT_QPA_PLATFORMTHEME (gtk3)")));
 
     // An explicit empty name replaces the variable's.
-    const char* empty[] = {"pulsescope", "-platformtheme", "", "--theme-info"};
+    const char* empty[] = {"bex", "-platformtheme", "", "--theme-info"};
     env = cli::probeThemeEnvironment(4, empty);
     QVERIFY(env.themeArgument && env.themeArgumentCleared && env.themeArgumentValue.isEmpty());
     QVERIFY2(!cli::chooseTheme(env).note.contains(QStringLiteral("from QT_QPA_PLATFORMTHEME")),
              qPrintable(cli::chooseTheme(env).note));
-    const char* emptyThenName[] = {"pulsescope", "-platformtheme", "", "-platformtheme", "qt6ct"};
+    const char* emptyThenName[] = {"bex", "-platformtheme", "", "-platformtheme", "qt6ct"};
     env = cli::probeThemeEnvironment(5, emptyThenName);
     QVERIFY(!env.themeArgumentCleared);
     QCOMPARE(env.themeArgumentValue, QStringLiteral("qt6ct"));
-    const char* nameThenEmpty[] = {"pulsescope", "--platformtheme", "qt6ct", "--platformtheme", ""};
+    const char* nameThenEmpty[] = {"bex", "--platformtheme", "qt6ct", "--platformtheme", ""};
     env = cli::probeThemeEnvironment(5, nameThenEmpty);
     QVERIFY(env.themeArgumentCleared && env.themeArgumentValue.isEmpty());
 
@@ -3665,7 +3665,7 @@ void TestUi::themeProbeFindsConfigAndPlugin()
         bool uncertain;
     };
     auto expect = [](std::initializer_list<const char*> args, Reading want, const char* what) {
-        std::vector<const char*> argv {"pulsescope"};
+        std::vector<const char*> argv {"bex"};
         argv.insert(argv.end(), args.begin(), args.end());
         const auto got = cli::probeThemeEnvironment(static_cast<int>(argv.size()), argv.data());
         const QString problem = QStringLiteral("%1: argument %2, value \"%3\", uncertain %4")
@@ -3704,7 +3704,7 @@ void TestUi::themeProbeFindsConfigAndPlugin()
            "unknown start, -platform wayland first");
     use({"offscreen", nullptr, nullptr, nullptr});
     expect({"-title", "-platformtheme", "gtk3"}, {true, "gtk3", false}, "QT_QPA_PLATFORM=offscreen");
-    const char* unknown[] = {"pulsescope", "-title", "-platformtheme", "gtk3"};
+    const char* unknown[] = {"bex", "-title", "-platformtheme", "gtk3"};
     use({nullptr, nullptr, nullptr, nullptr});
     const auto d = cli::chooseTheme(cli::probeThemeEnvironment(4, unknown));
     QVERIFY(!d.requestQt6ct);

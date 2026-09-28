@@ -79,7 +79,7 @@ Collector::Collector(ps::SamplerOptions options, QObject* parent)
 {
     qRegisterMetaType<ps::SnapshotPtr>();
     m_thread = new QThread; // deliberately unparented, see stop()
-    m_thread->setObjectName(QStringLiteral("pulsescope-collector"));
+    m_thread->setObjectName(QStringLiteral("bex-collector"));
     auto* worker = new CollectorWorker(std::move(options), m_link);
     worker->moveToThread(m_thread);
     m_worker = worker;
@@ -234,7 +234,7 @@ bool Collector::stop(int timeoutMs)
             // connection made in the constructor). The QThread object, which lives on this
             // thread, is then deleted by this thread's event loop. The worker
             // only references its own state and the shared link.
-            qWarning("PulseScope: collector thread did not stop within %d ms; abandoning it", timeoutMs);
+            qWarning("bex: collector thread did not stop within %d ms; abandoning it", timeoutMs);
             QThread* thread = m_thread;
             m_worker = nullptr;
             m_thread = nullptr;

@@ -16,7 +16,7 @@ bool startsWith(std::string_view s, std::string_view prefix)
 }
 
 // Parses the value part of a "Key:   123 kB" line, returning bytes. The kernel
-// prints every field PulseScope reads with the " kB" unit, so a value without
+// prints every field bex reads with the " kB" unit, so a value without
 // it (truncated or corrupted input) is rejected instead of read as bytes.
 std::optional<uint64_t> kbValue(std::string_view rest)
 {

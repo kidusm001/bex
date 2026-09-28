@@ -663,7 +663,7 @@ struct UiEnv {
     {
         MainWindowOptions o;
         o.startCollector = false;
-        o.settingsFile = dir.filePath(QStringLiteral("pulsescope.ini"));
+        o.settingsFile = dir.filePath(QStringLiteral("bex.ini"));
         o.windowProbe.enabled = false;
         o.clock = [] { return 100.0; };
         if (withFake)
@@ -1111,7 +1111,7 @@ void TestEndTaskAdversarial::refusedBeforeOpening_data()
     QTest::addColumn<QString>("which");
     QTest::addColumn<int>("expected");
     QTest::newRow("PID 1") << QStringLiteral("pid1") << int(Outcome::Protected);
-    QTest::newRow("PulseScope itself") << QStringLiteral("self") << int(Outcome::Protected);
+    QTest::newRow("bex itself") << QStringLiteral("self") << int(Outcome::Protected);
     QTest::newRow("listed as kernel thread") << QStringLiteral("kthread") << int(Outcome::Protected);
     QTest::newRow("owner unknown") << QStringLiteral("unknown") << int(Outcome::NotOwned);
     QTest::newRow("listed other owner") << QStringLiteral("other") << int(Outcome::NotOwned);

@@ -417,7 +417,7 @@ int childCollector()
             // A stopped collector must not retry once threads can start again.
             limit.restore();
             pump(1500);
-            if (threadsNamed("pulsescope-coll") != 0 || snapshots != 0)
+            if (threadsNamed("bex-collector") != 0 || snapshots != 0)
                 childFail("a stopped collector started its thread or delivered a snapshot after the limit was lifted");
             c.reset();
         } catch (const std::exception& e) {
@@ -505,7 +505,7 @@ int childWindowProbe()
             const int before = results;
             limit.restore();
             pump(1500);
-            if (threadsNamed("pulsescope-wind") != 0 || results != before)
+            if (threadsNamed("bex-windows") != 0 || results != before)
                 childFail("a stopped window probe started its thread or delivered a result after the limit was lifted");
             p.reset();
         } catch (const std::exception& e) {
@@ -588,7 +588,7 @@ int childCollectorRetry()
         pump(100);
         limit.restore();
         pump(2500);
-        if (c.isRunning() || threadsNamed("pulsescope-coll") != 0)
+        if (c.isRunning() || threadsNamed("bex-collector") != 0)
             childFail("a paused collector retried its thread start");
         if (snapshots != 0)
             childFail("a paused collector delivered " + std::to_string(snapshots) + " snapshots");
@@ -619,7 +619,7 @@ int childCollectorRetry()
         if (snapshots < 3)
             childFail("only " + std::to_string(snapshots) + " snapshots in 1.5 s at 250 ms");
         checkIncreasing(seqs, "collector");
-        const int threads = threadsNamed("pulsescope-coll");
+        const int threads = threadsNamed("bex-collector");
         if (threads == 0)
             childInfo("thread names unavailable; worker count not checked");
         else if (threads != 1)
@@ -676,7 +676,7 @@ int childWindowProbeRetry()
         const size_t pausedAt = results.size();
         limit.restore();
         pump(2500);
-        if (p.isRunning() || threadsNamed("pulsescope-wind") != 0)
+        if (p.isRunning() || threadsNamed("bex-windows") != 0)
             childFail("a paused window probe retried its thread start");
         if (results.size() != pausedAt)
             childFail("a paused window probe delivered " + std::to_string(results.size() - pausedAt) + " results");
@@ -720,7 +720,7 @@ int childWindowProbeRetry()
         if (seqs.size() < 3)
             childFail("only " + std::to_string(seqs.size()) + " results in 1.5 s at 100 ms");
         checkIncreasing(seqs, "window probe");
-        const int threads = threadsNamed("pulsescope-wind");
+        const int threads = threadsNamed("bex-windows");
         if (threads == 0)
             childInfo("thread names unavailable; worker count not checked");
         else if (threads != 1)
@@ -1294,7 +1294,7 @@ void TestCouncil::detailsCoreChartsStayHonest()
     auto clock = std::make_shared<double>(100.0);
     MainWindowOptions o;
     o.startCollector = false;
-    o.settingsFile = dir.filePath(QStringLiteral("pulsescope.ini"));
+    o.settingsFile = dir.filePath(QStringLiteral("bex.ini"));
     o.windowProbe.enabled = false;
     o.initialIntervalMs = 1000;
     o.clock = [clock] { return *clock; };
@@ -1447,7 +1447,7 @@ struct QuietWindow {
     {
         MainWindowOptions o;
         o.startCollector = false;
-        o.settingsFile = dir.filePath(QStringLiteral("pulsescope.ini"));
+        o.settingsFile = dir.filePath(QStringLiteral("bex.ini"));
         o.windowProbe.enabled = false;
         o.initialIntervalMs = intervalMs;
         auto c = clock;
@@ -1456,7 +1456,7 @@ struct QuietWindow {
     }
     QVariant saved(const QString& key) const
     {
-        QSettings s(dir.filePath(QStringLiteral("pulsescope.ini")), QSettings::IniFormat);
+        QSettings s(dir.filePath(QStringLiteral("bex.ini")), QSettings::IniFormat);
         return s.value(key);
     }
 };
@@ -1793,7 +1793,7 @@ int childMainWindowStartup()
     QTemporaryDir dir;
     MainWindowOptions o;
     o.sampler = fixtureOptions(r);
-    o.settingsFile = dir.filePath(QStringLiteral("pulsescope.ini"));
+    o.settingsFile = dir.filePath(QStringLiteral("bex.ini"));
     o.initialIntervalMs = 500;
     o.windowProbe.enabled = false;
     ThreadLimit limit;

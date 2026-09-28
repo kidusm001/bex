@@ -2893,7 +2893,7 @@ QString appPath()
     const QString env = qEnvironmentVariable("PS_GU_APP");
     if (!env.isEmpty())
         return env;
-    const QString sibling = QCoreApplication::applicationDirPath() + QStringLiteral("/pulsescope");
+    const QString sibling = QCoreApplication::applicationDirPath() + QStringLiteral("/bex");
     return QFileInfo(sibling).isExecutable() ? sibling : QString();
 }
 QByteArray fileHash(const QString& path)
@@ -3042,7 +3042,7 @@ void TestGraphUpgrade::cliThemeProbeReadsArgumentsAsQt()
     // environment variable: the variable is set on the probed value only).
     QFETCH(QStringList, args);
     QFETCH(QString, expected);
-    std::vector<QByteArray> storage {QByteArrayLiteral("pulsescope")};
+    std::vector<QByteArray> storage {QByteArrayLiteral("bex")};
     for (const QString& a : args)
         storage.push_back(a.toLocal8Bit());
     std::vector<const char*> argv;

@@ -39,7 +39,7 @@ QPixmap renderIcon(int size)
 
 } // namespace
 
-QIcon pulseScopeIcon()
+QIcon bexIcon()
 {
     QIcon icon;
     for (int size : {16, 22, 24, 32, 48, 64, 128, 256})
