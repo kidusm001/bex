@@ -289,6 +289,18 @@ private:
     QSize m_layoutSize;
     bool m_layoutValid = false;
 
+    // Cached per-window sample stats and range to avoid re-scanning history on
+    // every 60 Hz scroll frame when the history and visible window start are unchanged.
+    bool m_statsValid = false;
+    const ps::History* m_statsHistory = nullptr;
+    uint64_t m_statsSamples = 0;
+    std::size_t m_statsSize = 0;
+    double m_statsLatest = ps::kNaN;
+    std::size_t m_statsFirst = 0;
+    int m_statsPainted = 0;
+    bool m_statsMoving = false;
+    Range m_statsRange;
+
     bool m_revealEnabled = false;
     double m_seenLatest = ps::kNaN; // newest sample time already known
     double m_revealFrom = ps::kNaN; // predecessor time of the sample being revealed

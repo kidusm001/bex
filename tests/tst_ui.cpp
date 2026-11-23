@@ -29,6 +29,7 @@
 #include <QMouseEvent>
 #include <QMessageBox>
 #include <QPaintEvent>
+#include <QPainter>
 #include <QProcess>
 #include <QProxyStyle>
 #include <QRegularExpression>
@@ -479,6 +480,9 @@ private Q_SLOTS:
     void detailsScrollInsteadOfSqueezing();
     void shortChartsKeepAxisLabelsApart();
     void timeAxisLabelsNeverTouch();
+    void metricButtonKeepsContrastOnTranslucentSelection();
+    void firstRunSensorsIncludeHottest();
+    void aboutDialogIsNonBlockingAndClosesOnShutdown();
 };
 
 void TestUi::initTestCase()
@@ -4940,6 +4944,114 @@ void TestUi::threadStartFailureIsShownAndRecovers()
         QSKIP("RLIMIT_NPROC does not stop thread creation for this user");
     QVERIFY2(child.exitStatus() == QProcess::NormalExit && child.exitCode() == 0 && !out.contains(QLatin1String("FAIL: ")),
              qPrintable(QStringLiteral("exit %1:\n%2").arg(child.exitCode()).arg(out)));
+}
+
+namespace {
+// Simulates a translucent-selection theme (like Kvantum Catppuccin Mocha):
+// QPalette::HighlightedText is dark (intended for solid Highlight), while
+// PE_PanelItemViewItem actually paints a dark translucent overlay over Window.
+class TranslucentSelectionStyle : public QProxyStyle {
+public:
+    TranslucentSelectionStyle()
+        : QProxyStyle(QStyleFactory::create(QStringLiteral("Fusion")))
+    {
+    }
+    void drawPrimitive(PrimitiveElement element, const QStyleOption* option, QPainter* p,
+                       const QWidget* w) const override
+    {
+        if (element == PE_PanelItemViewItem && (option->state & State_Selected)) {
+            p->fillRect(option->rect, QColor(0x40, 0x39, 0x55));
+            return;
+        }
+        QProxyStyle::drawPrimitive(element, option, p, w);
+    }
+};
+} // namespace
+
+void TestUi::metricButtonKeepsContrastOnTranslucentSelection()
+{
+    TranslucentSelectionStyle style;
+    MetricButton b(QStringLiteral("CPU"));
+    b.setStyle(&style);
+    QPalette pal = b.palette();
+    pal.setColor(QPalette::Window, QColor(0x1e, 0x1e, 0x2e));
+    pal.setColor(QPalette::WindowText, QColor(0xcd, 0xd6, 0xf4));
+    pal.setColor(QPalette::Highlight, QColor(0xcb, 0xa6, 0xf7));
+    pal.setColor(QPalette::HighlightedText, QColor(0x18, 0x18, 0x25));
+    b.setPalette(pal);
+    b.setValueText(QStringLiteral("42.0 %"));
+    b.setChecked(true);
+    b.resize(240, b.sizeHint().height());
+    const QImage img = b.grab().toImage().convertToFormat(QImage::Format_RGB32);
+    // Bright text pixels (from WindowText fallback) must appear on the dark
+    // translucent selection panel rather than dark-on-dark HighlightedText.
+    int bright = 0;
+    for (int y = 0; y < img.height(); ++y)
+        for (int x = 0; x < img.width(); ++x)
+            if (img.pixelColor(x, y).lightness() > 160)
+                ++bright;
+    QVERIFY2(bright > 50, qPrintable(QStringLiteral("only %1 bright text pixels on selected dark panel").arg(bright)));
+}
+
+void TestUi::firstRunSensorsIncludeHottest()
+{
+    Env env;
+    MainWindow w(env.options());
+    auto s = snapshot(10, false);
+    s->temperatures.clear();
+    // 8 sensors where the 7th and 8th are hottest: first-run auto-selection
+    // (up to 6 sensors) must include the hottest sensor shown in the headline.
+    auto makeTemp = [](const std::string& key, const std::string& chip, const std::string& label, double c) {
+        ps::TemperatureReading t;
+        t.key = key;
+        t.chip = chip;
+        t.label = label;
+        t.displayName = chip + " " + label;
+        t.celsius = c;
+        return t;
+    };
+    for (int i = 0; i < 6; ++i)
+        s->temperatures.push_back(makeTemp("hwmon:nvme" + std::to_string(i), "nvme", "temp" + std::to_string(i), 40.0 + i));
+    s->temperatures.push_back(makeTemp("hwmon:cpu:temp1", "k10temp", "Tctl", 82.0));
+    s->temperatures.push_back(makeTemp("hwmon:gpu:temp1", "amdgpu", "edge", 71.0));
+    w.applySnapshot(s);
+    auto* list = child<QTreeWidget>(w, "sensorList");
+    QCOMPARE(list->topLevelItemCount(), 8);
+    int checked = 0;
+    bool cpuChecked = false, gpuChecked = false;
+    for (int i = 0; i < list->topLevelItemCount(); ++i) {
+        const auto* item = list->topLevelItem(i);
+        if (item->checkState(0) == Qt::Checked) {
+            ++checked;
+            const QString key = item->data(0, Qt::UserRole).toString();
+            cpuChecked = cpuChecked || key == QStringLiteral("hwmon:cpu:temp1");
+            gpuChecked = gpuChecked || key == QStringLiteral("hwmon:gpu:temp1");
+        }
+    }
+    QCOMPARE(checked, 6);
+    QVERIFY2(cpuChecked, "hottest CPU sensor was not checked on first run");
+    QVERIFY2(gpuChecked, "second hottest GPU sensor was not checked on first run");
+}
+
+void TestUi::aboutDialogIsNonBlockingAndClosesOnShutdown()
+{
+    Env env;
+    MainWindow w(env.options());
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    QAction* about = nullptr;
+    for (auto* a : w.findChildren<QAction*>())
+        if (a->text() == QStringLiteral("About bex"))
+            about = a;
+    QVERIFY(about);
+    // Non-blocking: triggering About returns immediately without a nested exec().
+    about->trigger();
+    auto* box = w.findChild<QMessageBox*>(QStringLiteral("aboutBox"));
+    QVERIFY(box);
+    QVERIFY(box->isVisible());
+    QVERIFY(w.shutdown(2000));
+    QVERIFY(!box->isVisible());
+    w.close();
 }
 
 int main(int argc, char** argv)

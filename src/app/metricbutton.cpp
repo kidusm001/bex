@@ -3,6 +3,7 @@
 #include "app/timechart.h"
 
 #include <QEvent>
+#include <QImage>
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPainterPath>
@@ -18,13 +19,30 @@ constexpr int kPadX = 10;
 constexpr int kPadY = 7;
 constexpr int kSparkW = 64;
 
+double linearChannel(double c)
+{
+    return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
+}
+
+double relativeLuminance(const QColor& c)
+{
+    return 0.2126 * linearChannel(c.redF()) + 0.7152 * linearChannel(c.greenF()) + 0.0722 * linearChannel(c.blueF());
+}
+
+double contrastRatio(const QColor& a, const QColor& b)
+{
+    const double la = relativeLuminance(a);
+    const double lb = relativeLuminance(b);
+    return (std::max(la, lb) + 0.05) / (std::min(la, lb) + 0.05);
+}
+
 QFont valueFont(const QFont& base)
 {
     QFont f = base;
     if (f.pointSizeF() > 0)
         f.setPointSizeF(f.pointSizeF() * 1.3);
-    else
-        f.setPixelSize(static_cast<int>(f.pixelSize() * 1.3));
+    else if (f.pixelSize() > 0)
+        f.setPixelSize(std::max(1, static_cast<int>(std::lround(f.pixelSize() * 1.3))));
     f.setWeight(QFont::DemiBold);
     return f;
 }
@@ -41,6 +59,8 @@ QFont smallFont(const QFont& base)
     QFont f = base;
     if (f.pointSizeF() > 0)
         f.setPointSizeF(f.pointSizeF() * 0.9);
+    else if (f.pixelSize() > 0)
+        f.setPixelSize(std::max(1, static_cast<int>(std::lround(f.pixelSize() * 0.9))));
     return f;
 }
 } // namespace
@@ -198,10 +218,47 @@ void MetricButton::changeEvent(QEvent* event)
 {
     if (event->type() == QEvent::PaletteChange || event->type() == QEvent::FontChange ||
         event->type() == QEvent::StyleChange) {
+        m_contrastValid = false;
         updateGeometry();
         update();
     }
     QAbstractButton::changeEvent(event);
+}
+
+QColor MetricButton::selectedTextColor(const QStyleOptionViewItem& opt, QPalette::ColorGroup group) const
+{
+    const QPalette& pal = opt.palette;
+    const QStyle* st = style();
+    const bool down = isDown();
+    if (m_contrastValid && m_contrastStyle == st && m_contrastPaletteKey == pal.cacheKey()
+        && m_contrastGroup == group && m_contrastDown == down)
+        return m_contrastColor;
+    // Some styles (e.g. Kvantum themes with translucent selection panels) paint
+    // PE_PanelItemViewItem much darker or lighter than QPalette::Highlight,
+    // leaving QPalette::HighlightedText with poor contrast. Probe the actual
+    // rendered panel once per style/palette/state change and fall back to
+    // WindowText when HighlightedText would be unreadable.
+    QImage probe(16, 16, QImage::Format_ARGB32_Premultiplied);
+    probe.fill(pal.color(QPalette::Window));
+    QStyleOptionViewItem probeOpt = opt;
+    probeOpt.rect = probe.rect();
+    probeOpt.state &= ~QStyle::State_MouseOver;
+    {
+        QPainter qp(&probe);
+        st->drawPrimitive(QStyle::PE_PanelItemViewItem, &probeOpt, &qp, this);
+    }
+    const QColor bg = probe.pixelColor(8, 8);
+    const QColor hiText = pal.color(group, QPalette::HighlightedText);
+    const QColor winText = pal.color(group, QPalette::WindowText);
+    const double hiContrast = contrastRatio(hiText, bg);
+    const double winContrast = contrastRatio(winText, bg);
+    m_contrastColor = (hiContrast < 3.0 && winContrast > hiContrast) ? winText : hiText;
+    m_contrastStyle = st;
+    m_contrastPaletteKey = pal.cacheKey();
+    m_contrastGroup = group;
+    m_contrastDown = down;
+    m_contrastValid = true;
+    return m_contrastColor;
 }
 
 void MetricButton::paintEvent(QPaintEvent* event)
@@ -233,7 +290,7 @@ void MetricButton::paintEvent(QPaintEvent* event)
 
     const QPalette::ColorGroup group = !isEnabled() ? QPalette::Disabled
                                                     : (isActiveWindow() ? QPalette::Active : QPalette::Inactive);
-    const QColor text = selected ? pal.color(group, QPalette::HighlightedText) : pal.color(QPalette::WindowText);
+    const QColor text = selected ? selectedTextColor(opt, group) : pal.color(QPalette::WindowText);
     QColor muted = pal.color(QPalette::PlaceholderText);
     if (selected) {
         muted = text;
@@ -274,7 +331,7 @@ void MetricButton::paintEvent(QPaintEvent* event)
     const QFontMetrics valueFm(valueDrawFont);
     const int valueW = sparkBesideValue && hasSpark ? besideW : textW;
 
-    const QRect titleRect(x, y, textW - kSparkW - 6, fm.height());
+    const QRect titleRect(x, y, hasSpark ? besideW : textW, fm.height());
     if (dirty.intersects(titleRect)) {
         p.setPen(text);
         p.setFont(base);

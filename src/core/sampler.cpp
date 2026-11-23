@@ -258,15 +258,20 @@ FsStats fsStatsFrom(const struct statvfs& st)
 
 std::string defaultUserName(uint32_t uid)
 {
-    long size = ::sysconf(_SC_GETPW_R_SIZE_MAX);
-    if (size <= 0)
-        size = 16384;
-    std::vector<char> buf(static_cast<std::size_t>(size));
-    passwd pw {};
-    passwd* result = nullptr;
-    if (::getpwuid_r(uid, &pw, buf.data(), buf.size(), &result) == 0 && result && result->pw_name)
-        return parse::sanitize(result->pw_name);
-    return std::to_string(uid);
+    const long init = ::sysconf(_SC_GETPW_R_SIZE_MAX);
+    std::size_t size = init > 0 ? static_cast<std::size_t>(init) : 16384;
+    constexpr std::size_t kMaxBuf = std::size_t(1) << 20;
+    for (;;) {
+        std::vector<char> buf(size);
+        passwd pw {};
+        passwd* result = nullptr;
+        const int rc = ::getpwuid_r(uid, &pw, buf.data(), buf.size(), &result);
+        if (rc == 0)
+            return (result && result->pw_name) ? parse::sanitize(result->pw_name) : std::to_string(uid);
+        if (rc != ERANGE || size >= kMaxBuf)
+            return std::to_string(uid);
+        size = std::min(size * 2, kMaxBuf);
+    }
 }
 
 // One component of a colon-separated sensor key. escapeName is injective and
@@ -284,13 +289,18 @@ std::string keyPart(std::string_view s)
     return out;
 }
 
+std::string errorMessage(int err)
+{
+    return std::error_code(err, std::generic_category()).message();
+}
+
 std::string errnoText(int err)
 {
     if (err == kErrMountChanged)
         return "mount changed while measuring";
     if (err == kErrNoMountId)
         return "cannot verify which filesystem is mounted here; capacity not read";
-    return err == EACCES || err == EPERM ? "permission denied" : std::strerror(err);
+    return err == EACCES || err == EPERM ? "permission denied" : errorMessage(err);
 }
 
 } // namespace
@@ -959,6 +969,7 @@ void Sampler::prepareFilesystems(Snapshot& s, double now)
             for (const auto& c : candidates) {
                 if (c.group == g) {
                     fs.mountPoints.push_back(table[c.entry].mountPoint);
+                    fs.readOnly = table[c.entry].readOnly();
                     fs.error = c.skipReason;
                     break;
                 }
@@ -971,6 +982,7 @@ void Sampler::prepareFilesystems(Snapshot& s, double now)
         for (const auto& c : candidates) {
             const auto& e = table[c.entry];
             if (c.group == g && e.mountPoint == t.id.path && c.skipReason.empty()) {
+                fs.readOnly = e.readOnly();
                 t.id.mountId = e.id;
                 t.id.major = e.major;
                 t.id.minor = e.minor;
@@ -1030,7 +1042,7 @@ void Sampler::finishFilesystems(Snapshot& s, double now, double expectedInterval
             if (stuck)
                 fs.error = "not responding (capacity check blocked)";
             else if (const int err = m_prober->startError())
-                fs.error = std::string("capacity check could not start (") + std::strerror(err) + ")";
+                fs.error = "capacity check could not start (" + errorMessage(err) + ")";
             else
                 fs.error = "measuring";
             continue;

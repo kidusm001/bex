@@ -38,6 +38,7 @@ class QSplitter;
 class QTreeWidget;
 class QWindow;
 class CoreGrid;
+class FactGrid;
 class HeadRow;
 class MetricButton;
 class TimeChart;
@@ -298,6 +299,7 @@ private:
     QPushButton* m_endTaskButton = nullptr;
     QAction* m_endTaskAction = nullptr;
     QPointer<QMessageBox> m_endTaskBox; // open confirmation
+    QPointer<QMessageBox> m_aboutBox;
     EndTaskRunner* m_endTaskRunner = nullptr;
     QString m_endTaskUnavailable; // why there is no backend
     // Window owners: the newest successful list and the newest failure
@@ -318,6 +320,7 @@ private:
 
     // Fact labels by page, keyed by a stable id.
     std::vector<std::pair<std::string, QLabel*>> m_facts;
+    std::vector<FactGrid*> m_factGrids;
     QLabel* fact(const std::string& id) const;
 
     // Glance view and animation.

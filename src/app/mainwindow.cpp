@@ -447,6 +447,8 @@ protected:
 // "Name: value" pairs in up to `columns` pairs per row. Narrow windows (a
 // tiled half screen, a large system font) get fewer pairs per row instead of
 // clipped numbers: the minimum width is a single pair.
+} // namespace
+
 class FactGrid : public QWidget {
 public:
     FactGrid(int columns, QWidget* parent)
@@ -469,6 +471,14 @@ public:
         m_pairs.push_back({name, value, 0});
         m_columns = 0;
         place(m_maxColumns);
+    }
+
+    void resetWidths()
+    {
+        for (auto& p : m_pairs)
+            p.widest = 0;
+        m_columns = 0;
+        place(columnsFor(width()));
     }
 
     bool hasHeightForWidth() const override { return true; }
@@ -581,6 +591,8 @@ private:
     QGridLayout* m_grid;
     std::vector<Pair> m_pairs;
 };
+
+namespace {
 
 void addFactPair(FactGrid* grid, const QString& name, QLabel* value, const QString& tip)
 {
@@ -907,9 +919,12 @@ bool MainWindow::shutdown(int timeoutMs)
                      qUtf8Printable(path), qUtf8Printable(QFileInfo(path).fileName()));
         }
     }
-    // An open confirmation is dropped unanswered. A confirmed request is
-    // normally done in microseconds; one still blocked in the kernel is left
-    // to finish on its own, without showing its result.
+    // Any open confirmation or About dialog is closed.
+    if (m_aboutBox) {
+        m_aboutBox->hide();
+        m_aboutBox->deleteLater();
+        m_aboutBox = nullptr;
+    }
     if (m_endTaskBox) {
         m_endTaskBox->hide();
         m_endTaskBox->deleteLater();
@@ -1199,6 +1214,7 @@ QWidget* MainWindow::buildCpuPage()
     v->addWidget(buildHeadline(CpuPage, QStringLiteral("cpu"), page));
 
     auto* grid = new FactGrid(4, page);
+    m_factGrids.push_back(grid);
     const QString convention = QStringLiteral("Percent of all logical CPUs together: 100% means every CPU is busy.");
     struct F { const char* id; const char* name; QString tip; };
     const F fs[] = {
@@ -1262,6 +1278,7 @@ QWidget* MainWindow::buildMemoryPage()
     v->addWidget(buildHeadline(MemoryPage, QStringLiteral("memory"), page));
 
     auto* grid = new FactGrid(4, page);
+    m_factGrids.push_back(grid);
     struct F { const char* id; const char* name; QString tip; };
     const F fs[] = {
         {"mem.total", "Total", QStringLiteral("MemTotal: usable RAM")},
@@ -1329,6 +1346,7 @@ QWidget* MainWindow::buildDiskPage()
     v->addWidget(buildHeadline(DiskPage, QStringLiteral("disk"), page));
 
     auto* grid = new FactGrid(4, page);
+    m_factGrids.push_back(grid);
     struct F { const char* id; const char* name; QString tip; };
     const F fs[] = {
         {"disk.read", "Read", {}},
@@ -1407,6 +1425,7 @@ QWidget* MainWindow::buildNetworkPage()
     v->addWidget(buildHeadline(NetworkPage, QStringLiteral("net"), page));
 
     auto* grid = new FactGrid(4, page);
+    m_factGrids.push_back(grid);
     struct F { const char* id; const char* name; };
     const F fs[] = {{"net.rx", "Receive"}, {"net.tx", "Transmit"}, {"net.state", "State"}, {"net.kind", "Type"}};
     for (const auto& f : fs) {
@@ -2013,6 +2032,20 @@ void MainWindow::applyScaledFonts()
     if (m_navPanel)
         m_navPanel->setFixedWidth(navWidth);
     m_sensorList->setMinimumWidth(sensorListMinimumWidth(m_sensorList));
+    const QFontMetrics fm(base);
+    if (m_fsTable) {
+        m_fsTable->setColumnWidth(0, fm.horizontalAdvance(QStringLiteral("/home/user/mount")) + 24);
+        m_fsTable->setColumnWidth(1, fm.horizontalAdvance(QStringLiteral("/dev/nvme0n1p3")) + 24);
+        m_fsTable->setColumnWidth(2, fm.horizontalAdvance(QStringLiteral("btrfs")) + 24);
+        for (int c = 3; c <= 5; ++c)
+            m_fsTable->setColumnWidth(c, fm.horizontalAdvance(QStringLiteral("1000 GiB")) + 24);
+    }
+    if (m_procTable) {
+        m_procNameMinWidth = 2 * m_procTable->indentation() + fm.horizontalAdvance(QStringLiteral("gnome-shell")) + 28;
+        fitProcessNameColumn();
+    }
+    for (auto* grid : m_factGrids)
+        grid->resetWidths();
     for (auto* head : m_head)
         if (head)
             head->reflow();
@@ -2329,11 +2362,19 @@ void MainWindow::updateSensorList(const ps::Snapshot& s)
         same = m_sensorList->topLevelItem(i)->data(0, Qt::UserRole).toString()
             == entries[static_cast<std::size_t>(i)].key;
     if (!same) {
-        // First run without a saved choice: plot up to six sensors that read.
+        // First run without a saved choice: plot up to six sensors that read,
+        // hottest first so the headline sensor is always plotted.
         if (!m_sensorsChosen && m_wantedSensors.isEmpty()) {
+            std::vector<const ps::TemperatureReading*> valid;
+            valid.reserve(s.temperatures.size());
             for (const auto& t : s.temperatures)
-                if (ps::isValid(t.celsius) && m_wantedSensors.size() < 6)
-                    m_wantedSensors << q(t.key);
+                if (ps::isValid(t.celsius))
+                    valid.push_back(&t);
+            std::stable_sort(valid.begin(), valid.end(), [](const ps::TemperatureReading* a, const ps::TemperatureReading* b) {
+                return a->celsius > b->celsius;
+            });
+            for (std::size_t i = 0; i < valid.size() && i < 6; ++i)
+                m_wantedSensors << q(valid[i]->key);
         }
         m_sensorList->clear();
         for (const auto& e : entries) {
@@ -3544,7 +3585,7 @@ void MainWindow::exportCsvInteractive()
     const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export History as CSV"),
                                                       QDir(dir).filePath(name),
                                                       QStringLiteral("CSV files (*.csv);;All files (*)"));
-    if (path.isEmpty())
+    if (path.isEmpty() || m_shutdown)
         return;
     if (!startCsvExport(path, &error))
         statusBar()->showMessage(error, 8000);
@@ -3552,8 +3593,18 @@ void MainWindow::exportCsvInteractive()
 
 void MainWindow::showAbout()
 {
-    QMessageBox::about(
-        this, QStringLiteral("About bex"),
+    if (m_aboutBox) {
+        m_aboutBox->raise();
+        m_aboutBox->activateWindow();
+        return;
+    }
+    auto* box = new QMessageBox(this);
+    box->setObjectName(QStringLiteral("aboutBox"));
+    box->setAttribute(Qt::WA_DeleteOnClose);
+    box->setWindowTitle(QStringLiteral("About bex"));
+    box->setIconPixmap(bexIcon().pixmap(64, 64));
+    box->setTextFormat(Qt::RichText);
+    box->setText(
         QStringLiteral("<p><b>bex %1</b></p>"
                        "<p>A native Linux performance monitor. It reads /proc and /sys locally; it needs no "
                        "privileges and sends nothing over the network. It changes nothing on the system, except "
@@ -3564,4 +3615,7 @@ void MainWindow::showAbout()
                  (m_options.styleName.isEmpty() ? style()->name() : m_options.styleName).toHtmlEscaped(),
                  qApp->styleSheet().isEmpty() ? QString() : QStringLiteral(", with a style sheet"),
                  m_options.themeNote.toHtmlEscaped()));
+    box->setStandardButtons(QMessageBox::Ok);
+    m_aboutBox = box;
+    box->open();
 }

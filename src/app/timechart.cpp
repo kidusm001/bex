@@ -462,20 +462,25 @@ void TimeChart::setUnit(ps::Unit unit)
 void TimeChart::setFixedRange(double min, double max)
 {
     // Invalid bounds (non-finite, empty or inverted) fall back to automatic.
-    if (std::isfinite(min) && std::isfinite(max) && max > min) {
-        m_fixedMin = min;
-        m_fixedMax = max;
-    } else {
-        m_fixedMin = ps::kNaN;
-        m_fixedMax = ps::kNaN;
-    }
+    const double nextMin = (std::isfinite(min) && std::isfinite(max) && max > min) ? min : ps::kNaN;
+    const double nextMax = std::isfinite(nextMin) ? max : ps::kNaN;
+    const bool same = (std::isnan(nextMin) && std::isnan(m_fixedMin))
+        || (nextMin == m_fixedMin && nextMax == m_fixedMax);
+    if (same)
+        return;
+    m_fixedMin = nextMin;
+    m_fixedMax = nextMax;
+    m_statsValid = false;
     update();
 }
 
 void TimeChart::setAutoRange()
 {
+    if (!hasFixedRange())
+        return;
     m_fixedMin = ps::kNaN;
     m_fixedMax = ps::kNaN;
+    m_statsValid = false;
     update();
 }
 
@@ -902,21 +907,6 @@ void TimeChart::updateAccessibleDescription()
 TimeChart::Range TimeChart::computeRange(std::size_t first, std::size_t last) const
 {
     Range r;
-    double lo = INFINITY, hi = -INFINITY;
-    if (m_history) {
-        for (const auto& cs : m_series) {
-            const auto* s = m_history->find(cs.key);
-            if (!s)
-                continue;
-            for (std::size_t i = first; i <= last && i < m_history->size(); ++i) {
-                const double v = m_history->value(*s, i);
-                if (ps::isValid(v)) {
-                    lo = std::min(lo, v);
-                    hi = std::max(hi, v);
-                }
-            }
-        }
-    }
     int intervals = 4;
     if (hasFixedRange()) {
         r.lo = m_fixedMin;
@@ -931,6 +921,21 @@ TimeChart::Range TimeChart::computeRange(std::size_t first, std::size_t last) co
         }
         r.step = niceCeil((r.hi - r.lo) / r.divisor / 5.0, &intervals) * r.divisor;
         return r;
+    }
+    double lo = INFINITY, hi = -INFINITY;
+    if (m_history) {
+        for (const auto& cs : m_series) {
+            const auto* s = m_history->find(cs.key);
+            if (!s)
+                continue;
+            for (std::size_t i = first; i <= last && i < m_history->size(); ++i) {
+                const double v = m_history->value(*s, i);
+                if (ps::isValid(v)) {
+                    lo = std::min(lo, v);
+                    hi = std::max(hi, v);
+                }
+            }
+        }
     }
     switch (m_unit) {
     case ps::Unit::Percent: {
@@ -1088,19 +1093,42 @@ void TimeChart::paintEvent(QPaintEvent* event)
     m_paintedFirst = inWindow ? first : 0;
     m_paintedInWindow = inWindow;
 
-    // Valid points in the window, and whether anything drawn (points or
-    // outage shading) scrolls with the view.
+    // Valid points in the window, whether anything drawn (points or outage
+    // shading) scrolls with the view, and the vertical range. Cached across
+    // 60 Hz scroll frames while the history and first visible sample match.
     int painted = 0;
     bool moving = false;
+    Range range;
     if (inWindow) {
-        for (const auto& cs : m_series) {
-            if (const auto* s = m_history->find(cs.key))
-                for (std::size_t i = first; i <= last; ++i)
-                    painted += ps::isValid(m_history->value(*s, i));
+        const bool statsHit = m_statsValid && m_statsHistory == m_history
+            && m_statsSamples == m_history->totalSamples() && m_statsSize == m_history->size()
+            && m_statsLatest == m_history->latestTime() && m_statsFirst == first;
+        if (statsHit) {
+            painted = m_statsPainted;
+            moving = m_statsMoving;
+            range = m_statsRange;
+        } else {
+            for (const auto& cs : m_series) {
+                if (const auto* s = m_history->find(cs.key))
+                    for (std::size_t i = first; i <= last; ++i)
+                        painted += ps::isValid(m_history->value(*s, i));
+            }
+            moving = painted > 0;
+            for (std::size_t i = std::max<std::size_t>(start, 1); !moving && i <= last; ++i)
+                moving = !m_history->continuous(i);
+            range = computeRange(first, last);
+            m_statsValid = true;
+            m_statsHistory = m_history;
+            m_statsSamples = m_history->totalSamples();
+            m_statsSize = m_history->size();
+            m_statsLatest = m_history->latestTime();
+            m_statsFirst = first;
+            m_statsPainted = painted;
+            m_statsMoving = moving;
+            m_statsRange = range;
         }
-        moving = painted > 0;
-        for (std::size_t i = std::max<std::size_t>(start, 1); !moving && i <= last; ++i)
-            moving = !m_history->continuous(i);
+    } else {
+        range = computeRange(first, last);
     }
     m_lastPainted = painted;
     m_paintedMoving = moving;
@@ -1173,7 +1201,6 @@ void TimeChart::paintEvent(QPaintEvent* event)
     }
 
     const QRectF plot = l.plot;
-    const Range range = computeRange(first, last);
     // Halved operands keep the fraction finite even for bounds near +-DBL_MAX.
     auto yOf = [&](double v) {
         return plot.bottom() - (v * 0.5 - range.lo * 0.5) / (range.hi * 0.5 - range.lo * 0.5) * plot.height();
@@ -1327,7 +1354,7 @@ void TimeChart::paintEvent(QPaintEvent* event)
     fillTranslucent(p, QRectF(plot.left(), plot.top() + 1, 1, plot.height() - 2), frame);
     fillTranslucent(p, QRectF(plot.right() - 1, plot.top() + 1, 1, plot.height() - 2), frame);
 
-    if (!hasVisibleData()) {
+    if (painted == 0) {
         p.setPen(muted);
         p.drawText(plot.adjusted(6, 4, -6, -4), Qt::AlignCenter | Qt::TextWordWrap, emptyMessage());
     }
@@ -1505,6 +1532,7 @@ void TimeChart::paintData(QPainter& p, const QRectF& plot, double lo, double hi,
 void TimeChart::invalidateLayer()
 {
     m_layer.valid = false;
+    m_statsValid = false;
 }
 
 long long TimeChart::layerKey(double tEnd) const
@@ -1734,7 +1762,9 @@ void TimeChart::mouseMoveEvent(QMouseEvent* event)
     if (m_lastPlot.contains(pos)) {
         m_cursorFollowsMouse = true;
         m_mouseX = pos.x();
-        update();
+        const QRegion dirty = m_paintedCursor + cursorFootprint();
+        if (!dirty.isEmpty())
+            update(dirty);
     } else if (m_cursorFollowsMouse) {
         clearCursor();
     }

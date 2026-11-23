@@ -1,5 +1,6 @@
 // Focused regression cases for identity, escaping and overflow guarantees
 // that the broader adversarial suite does not pin down directly.
+#include "core/format.h"
 #include "core/history.h"
 #include "core/linuxparsers.h"
 #include "core/metrics.h"
@@ -102,6 +103,8 @@ private Q_SLOTS:
     void productionProbeVerifiesMountIdentity();
     void readCapsAreExact();
     void processMetadataRefreshIsBoundedAndHonest();
+    void bytesFormatRollovers();
+    void filesystemReadOnlyFollowsProbedMount();
 };
 
 void TestCore::escapeNameIsInjectiveAndPrintable()
@@ -550,6 +553,48 @@ void TestCore::processMetadataRefreshIsBoundedAndHonest()
     QCOMPARE(app(s)->user, "1002"s);
     QCOMPARE(app(s)->command, "app --again"s);
     QCOMPARE(app(s)->cpuPercent, 50.0);
+}
+
+void TestCore::bytesFormatRollovers()
+{
+    QCOMPARE(ps::fmt::bytes(1023.4), "1023 B"s);
+    QCOMPARE(ps::fmt::bytes(1023.9), "1.00 KiB"s);
+    QCOMPARE(ps::fmt::bytes(-1023.9), "-1.00 KiB"s);
+    QCOMPARE(ps::fmt::rate(1023.9), "1.00 KiB/s"s);
+    constexpr double kPiB = 1024.0 * 1024 * 1024 * 1024 * 1024;
+    constexpr double kEiB = kPiB * 1024.0;
+    QCOMPARE(ps::fmt::bytes(1023.9 * kPiB), "1.00 EiB"s);
+    QCOMPARE(ps::fmt::bytes(-1023.9 * kPiB), "-1.00 EiB"s);
+    QCOMPARE(ps::fmt::bytes(1023.9 * kEiB), "1024 EiB"s);
+}
+
+void TestCore::filesystemReadOnlyFollowsProbedMount()
+{
+    Fixture f;
+    f.writeBase();
+    // Same source mounted ro (hidden by an overlay/later mount) and rw at /data:
+    // readOnly must reflect the active probed mount (/data, rw), not the hidden ro mount.
+    f.write("proc/self/mountinfo",
+            "1 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+            "2 1 8:2 / /hidden ro - ext4 /dev/sda2 ro\n"
+            "3 2 0:30 / /hidden rw - tmpfs tmpfs rw\n"
+            "4 1 8:2 / /data rw - ext4 /dev/sda2 rw\n");
+    auto o = f.options();
+    o.statFs = [](const std::string& path, int&) -> std::optional<ps::FsStats> {
+        ps::FsStats st {1000, 500, 400, 4096};
+        st.hasMountId = true;
+        st.mountId = path == "/data" ? 4 : 1;
+        return st;
+    };
+    ps::Sampler smp(o);
+    const auto s = smp.sample(1, 1);
+    const ps::Filesystem* data = nullptr;
+    for (const auto& fsys : s.filesystems)
+        if (fsys.source == "/dev/sda2")
+            data = &fsys;
+    QVERIFY(data);
+    QCOMPARE(data->mountPoints, (std::vector<std::string> {"/data"}));
+    QVERIFY(!data->readOnly);
 }
 
 QTEST_APPLESS_MAIN(TestCore)

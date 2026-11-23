@@ -52,13 +52,17 @@ std::string bytes(double v)
         return kUnavailable;
     const IecScale s = iecScaleFor(v);
     const double scaled = v / s.divisor;
-    if (s.divisor == 1)
+    if (s.divisor == 1) {
+        if (std::fabs(std::round(scaled)) >= 1024.0)
+            return bytes(std::copysign(1024.0, v));
         return number(scaled, 0) + " B";
+    }
     const double a = std::fabs(scaled);
     int decimals = a >= 99.95 ? 0 : (a >= 9.995 ? 1 : 2);
     std::string out = number(scaled, decimals);
     // Rounding may reach 1024 (e.g. 1023.9 KiB); present it in the next unit.
-    if (decimals == 0 && std::fabs(std::round(scaled)) >= 1024.0 && s.divisor < 1024.0 * 1024 * 1024 * 1024 * 1024)
+    constexpr double kMaxDivisor = 1024.0 * 1024 * 1024 * 1024 * 1024 * 1024; // EiB (kUnits[6])
+    if (decimals == 0 && std::fabs(std::round(scaled)) >= 1024.0 && s.divisor < kMaxDivisor)
         return bytes(std::copysign(1024.0 * s.divisor, v));
     return out + " " + s.unit;
 }

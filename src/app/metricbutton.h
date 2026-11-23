@@ -5,9 +5,14 @@
 #include "core/history.h"
 
 #include <QAbstractButton>
+#include <QColor>
+#include <QPalette>
 #include <string>
 #include <utility>
 #include <vector>
+
+class QStyle;
+class QStyleOptionViewItem;
 
 class MetricButton : public QAbstractButton {
     Q_OBJECT
@@ -58,6 +63,7 @@ protected:
 private:
     void updateAccessibleText();
     QRect sparkUpdateRect() const;
+    QColor selectedTextColor(const QStyleOptionViewItem& opt, QPalette::ColorGroup group) const;
 
     QString m_value;
     QString m_accessibleValue;
@@ -73,6 +79,12 @@ private:
     std::vector<std::pair<int, Qt::PenStyle>> m_visuals;
     // What the last paint showed.
     mutable QRectF m_sparkRect;
+    mutable const QStyle* m_contrastStyle = nullptr;
+    mutable qint64 m_contrastPaletteKey = 0;
+    mutable QPalette::ColorGroup m_contrastGroup = QPalette::Active;
+    mutable bool m_contrastDown = false;
+    mutable bool m_contrastValid = false;
+    mutable QColor m_contrastColor;
     double m_paintedEnd = ps::kNaN;
     std::size_t m_paintedFirst = 0;
     int m_paintCount = 0;
