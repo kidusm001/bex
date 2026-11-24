@@ -15,15 +15,43 @@ bool startsWith(std::string_view s, std::string_view prefix)
     return s.size() >= prefix.size() && s.substr(0, prefix.size()) == prefix;
 }
 
+template <typename Fn>
+void forEachLine(std::string_view text, Fn&& fn)
+{
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t nl = text.find('\n', start);
+        if (nl == std::string_view::npos)
+            nl = text.size();
+        if (!fn(text.substr(start, nl - start)))
+            return;
+        start = nl + 1;
+    }
+}
+
+std::string_view nextToken(std::string_view& rest)
+{
+    size_t i = 0;
+    while (i < rest.size() && isSpace(rest[i]))
+        ++i;
+    const size_t start = i;
+    while (i < rest.size() && !isSpace(rest[i]))
+        ++i;
+    const auto tok = rest.substr(start, i - start);
+    rest.remove_prefix(i);
+    return tok;
+}
+
 // Parses the value part of a "Key:   123 kB" line, returning bytes. The kernel
 // prints every field bex reads with the " kB" unit, so a value without
 // it (truncated or corrupted input) is rejected instead of read as bytes.
 std::optional<uint64_t> kbValue(std::string_view rest)
 {
-    const auto tokens = splitWhitespace(rest);
-    if (tokens.size() != 2 || tokens[1] != "kB")
+    const auto num = nextToken(rest);
+    const auto unit = nextToken(rest);
+    if (num.empty() || unit != "kB" || !nextToken(rest).empty())
         return std::nullopt;
-    const auto v = toU64(tokens[0]);
+    const auto v = toU64(num);
     if (!v || *v > UINT64_MAX / 1024)
         return std::nullopt;
     return *v * 1024;
@@ -187,32 +215,33 @@ std::string escapeName(std::string_view s)
 ProcStat parseProcStat(std::string_view text)
 {
     ProcStat result;
-    for (auto line : splitLines(text)) {
+    forEachLine(text, [&](std::string_view line) {
         if (startsWith(line, "cpu")) {
-            const auto tokens = splitWhitespace(line);
-            if (tokens.size() < 5) // name + user nice system idle at minimum
-                continue;
+            std::string_view rest = line;
+            const auto name = nextToken(rest);
             int index = -1;
-            const auto name = tokens[0];
             if (name != "cpu") {
                 const auto idx = toU64(name.substr(3));
                 if (!idx || *idx > 1u << 20)
-                    continue;
+                    return true;
                 index = static_cast<int>(*idx);
             }
             uint64_t fields[10] = {};
+            size_t count = 0;
             bool ok = true;
-            const size_t count = std::min<size_t>(tokens.size() - 1, 10);
-            for (size_t i = 0; i < count; ++i) {
-                const auto v = toU64(tokens[i + 1]);
+            while (count < 10) {
+                const auto tok = nextToken(rest);
+                if (tok.empty())
+                    break;
+                const auto v = toU64(tok);
                 if (!v) {
                     ok = false;
                     break;
                 }
-                fields[i] = *v;
+                fields[count++] = *v;
             }
-            if (!ok)
-                continue;
+            if (!ok || count < 4) // user nice system idle at minimum
+                return true;
             CpuTimes t;
             t.user = fields[0];
             t.nice = fields[1];
@@ -234,11 +263,14 @@ ProcStat parseProcStat(std::string_view text)
                     result.cpus.push_back({index, t});
             }
         } else if (startsWith(line, "btime")) {
-            const auto tokens = splitWhitespace(line);
-            if (tokens.size() == 2 && tokens[0] == "btime")
-                result.bootTime = toU64(tokens[1]);
+            std::string_view rest = line;
+            const auto key = nextToken(rest);
+            const auto val = nextToken(rest);
+            if (key == "btime" && !val.empty() && nextToken(rest).empty())
+                result.bootTime = toU64(val);
         }
-    }
+        return true;
+    });
     std::sort(result.cpus.begin(), result.cpus.end(),
               [](const CpuLine& a, const CpuLine& b) { return a.index < b.index; });
     return result;
@@ -247,44 +279,51 @@ ProcStat parseProcStat(std::string_view text)
 MemInfoRaw parseMeminfo(std::string_view text)
 {
     MemInfoRaw m;
-    for (auto line : splitLines(text)) {
+    forEachLine(text, [&](std::string_view line) {
         const auto colon = line.find(':');
         if (colon == std::string_view::npos)
-            continue;
+            return true;
         const auto key = line.substr(0, colon);
-        const auto value = kbValue(line.substr(colon + 1));
-        if (!value)
-            continue;
-        if (key == "MemTotal") m.memTotal = value;
-        else if (key == "MemFree") m.memFree = value;
-        else if (key == "MemAvailable") m.memAvailable = value;
-        else if (key == "Buffers") m.buffers = value;
-        else if (key == "Cached") m.cached = value;
-        else if (key == "SReclaimable") m.sReclaimable = value;
-        else if (key == "Shmem") m.shmem = value;
-        else if (key == "SwapTotal") m.swapTotal = value;
-        else if (key == "SwapFree") m.swapFree = value;
-    }
+        // Only parse numeric values for the nine keys we actually use.
+        std::optional<uint64_t>* dst = nullptr;
+        if (key == "MemTotal") dst = &m.memTotal;
+        else if (key == "MemFree") dst = &m.memFree;
+        else if (key == "MemAvailable") dst = &m.memAvailable;
+        else if (key == "Buffers") dst = &m.buffers;
+        else if (key == "Cached") dst = &m.cached;
+        else if (key == "SReclaimable") dst = &m.sReclaimable;
+        else if (key == "Shmem") dst = &m.shmem;
+        else if (key == "SwapTotal") dst = &m.swapTotal;
+        else if (key == "SwapFree") dst = &m.swapFree;
+        if (!dst)
+            return true;
+        if (const auto value = kbValue(line.substr(colon + 1)))
+            *dst = value;
+        return true;
+    });
     return m;
 }
 
 std::vector<DiskStatLine> parseDiskstats(std::string_view text)
 {
     std::vector<DiskStatLine> out;
-    for (auto line : splitLines(text)) {
-        const auto t = splitWhitespace(line);
-        // major minor name + at least 11 statistics fields
-        if (t.size() < 14)
-            continue;
+    forEachLine(text, [&](std::string_view line) {
+        std::string_view rest = line;
+        std::string_view t[14];
+        for (int i = 0; i < 14; ++i) {
+            t[i] = nextToken(rest);
+            if (t[i].empty())
+                return true; // major minor name + at least 11 statistics fields
+        }
         const auto major = toU64(t[0]);
         const auto minor = toU64(t[1]);
         const auto sectorsRead = toU64(t[5]);
         const auto sectorsWritten = toU64(t[9]);
         const auto ioTicks = toU64(t[12]);
         if (!major || !minor || !sectorsRead || !sectorsWritten || !ioTicks)
-            continue;
+            return true;
         if (*major > UINT32_MAX || *minor > UINT32_MAX)
-            continue;
+            return true;
         DiskStatLine d;
         d.major = static_cast<unsigned>(*major);
         d.minor = static_cast<unsigned>(*minor);
@@ -293,32 +332,38 @@ std::vector<DiskStatLine> parseDiskstats(std::string_view text)
         d.sectorsWritten = *sectorsWritten;
         d.ioTicksMs = *ioTicks;
         out.push_back(std::move(d));
-    }
+        return true;
+    });
     return out;
 }
 
 std::vector<NetDevLine> parseNetDev(std::string_view text)
 {
     std::vector<NetDevLine> out;
-    for (auto line : splitLines(text)) {
+    forEachLine(text, [&](std::string_view line) {
         const auto colon = line.find(':');
         if (colon == std::string_view::npos)
-            continue;
+            return true;
         // The header lines have no colon. Linux interface names may contain
         // any byte except '/', ':' and whitespace (dev_valid_name), so '|' is
         // a legal character and the colon plus numeric fields identify rows.
         const auto name = trim(line.substr(0, colon));
         if (name.empty() || name.find_first_of(" \t/") != std::string_view::npos)
-            continue;
-        const auto t = splitWhitespace(line.substr(colon + 1));
-        if (t.size() < 16)
-            continue;
+            return true;
+        std::string_view rest = line.substr(colon + 1);
+        std::string_view t[16];
+        for (int i = 0; i < 16; ++i) {
+            t[i] = nextToken(rest);
+            if (t[i].empty())
+                return true;
+        }
         const auto rx = toU64(t[0]);
         const auto tx = toU64(t[8]);
         if (!rx || !tx)
-            continue;
+            return true;
         out.push_back({std::string(name), *rx, *tx});
-    }
+        return true;
+    });
     return out;
 }
 
@@ -333,26 +378,32 @@ std::optional<PidStat> parsePidStat(std::string_view text)
     const auto pid = toI64(trim(text.substr(0, open)));
     if (!pid || *pid <= 0 || *pid > INT32_MAX)
         return std::nullopt;
-    const auto rest = splitWhitespace(text.substr(close + 1));
-    // rest[0] is field 3 (state); we need up to field 24 (rss) => 22 entries.
-    if (rest.size() < 22 || rest[0].size() != 1)
+    std::string_view rest = text.substr(close + 1);
+    // f[0] is field 3 (state); we need up to field 24 (rss) => 22 entries.
+    std::string_view f[22];
+    for (int i = 0; i < 22; ++i) {
+        f[i] = nextToken(rest);
+        if (f[i].empty())
+            return std::nullopt;
+    }
+    if (f[0].size() != 1)
         return std::nullopt;
-    PidStat s;
-    s.pid = static_cast<int>(*pid);
-    s.comm = sanitize(text.substr(open + 1, close - open - 1));
-    s.state = rest[0][0];
-    const auto ppid = toI64(rest[1]);
-    const auto flags = toU64(rest[6]);
-    const auto utime = toU64(rest[11]);
-    const auto stime = toU64(rest[12]);
-    const auto nice = toI64(rest[16]);
-    const auto threads = toI64(rest[17]);
-    const auto start = toU64(rest[19]);
-    const auto rss = toI64(rest[21]);
+    const auto ppid = toI64(f[1]);
+    const auto flags = toU64(f[6]);
+    const auto utime = toU64(f[11]);
+    const auto stime = toU64(f[12]);
+    const auto nice = toI64(f[16]);
+    const auto threads = toI64(f[17]);
+    const auto start = toU64(f[19]);
+    const auto rss = toI64(f[21]);
     if (!ppid || !flags || !utime || !stime || !nice || !threads || !start || !rss)
         return std::nullopt;
     if (*ppid < 0 || *ppid > INT32_MAX || *flags > UINT32_MAX || *threads < 0 || *rss < 0)
         return std::nullopt;
+    PidStat s;
+    s.pid = static_cast<int>(*pid);
+    s.comm = sanitize(text.substr(open + 1, close - open - 1));
+    s.state = f[0][0];
     s.ppid = static_cast<int>(*ppid);
     s.flags = static_cast<unsigned>(*flags);
     s.utime = *utime;
@@ -367,17 +418,17 @@ std::optional<PidStat> parsePidStat(std::string_view text)
 std::optional<PidIo> parsePidIo(std::string_view text)
 {
     std::optional<uint64_t> readBytes, writeBytes;
-    for (auto line : splitLines(text)) {
+    forEachLine(text, [&](std::string_view line) {
         const auto colon = line.find(':');
         if (colon == std::string_view::npos)
-            continue;
+            return true;
         const auto key = line.substr(0, colon);
-        const auto value = toU64(trim(line.substr(colon + 1)));
         if (key == "read_bytes")
-            readBytes = value;
+            readBytes = toU64(trim(line.substr(colon + 1)));
         else if (key == "write_bytes")
-            writeBytes = value;
-    }
+            writeBytes = toU64(trim(line.substr(colon + 1)));
+        return true;
+    });
     if (!readBytes || !writeBytes)
         return std::nullopt;
     return PidIo{*readBytes, *writeBytes};
@@ -385,18 +436,21 @@ std::optional<PidIo> parsePidIo(std::string_view text)
 
 std::optional<uint32_t> parseStatusRealUid(std::string_view text)
 {
-    for (auto line : splitLines(text)) {
+    std::optional<uint32_t> result;
+    forEachLine(text, [&](std::string_view line) {
         if (!startsWith(line, "Uid:"))
-            continue;
-        const auto t = splitWhitespace(line.substr(4));
-        if (t.empty())
-            return std::nullopt;
-        const auto uid = toU64(t[0]);
+            return true;
+        std::string_view rest = line.substr(4);
+        const auto first = nextToken(rest);
+        if (first.empty())
+            return false;
+        const auto uid = toU64(first);
         if (!uid || *uid > UINT32_MAX)
-            return std::nullopt;
-        return static_cast<uint32_t>(*uid);
-    }
-    return std::nullopt;
+            return false;
+        result = static_cast<uint32_t>(*uid);
+        return false;
+    });
+    return result;
 }
 
 std::string parseCmdline(std::string_view raw)
@@ -613,10 +667,11 @@ std::optional<double> parseMilliCelsius(std::string_view text)
 
 std::optional<LoadAvg> parseLoadavg(std::string_view text)
 {
-    const auto t = splitWhitespace(text);
-    if (t.size() < 3)
+    std::string_view rest = text;
+    const auto t0 = nextToken(rest), t1 = nextToken(rest), t2 = nextToken(rest);
+    if (t2.empty())
         return std::nullopt;
-    const auto a = toDouble(t[0]), b = toDouble(t[1]), c = toDouble(t[2]);
+    const auto a = toDouble(t0), b = toDouble(t1), c = toDouble(t2);
     if (!a || !b || !c || *a < 0 || *b < 0 || *c < 0)
         return std::nullopt;
     return LoadAvg{*a, *b, *c};
@@ -624,10 +679,11 @@ std::optional<LoadAvg> parseLoadavg(std::string_view text)
 
 std::optional<double> parseUptime(std::string_view text)
 {
-    const auto t = splitWhitespace(text);
-    if (t.empty())
+    std::string_view rest = text;
+    const auto t0 = nextToken(rest);
+    if (t0.empty())
         return std::nullopt;
-    const auto v = toDouble(t[0]);
+    const auto v = toDouble(t0);
     if (!v || *v < 0)
         return std::nullopt;
     return v;

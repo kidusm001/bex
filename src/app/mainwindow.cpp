@@ -18,6 +18,7 @@
 #include <QElapsedTimer>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFrame>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -256,10 +257,11 @@ public:
             c->setNotice(notice);
     }
     const std::vector<TimeChart*>& charts() const { return m_charts; }
-    QSize sizeHint() const override { return {600, 2 * kCellH}; }
+    QSize sizeHint() const override { return {600, 2 * kCellH + kGap}; }
 
-    static constexpr int kCellW = 190;
-    static constexpr int kCellH = 86;
+    static constexpr int kCellW = 176;
+    static constexpr int kCellH = 78;
+    static constexpr int kGap = 6;
 
 protected:
     void resizeEvent(QResizeEvent*) override
@@ -272,16 +274,23 @@ private:
     void relayout()
     {
         const int n = static_cast<int>(m_charts.size());
-        const int cols = std::clamp(width() / kCellW, 1, std::max(1, std::min(n, 8)));
+        const int availW = std::max(1, width());
+        const int cols = std::clamp((availW + kGap) / (kCellW + kGap), 1, std::max(1, std::min(n, 8)));
         if (cols == m_columns)
             return;
         m_columns = cols;
         const int rows = (n + cols - 1) / cols;
-        setMinimumHeight(rows * kCellH);
-        const int cellW = width() / cols;
-        for (int i = 0; i < n; ++i)
-            m_charts[static_cast<std::size_t>(i)]->setGeometry((i % cols) * cellW, (i / cols) * kCellH, cellW - 4,
-                                                               kCellH - 4);
+        setMinimumHeight(rows > 0 ? rows * kCellH + (rows - 1) * kGap : kCellH);
+        const int totalGap = (cols - 1) * kGap;
+        const int baseW = std::max(1, (availW - totalGap) / cols);
+        const int extra = std::max(0, (availW - totalGap) - baseW * cols);
+        for (int i = 0; i < n; ++i) {
+            const int col = i % cols;
+            const int row = i / cols;
+            const int x = col * (baseW + kGap) + std::min(col, extra);
+            const int w = baseW + (col < extra ? 1 : 0);
+            m_charts[static_cast<std::size_t>(i)]->setGeometry(x, row * (kCellH + kGap), w, kCellH);
+        }
     }
 
     std::vector<int> m_indices;
@@ -347,28 +356,33 @@ public:
 
         const double fraction = index.data(Qt::UserRole).toDouble();
         const QFontMetrics fm(opt.font);
-        const int textW = fm.horizontalAdvance(QStringLiteral("100%")) + 6;
+        const int textW = fm.horizontalAdvance(QStringLiteral("100 %")) + 8;
         const QRect r = opt.rect.adjusted(4, 0, -4, 0);
         const QRect textRect(r.right() - textW, r.top(), textW, r.height());
+        const bool selected = (opt.state & QStyle::State_Selected) != 0;
         p->save();
-        p->setPen(opt.palette.color(opt.state & QStyle::State_Selected ? QPalette::HighlightedText : QPalette::Text));
+        p->setPen(opt.palette.color(selected ? QPalette::HighlightedText : QPalette::Text));
         p->drawText(textRect, Qt::AlignRight | Qt::AlignVCenter, text);
         if (std::isfinite(fraction)) {
-            const int barH = std::max(6, fm.height() / 2);
-            const QRectF track(r.left(), r.center().y() - barH / 2.0 + 0.5, std::max(0, r.width() - textW - 6), barH);
-            QColor trackColor = opt.palette.color(QPalette::Text);
-            trackColor.setAlphaF(0.12f);
+            const int barH = std::max(6, fm.height() / 3 + 2);
+            const double radius = barH / 2.0;
+            const QRectF track(r.left(), r.center().y() - barH / 2.0 + 0.5, std::max(0, r.width() - textW - 8), barH);
+            QColor trackColor = opt.palette.color(selected ? QPalette::HighlightedText : QPalette::Text);
+            trackColor.setAlphaF(selected ? 0.24f : 0.14f);
             p->setRenderHint(QPainter::Antialiasing, true);
             p->setPen(Qt::NoPen);
             p->setBrush(trackColor);
-            p->drawRoundedRect(track, 2, 2);
+            p->drawRoundedRect(track, radius, radius);
             // The red of the series palette, in its light or dark variant.
             const bool nearlyFull = fraction >= kNearlyFull;
-            QColor fill = nearlyFull ? seriesColor(6, opt.palette) : opt.palette.color(QPalette::Highlight);
+            QColor fill = nearlyFull
+                ? seriesColor(6, opt.palette)
+                : opt.palette.color(selected ? QPalette::HighlightedText : QPalette::Highlight);
             p->setBrush(fill);
             QRectF bar = track;
             bar.setWidth(track.width() * std::clamp(fraction, 0.0, 1.0));
-            p->drawRoundedRect(bar, 2, 2);
+            if (bar.width() > 0.5)
+                p->drawRoundedRect(bar, radius, radius);
         }
         p->restore();
     }
@@ -456,11 +470,12 @@ public:
         , m_maxColumns(columns)
         , m_grid(new Layout(this))
     {
-        m_grid->setContentsMargins(0, 0, 0, 0);
-        m_grid->setHorizontalSpacing(10);
+        m_grid->setContentsMargins(0, 2, 0, 4);
+        m_grid->setHorizontalSpacing(kIntraGap);
+        m_grid->setVerticalSpacing(4);
         // The widget's minimum is one pair, not the current arrangement.
         m_grid->setSizeConstraint(QLayout::SetNoConstraint);
-        m_grid->setColumnStretch(2 * m_maxColumns, 1);
+        m_grid->setColumnStretch(3 * m_maxColumns, 1);
         QSizePolicy sp(QSizePolicy::Preferred, QSizePolicy::Preferred);
         sp.setHeightForWidth(true);
         setSizePolicy(sp);
@@ -544,7 +559,8 @@ private:
         int w = 0;
         for (int c = 0; c < columns; ++c)
             w += nameW[c] + valueW[c];
-        return w + m_grid->horizontalSpacing() * (2 * columns - 1);
+        // Intra-pair spacing (kIntraGap) plus inter-pair gutter column (kPairGap + 2 * kIntraGap).
+        return w + columns * kIntraGap + (columns - 1) * (kPairGap + 2 * kIntraGap);
     }
 
     int heightFor(int columns) const
@@ -556,7 +572,8 @@ private:
             rowH = std::max({rowH, p.name->sizeHint().height(), p.value->sizeHint().height()});
         const int n = static_cast<int>(m_pairs.size());
         const int rows = (n + columns - 1) / columns;
-        return rows * rowH + (rows - 1) * std::max(0, m_grid->verticalSpacing());
+        const QMargins m = m_grid->contentsMargins();
+        return m.top() + m.bottom() + rows * rowH + (rows - 1) * std::max(0, m_grid->verticalSpacing());
     }
 
     int columnsFor(int width) const
@@ -577,15 +594,19 @@ private:
             m_grid->removeWidget(p.name);
             m_grid->removeWidget(p.value);
         }
+        for (int c = 0; c < m_maxColumns; ++c)
+            m_grid->setColumnMinimumWidth(c * 3 + 2, c + 1 < columns ? kPairGap : 0);
         for (std::size_t i = 0; i < m_pairs.size(); ++i) {
             const int row = static_cast<int>(i) / columns;
             const int col = static_cast<int>(i) % columns;
-            m_grid->addWidget(m_pairs[i].name, row, col * 2, Qt::AlignLeft | Qt::AlignVCenter);
-            m_grid->addWidget(m_pairs[i].value, row, col * 2 + 1, Qt::AlignLeft | Qt::AlignVCenter);
+            m_grid->addWidget(m_pairs[i].name, row, col * 3, Qt::AlignLeft | Qt::AlignVCenter);
+            m_grid->addWidget(m_pairs[i].value, row, col * 3 + 1, Qt::AlignLeft | Qt::AlignVCenter);
         }
         updateGeometry();
     }
 
+    static constexpr int kIntraGap = 6;
+    static constexpr int kPairGap = 14;
     int m_maxColumns;
     int m_columns = 0;
     QGridLayout* m_grid;
@@ -600,6 +621,7 @@ void addFactPair(FactGrid* grid, const QString& name, QLabel* value, const QStri
     label->setForegroundRole(QPalette::PlaceholderText);
     label->setBuddy(value);
     value->setParent(grid);
+    setRelativeFont(value, grid->font(), 1.0, QFont::DemiBold);
     grid->addPair(label, value);
     value->setTextInteractionFlags(Qt::TextSelectableByMouse);
     value->setAccessibleName(name);
@@ -625,7 +647,7 @@ public:
     QSize sizeHint() const override
     {
         const int h = fontMetrics().height();
-        return {2 * h, h};
+        return {std::max(14, static_cast<int>(std::lround(h * 1.35))), h};
     }
 
 protected:
@@ -638,7 +660,7 @@ protected:
         const double mid = r.center().y();
         QColor tint = c;
         tint.setAlphaF(isDarkPalette(palette()) ? 0.30f : 0.24f);
-        p.fillRect(QRectF(r.left(), mid, r.width(), r.bottom() - mid), tint);
+        p.fillRect(QRectF(r.left(), mid, r.width(), std::min(4.0, r.bottom() - mid)), tint);
         QPen pen(c, 2.0);
         pen.setStyle(m_style);
         pen.setCapStyle(Qt::FlatCap);
@@ -663,14 +685,17 @@ public:
         , m_items(new QBoxLayout(QBoxLayout::LeftToRight))
     {
         auto* v = new QVBoxLayout(this);
-        v->setContentsMargins(0, 0, 0, 2);
-        v->setSpacing(2);
+        v->setContentsMargins(0, 0, 0, 4);
+        v->setSpacing(4);
         // The minimum is one value wide, not the current arrangement.
         v->setSizeConstraint(QLayout::SetNoConstraint);
         m_items->setContentsMargins(0, 0, 0, 0);
         m_items->setSpacing(kGap);
-        v->addLayout(m_items);
-        v->setAlignment(m_items, Qt::AlignLeft | Qt::AlignTop);
+        auto* row = new QHBoxLayout;
+        row->setContentsMargins(0, 0, 0, 0);
+        row->addLayout(m_items);
+        row->addStretch(1);
+        v->addLayout(row);
         m_summary = new QLabel(this);
         m_summary->setWordWrap(true);
         m_summary->setForegroundRole(QPalette::PlaceholderText);
@@ -682,10 +707,11 @@ public:
                     int visual, Qt::PenStyle style, const QString& tip)
     {
         auto* cell = new QWidget(this);
+        cell->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Preferred);
         auto* g = new QGridLayout(cell);
         g->setContentsMargins(0, 0, 0, 0);
         g->setHorizontalSpacing(6);
-        g->setVerticalSpacing(0);
+        g->setVerticalSpacing(2);
         int col = 0;
         if (visual >= 0) {
             g->addWidget(new Swatch(visual, style, cell), 0, 0, Qt::AlignVCenter);
@@ -700,7 +726,6 @@ public:
         value->setTextInteractionFlags(Qt::TextSelectableByMouse);
         setRelativeFont(value, font(), 1.6, QFont::DemiBold, widest);
         g->addWidget(value, 1, 0, 1, col + 1, Qt::AlignLeft | Qt::AlignVCenter);
-        g->setColumnStretch(col + 1, 1);
         label->setBuddy(value);
         if (!tip.isEmpty())
             cell->setToolTip(tip);
@@ -817,9 +842,15 @@ MainWindow::MainWindow(MainWindowOptions options, QWidget* parent)
 
     auto* central = new QWidget(this);
     auto* layout = new QHBoxLayout(central);
-    layout->setContentsMargins(8, 6, 8, 4);
+    layout->setContentsMargins(10, 8, 10, 8);
     layout->setSpacing(10);
     layout->addWidget(buildNavigation());
+    auto* navDivider = new QFrame(central);
+    navDivider->setObjectName(QStringLiteral("navDivider"));
+    navDivider->setFrameShape(QFrame::VLine);
+    navDivider->setFrameShadow(QFrame::Plain);
+    navDivider->setForegroundRole(QPalette::Mid);
+    layout->addWidget(navDivider);
     m_stack = new QStackedWidget(central);
     m_stack->addWidget(new PageScroll(buildCpuPage()));
     m_stack->addWidget(new PageScroll(buildMemoryPage()));
@@ -843,6 +874,11 @@ MainWindow::MainWindow(MainWindowOptions options, QWidget* parent)
 
     const int page = std::clamp(m_settings->value(QStringLiteral("page"), 0).toInt(), 0, PageCount - 1);
     showPage(static_cast<Page>(page));
+    // Give initial focus to the central container (ClickFocus) so neither the
+    // toolbar's rangeCombo nor a navigation button opens with a stray keyboard
+    // focus rectangle on startup, while Tab still navigates normally.
+    central->setFocusPolicy(Qt::ClickFocus);
+    central->setFocus();
 
     if (!restoreGeometry(m_settings->value(QStringLiteral("geometry")).toByteArray()))
         resize(1180, 780);
@@ -1158,8 +1194,8 @@ QWidget* MainWindow::buildNavigation()
     nav->setObjectName(QStringLiteral("navigation"));
     nav->setAccessibleName(QStringLiteral("Metric categories"));
     auto* v = new QVBoxLayout(nav);
-    v->setContentsMargins(0, 4, 0, 0);
-    v->setSpacing(2);
+    v->setContentsMargins(0, 2, 0, 0);
+    v->setSpacing(4);
     const QStringList names {QStringLiteral("CPU"),          QStringLiteral("Memory"),
                              QStringLiteral("Disks"),        QStringLiteral("Network"),
                              QStringLiteral("Temperatures"), QStringLiteral("Processes")};
@@ -1197,7 +1233,7 @@ QWidget* MainWindow::buildNavigation()
     m_nav[TemperaturePage]->setValueTemplate(QStringLiteral("100.0 \u00B0C"));
     m_nav[ProcessPage]->setValueTemplate(QStringLiteral("00000 processes"));
     v->addStretch(1);
-    int navWidth = 210;
+    int navWidth = 228;
     for (const auto* b : m_nav)
         navWidth = std::max(navWidth, b->sizeHint().width());
     nav->setFixedWidth(navWidth);
@@ -1209,7 +1245,8 @@ QWidget* MainWindow::buildCpuPage()
     auto* page = new QWidget;
     page->setAccessibleName(QStringLiteral("CPU"));
     auto* v = new QVBoxLayout(page);
-    v->setContentsMargins(4, 4, 4, 4);
+    v->setContentsMargins(10, 6, 10, 8);
+    v->setSpacing(8);
     v->addWidget(makeHeading(QStringLiteral("CPU"), page));
     v->addWidget(buildHeadline(CpuPage, QStringLiteral("cpu"), page));
 
@@ -1232,6 +1269,7 @@ QWidget* MainWindow::buildCpuPage()
         value->setObjectName(QString::fromLatin1(f.id).replace(QLatin1Char('.'), QLatin1Char('_')));
         addFactPair(grid, QString::fromLatin1(f.name), value, f.tip);
         m_facts.emplace_back(f.id, value);
+        m_factMap.emplace(f.id, value);
     }
     v->addWidget(detailOnly(grid));
 
@@ -1258,12 +1296,14 @@ QWidget* MainWindow::buildCpuPage()
     scroll->setObjectName(QStringLiteral("coreScroll"));
     scroll->setWidgetResizable(true);
     scroll->setFrameShape(QFrame::NoFrame);
+    scroll->viewport()->setAutoFillBackground(false);
     scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     // At least one row of per-core charts stays in view.
     scroll->setMinimumHeight(CoreGrid::kCellH);
     m_coreGrid = new CoreGrid(scroll);
     m_coreGrid->setObjectName(QStringLiteral("coreGrid"));
     scroll->setWidget(m_coreGrid);
+    m_coreGrid->setAutoFillBackground(false);
     v->addWidget(detailOnly(scroll), 2);
     return page;
 }
@@ -1273,7 +1313,8 @@ QWidget* MainWindow::buildMemoryPage()
     auto* page = new QWidget;
     page->setAccessibleName(QStringLiteral("Memory"));
     auto* v = new QVBoxLayout(page);
-    v->setContentsMargins(4, 4, 4, 4);
+    v->setContentsMargins(10, 6, 10, 8);
+    v->setSpacing(8);
     v->addWidget(makeHeading(QStringLiteral("Memory"), page));
     v->addWidget(buildHeadline(MemoryPage, QStringLiteral("memory"), page));
 
@@ -1297,6 +1338,7 @@ QWidget* MainWindow::buildMemoryPage()
         value->setObjectName(QString::fromLatin1(f.id).replace(QLatin1Char('.'), QLatin1Char('_')));
         addFactPair(grid, QString::fromLatin1(f.name), value, f.tip);
         m_facts.emplace_back(f.id, value);
+        m_factMap.emplace(f.id, value);
     }
     v->addWidget(detailOnly(grid));
 
@@ -1321,8 +1363,10 @@ QWidget* MainWindow::buildDiskPage()
     auto* page = new QWidget;
     page->setAccessibleName(QStringLiteral("Disks"));
     auto* v = new QVBoxLayout(page);
-    v->setContentsMargins(4, 4, 4, 4);
+    v->setContentsMargins(10, 6, 10, 8);
+    v->setSpacing(8);
     auto* header = new QHBoxLayout;
+    header->setSpacing(8);
     header->addWidget(makeHeading(QStringLiteral("Disks"), page));
     header->addStretch(1);
     auto* devLabel = new QLabel(QStringLiteral("Device:"), page);
@@ -1359,6 +1403,7 @@ QWidget* MainWindow::buildDiskPage()
         value->setObjectName(QString::fromLatin1(f.id).replace(QLatin1Char('.'), QLatin1Char('_')));
         addFactPair(grid, QString::fromLatin1(f.name), value, f.tip);
         m_facts.emplace_back(f.id, value);
+        m_factMap.emplace(f.id, value);
     }
     v->addWidget(detailOnly(grid));
 
@@ -1391,7 +1436,7 @@ QWidget* MainWindow::buildDiskPage()
     m_fsTable->setColumnWidth(2, fm.horizontalAdvance(QStringLiteral("btrfs")) + 24);
     for (int c = 3; c <= 5; ++c)
         m_fsTable->setColumnWidth(c, fm.horizontalAdvance(QStringLiteral("1000 GiB")) + 24);
-    v->addWidget(detailOnly(m_fsTable), 2);
+    v->addWidget(detailOnly(m_fsTable), 1);
     return page;
 }
 
@@ -1400,8 +1445,10 @@ QWidget* MainWindow::buildNetworkPage()
     auto* page = new QWidget;
     page->setAccessibleName(QStringLiteral("Network"));
     auto* v = new QVBoxLayout(page);
-    v->setContentsMargins(4, 4, 4, 4);
+    v->setContentsMargins(10, 6, 10, 8);
+    v->setSpacing(8);
     auto* header = new QHBoxLayout;
+    header->setSpacing(8);
     header->addWidget(makeHeading(QStringLiteral("Network"), page));
     header->addStretch(1);
     auto* ifLabel = new QLabel(QStringLiteral("Interface:"), page);
@@ -1433,6 +1480,7 @@ QWidget* MainWindow::buildNetworkPage()
         value->setObjectName(QString::fromLatin1(f.id).replace(QLatin1Char('.'), QLatin1Char('_')));
         addFactPair(grid, QString::fromLatin1(f.name), value, {});
         m_facts.emplace_back(f.id, value);
+        m_factMap.emplace(f.id, value);
     }
     v->addWidget(detailOnly(grid));
 
@@ -1449,7 +1497,8 @@ QWidget* MainWindow::buildTemperaturePage()
     auto* page = new QWidget;
     page->setAccessibleName(QStringLiteral("Temperatures"));
     auto* v = new QVBoxLayout(page);
-    v->setContentsMargins(4, 4, 4, 4);
+    v->setContentsMargins(10, 6, 10, 8);
+    v->setSpacing(8);
     v->addWidget(makeHeading(QStringLiteral("Temperatures"), page));
     v->addWidget(buildHeadline(TemperaturePage, QStringLiteral("temperature"), page));
     m_tempNote = makeNote({}, page);
@@ -1465,6 +1514,7 @@ QWidget* MainWindow::buildTemperaturePage()
     m_sensorList->setAccessibleName(QStringLiteral("Temperature sensors"));
     m_sensorList->setRootIsDecorated(false);
     m_sensorList->setUniformRowHeights(true);
+    m_sensorList->setAlternatingRowColors(true);
     // Sensor names often share a long prefix ("coretemp Core 0", "coretemp
     // Core 1"); eliding in the middle keeps the distinguishing end visible.
     m_sensorList->setTextElideMode(Qt::ElideMiddle);
@@ -1505,7 +1555,7 @@ QWidget* MainWindow::buildTemperaturePage()
     split->addWidget(m_tempChart);
     split->setStretchFactor(0, 1);
     split->setStretchFactor(1, 3);
-    m_tempSplitSizes = {300, 700};
+    m_tempSplitSizes = {340, 660};
     split->setSizes(m_tempSplitSizes);
     m_sensorList->setMinimumWidth(sensorListMinimumWidth(m_sensorList));
     detailOnly(m_sensorList);
@@ -1518,8 +1568,10 @@ QWidget* MainWindow::buildProcessPage()
     auto* page = new QWidget;
     page->setAccessibleName(QStringLiteral("Processes"));
     auto* v = new QVBoxLayout(page);
-    v->setContentsMargins(4, 4, 4, 4);
+    v->setContentsMargins(10, 6, 10, 8);
+    v->setSpacing(6);
     auto* header = new QHBoxLayout;
+    header->setSpacing(8);
     header->addWidget(makeHeading(QStringLiteral("Processes"), page));
     header->addSpacing(12);
     m_procFilter = new QLineEdit(page);
@@ -1622,7 +1674,7 @@ QWidget* MainWindow::buildProcessPage()
     // The name column also holds the group branch indicator and indent.
     m_procTable->setColumnWidth(ProcessModel::Name, width("gnome-shell-calen") + m_procTable->indentation());
     m_procTable->setColumnWidth(ProcessModel::User, cellWidth("username"));
-    m_procTable->setColumnWidth(ProcessModel::Cpu, cellWidth("1000.0 %"));
+    m_procTable->setColumnWidth(ProcessModel::Cpu, cellWidth("1000.0 %") + 16);
     m_procTable->setColumnWidth(ProcessModel::Memory, cellWidth("Memory (RSS)"));
     m_procTable->setColumnWidth(ProcessModel::Threads, cellWidth("Threads"));
     m_procTable->setColumnWidth(ProcessModel::State, cellWidth("Disk wait"));
@@ -2026,7 +2078,7 @@ void MainWindow::applyScaledFonts()
         if (!widest.isEmpty())
             w->setMinimumWidth(QFontMetrics(f).horizontalAdvance(widest) + 2);
     }
-    int navWidth = 210;
+    int navWidth = 228;
     for (const auto* b : m_nav)
         navWidth = std::max(navWidth, b->sizeHint().width());
     if (m_navPanel)
@@ -2062,10 +2114,8 @@ std::vector<TimeChart*> MainWindow::allCharts() const
 
 QLabel* MainWindow::fact(const std::string& id) const
 {
-    for (const auto& [key, label] : m_facts)
-        if (key == id)
-            return label;
-    return nullptr;
+    const auto it = m_factMap.find(id);
+    return it != m_factMap.end() ? it->second : nullptr;
 }
 
 // ---------------------------------------------------------------------------

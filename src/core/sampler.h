@@ -97,12 +97,14 @@ private:
     struct DiskState {
         std::string identity;
         uint64_t sectorsRead = 0, sectorsWritten = 0, ioTicks = 0;
+        uint64_t seenScan = 0;
         bool hasPrev = false;
     };
     struct NetState {
         std::string identity;
         DeviceKind kind = DeviceKind::Virtual;
         uint64_t rx = 0, tx = 0;
+        uint64_t seenScan = 0;
         bool hasPrev = false;
     };
     // When a read happened: the middle of the read call, in seconds after the
@@ -192,6 +194,7 @@ private:
     std::map<std::string, NetState> m_nets;
     std::unordered_map<int, ProcState> m_procs;
     uint64_t m_scanNo = 0;
+    std::string m_readBuf;
     std::unordered_map<uint32_t, std::string> m_users;
 
     std::vector<Filesystem> m_fsGroups;

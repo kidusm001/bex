@@ -644,10 +644,9 @@ Snapshot Sampler::sample(double now, double expectedInterval)
     // Processes come before the sensors, whose reads can be slow on some
     // drivers, so their read offset stays as steady as the counters'.
     if (m_opt.scanProcesses) {
-        std::string up;
         std::optional<double> uptime;
-        if (readFile(m_opt.procRoot + "/uptime", up, nullptr, 4096))
-            uptime = parse::parseUptime(up);
+        if (readFile(m_opt.procRoot + "/uptime", m_readBuf, nullptr, 4096))
+            uptime = parse::parseUptime(m_readBuf);
         sampleProcesses(s, rateBaseline, elapsed, uptime.value_or(kNaN), now);
     }
     sampleTemperatures(s, now);
@@ -664,9 +663,8 @@ Snapshot Sampler::sample(double now, double expectedInterval)
 
 void Sampler::sampleCpu(Snapshot& s, bool baseline)
 {
-    std::string text;
     int err = 0;
-    if (!readFile(m_opt.procRoot + "/stat", text, &err)) {
+    if (!readFile(m_opt.procRoot + "/stat", m_readBuf, &err)) {
         s.problems.push_back(tableProblem("/proc/stat", err));
         m_prevCpuAggregate.reset();
         m_prevCores.clear();
@@ -674,7 +672,7 @@ void Sampler::sampleCpu(Snapshot& s, bool baseline)
             s.cores.push_back({idx, false, {}});
         return;
     }
-    const auto st = parse::parseProcStat(text);
+    const auto st = parse::parseProcStat(m_readBuf);
     if (st.cpus.empty() && !st.aggregate)
         s.problems.emplace_back("/proc/stat malformed");
 
@@ -729,23 +727,21 @@ void Sampler::sampleCpu(Snapshot& s, bool baseline)
 
 void Sampler::sampleMemory(Snapshot& s)
 {
-    std::string text;
     int err = 0;
-    if (!readFile(m_opt.procRoot + "/meminfo", text, &err)) {
+    if (!readFile(m_opt.procRoot + "/meminfo", m_readBuf, &err)) {
         s.problems.push_back(tableProblem("/proc/meminfo", err));
         return;
     }
-    s.memory = metrics::memoryFromRaw(parse::parseMeminfo(text));
+    s.memory = metrics::memoryFromRaw(parse::parseMeminfo(m_readBuf));
     if (!s.memory.valid)
         s.problems.emplace_back("/proc/meminfo malformed");
 }
 
 void Sampler::sampleLoad(Snapshot& s)
 {
-    std::string text;
-    if (!readFile(m_opt.procRoot + "/loadavg", text, nullptr, 4096))
+    if (!readFile(m_opt.procRoot + "/loadavg", m_readBuf, nullptr, 4096))
         return;
-    if (const auto l = parse::parseLoadavg(text)) {
+    if (const auto l = parse::parseLoadavg(m_readBuf)) {
         s.load1 = l->one;
         s.load5 = l->five;
         s.load15 = l->fifteen;
@@ -756,15 +752,14 @@ void Sampler::sampleLoad(Snapshot& s)
 
 void Sampler::sampleDisks(Snapshot& s, bool baseline, double elapsed)
 {
-    std::string text;
     int err = 0;
-    if (!readFile(m_opt.procRoot + "/diskstats", text, &err)) {
+    if (!readFile(m_opt.procRoot + "/diskstats", m_readBuf, &err)) {
         s.problems.push_back(tableProblem("/proc/diskstats", err));
         m_disks.clear();
         return;
     }
-    std::set<std::string> seen;
-    for (const auto& line : parse::parseDiskstats(text)) {
+    const uint64_t scan = m_sequence;
+    for (const auto& line : parse::parseDiskstats(m_readBuf)) {
         // Loop and RAM disks mirror other storage or memory; skipping them
         // before touching sysfs keeps hosts with many snap loops cheap.
         if (startsWith(line.name, "loop") || startsWith(line.name, "ram"))
@@ -812,12 +807,12 @@ void Sampler::sampleDisks(Snapshot& s, bool baseline, double elapsed)
         state.sectorsRead = line.sectorsRead;
         state.sectorsWritten = line.sectorsWritten;
         state.ioTicks = line.ioTicksMs;
+        state.seenScan = scan;
         state.hasPrev = true;
-        seen.insert(line.name);
         s.disks.push_back(std::move(d));
     }
     for (auto it = m_disks.begin(); it != m_disks.end();)
-        it = seen.count(it->first) ? std::next(it) : m_disks.erase(it);
+        it = it->second.seenScan == scan ? std::next(it) : m_disks.erase(it);
 
     // Physical whole disks never overlap each other, so their sum is honest.
     AggregateRate agg;
@@ -844,15 +839,14 @@ void Sampler::sampleDisks(Snapshot& s, bool baseline, double elapsed)
 
 void Sampler::sampleNetwork(Snapshot& s, bool baseline, double elapsed)
 {
-    std::string text;
     int err = 0;
-    if (!readFile(m_opt.procRoot + "/net/dev", text, &err)) {
+    if (!readFile(m_opt.procRoot + "/net/dev", m_readBuf, &err)) {
         s.problems.push_back(tableProblem("/proc/net/dev", err));
         m_nets.clear();
         return;
     }
-    std::set<std::string> seen;
-    for (const auto& line : parse::parseNetDev(text)) {
+    const uint64_t scan = m_sequence;
+    for (const auto& line : parse::parseNetDev(m_readBuf)) {
         const std::string base = m_opt.sysRoot + "/class/net/" + line.name;
         std::string identity = readTrimmed(base + "/ifindex");
         auto& state = m_nets[line.name];
@@ -877,12 +871,12 @@ void Sampler::sampleNetwork(Snapshot& s, bool baseline, double elapsed)
         }
         state.rx = line.rxBytes;
         state.tx = line.txBytes;
+        state.seenScan = scan;
         state.hasPrev = true;
-        seen.insert(line.name);
         s.interfaces.push_back(std::move(n));
     }
     for (auto it = m_nets.begin(); it != m_nets.end();)
-        it = seen.count(it->first) ? std::next(it) : m_nets.erase(it);
+        it = it->second.seenScan == scan ? std::next(it) : m_nets.erase(it);
 
     // Virtual interfaces (bridges, veth, tunnels) re-carry traffic that also
     // crosses a physical NIC, so the default aggregate uses physical ones only.
@@ -916,13 +910,12 @@ void Sampler::prepareFilesystems(Snapshot& s, double now)
 {
     m_fsGroups.clear();
     m_fsTargets.clear();
-    std::string text;
     int err = 0;
-    if (!readFile(m_opt.procRoot + "/self/mountinfo", text, &err)) {
+    if (!readFile(m_opt.procRoot + "/self/mountinfo", m_readBuf, &err)) {
         s.problems.push_back(tableProblem("/proc/self/mountinfo", err));
         return;
     }
-    const auto table = parse::parseMountInfo(text);
+    const auto table = parse::parseMountInfo(m_readBuf);
     // Classify by type first: network, FUSE and autofs mounts are never
     // probed. Then check the mount is what its path actually resolves to and
     // that reaching it never crosses a mount whose lookups could hang.
@@ -1295,8 +1288,12 @@ void Sampler::sampleProcesses(Snapshot& s, bool baseline, double elapsed, double
     while (const dirent* e = ::readdir(dir)) {
         const char* name = e->d_name;
         bool numeric = name[0] != '\0';
-        for (const char* c = name; *c; ++c)
-            numeric = numeric && *c >= '0' && *c <= '9';
+        for (const char* c = name; *c; ++c) {
+            if (*c < '0' || *c > '9') {
+                numeric = false;
+                break;
+            }
+        }
         if (!numeric)
             continue;
 

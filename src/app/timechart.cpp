@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 namespace {
@@ -26,12 +27,36 @@ Qt::PenStyle cycleStyle(int index)
     return styles[static_cast<std::size_t>((i + i / 8) % 4)];
 }
 
-constexpr double kMargin = 8;
-constexpr double kSwatch = 22;
+constexpr double kPadXFull = 12;
+constexpr double kPadYFull = 8;
+constexpr double kPadXCompact = 8;
+constexpr double kPadYCompact = 6;
+constexpr double kSwatch = 16;
 // Longest reveal of a new sample (never more than half its interval).
 constexpr double kRevealSeconds = 0.3;
 // Vertical edges below the lines beyond which frames repaint all data rows.
 constexpr std::size_t kMaxEdges = 8;
+
+QFont scaledAxisFont(const QFont& base)
+{
+    QFont f = base;
+    if (f.pointSizeF() > 0)
+        f.setPointSizeF(std::max(6.0, f.pointSizeF() * 0.88));
+    else if (f.pixelSize() > 0)
+        f.setPixelSize(std::max(8, static_cast<int>(std::lround(f.pixelSize() * 0.88))));
+    return f;
+}
+
+QString unitValueReserve(ps::Unit unit)
+{
+    switch (unit) {
+    case ps::Unit::Percent: return QStringLiteral("100.0 %");
+    case ps::Unit::Celsius: return QStringLiteral("100.0 \u00b0C");
+    case ps::Unit::Bytes: return QStringLiteral("1000 MiB");
+    case ps::Unit::BytesPerSecond: return QStringLiteral("1000 MiB/s");
+    }
+    return QStringLiteral("1000 MiB/s");
+}
 
 long long floorDiv(long long a, long long b)
 {
@@ -182,13 +207,15 @@ bool clipSegment(QPointF& a, QPointF& b, const QRectF& r)
     return true;
 }
 
-void strokeTrace(QPainter& p, const QPolygonF& run, const std::vector<char>& anchors, const QColor& color,
-                 double width, Qt::PenStyle style, const QRectF& clip)
+namespace {
+
+template <typename LineList>
+void appendTraceLines(const QPolygonF& run, const std::vector<char>& anchors, double width, Qt::PenStyle style,
+                      const QRectF& clip, LineList& lines)
 {
     const qsizetype n = run.size();
     if (n < 2 || style == Qt::NoPen || !(width > 0))
         return;
-    QVarLengthArray<QLineF, 512> lines;
     const bool solid = style == Qt::SolidLine || style == Qt::CustomDashLine;
     if (solid) {
         // Square caps close the joins between segments; the run's own ends
@@ -265,8 +292,18 @@ void strokeTrace(QPainter& p, const QPolygonF& run, const std::vector<char>& anc
             d += QLineF(run[k - 1], run[k]).length();
         }
     }
+}
+
+} // namespace
+
+void strokeTrace(QPainter& p, const QPolygonF& run, const std::vector<char>& anchors, const QColor& color,
+                 double width, Qt::PenStyle style, const QRectF& clip)
+{
+    QVarLengthArray<QLineF, 512> lines;
+    appendTraceLines(run, anchors, width, style, clip, lines);
     if (lines.isEmpty())
         return;
+    const bool solid = style == Qt::SolidLine || style == Qt::CustomDashLine;
     p.setRenderHint(QPainter::Antialiasing, true);
     p.setPen(QPen(color, width, Qt::SolidLine, solid ? Qt::SquareCap : Qt::FlatCap));
     p.setBrush(Qt::NoBrush);
@@ -299,23 +336,17 @@ Qt::PenStyle seriesStyle(int index)
     return cycleStyle(index);
 }
 
-namespace {
-
 // Chart colours, all derived from the current palette. The plot is lightly
 // tinted with the chart's first series colour, and so are its grid lines.
-struct PlotColors {
-    bool dark = false;
-    QColor base, text, muted;
-    QColor frame; // translucent text
-    QColor plotBg;
-    QColor grid;        // translucent accent, for lines drawn over the data
-    QColor gridOpaque;  // the same over the plot background
-    QColor frameOpaque; // frame over the plot background
-};
-
-PlotColors plotColors(const QPalette& pal, const std::vector<ChartSeries>& series)
+const TimeChart::CachedColors& TimeChart::resolvedColors(const QPalette& pal) const
 {
-    PlotColors c;
+    const qint64 key = pal.cacheKey();
+    const int firstVis = m_series.empty() ? -1 : visualOf(m_series.front(), 0);
+    if (m_colorsCache.valid && m_colorsCache.paletteKey == key && m_colorsCache.firstVisual == firstVis)
+        return m_colorsCache;
+    CachedColors& c = m_colorsCache;
+    c.paletteKey = key;
+    c.firstVisual = firstVis;
     c.dark = isDarkPalette(pal);
     c.base = pal.color(QPalette::Base);
     c.text = pal.color(QPalette::Text);
@@ -324,15 +355,19 @@ PlotColors plotColors(const QPalette& pal, const std::vector<ChartSeries>& serie
         c.muted = pal.color(QPalette::Disabled, QPalette::Text);
     c.frame = c.text;
     c.frame.setAlphaF(0.22f);
-    const QColor accent = series.empty() ? c.text : seriesColor(visualOf(series.front(), 0), pal);
+    const QColor accent = firstVis < 0 ? c.text : seriesColor(firstVis, pal);
     c.plotBg = blend(c.base, accent, c.dark ? 0.07 : 0.045);
     const double gridAlpha = c.dark ? 0.22 : 0.16;
     c.grid = accent;
     c.grid.setAlphaF(static_cast<float>(gridAlpha));
     c.gridOpaque = blend(c.plotBg, accent, gridAlpha);
     c.frameOpaque = blend(c.plotBg, c.text, 0.22);
+    c.cardBorder = blend(c.base, c.text, c.dark ? 0.14 : 0.16);
+    c.valid = true;
     return c;
 }
+
+namespace {
 
 // Values of the horizontal grid lines: multiples of the step, also for fixed
 // ranges whose bounds are not. The glance view keeps every other line, and a
@@ -370,15 +405,15 @@ std::vector<double> gridValues(double lo, double hi, double step, bool simple, i
 // (at rows gridYs, one of which can be the row below the plot) and the top
 // and bottom frame lines, all opaque.
 void paintPlotBase(QPainter& p, const QRectF& plot, double x0, double x1, const std::vector<double>& gridYs,
-                   const PlotColors& c)
+                   const QColor& plotBg, const QColor& gridOpaque, const QColor& frameOpaque)
 {
     if (!(x1 > x0))
         return;
-    p.fillRect(QRectF(x0, plot.top(), x1 - x0, plot.height()), c.plotBg);
+    p.fillRect(QRectF(x0, plot.top(), x1 - x0, plot.height()), plotBg);
     for (double y : gridYs)
-        p.fillRect(QRectF(x0, y, x1 - x0, 1), c.gridOpaque);
-    p.fillRect(QRectF(x0, plot.top(), x1 - x0, 1), c.frameOpaque);
-    p.fillRect(QRectF(x0, plot.bottom() - 1, x1 - x0, 1), c.frameOpaque);
+        p.fillRect(QRectF(x0, y, x1 - x0, 1), gridOpaque);
+    p.fillRect(QRectF(x0, plot.top(), x1 - x0, 1), frameOpaque);
+    p.fillRect(QRectF(x0, plot.bottom() - 1, x1 - x0, 1), frameOpaque);
 }
 
 // A translucent fill in bands of at most 90 device rows: taller ones make
@@ -386,21 +421,40 @@ void paintPlotBase(QPainter& p, const QRectF& plot, double x0, double x1, const 
 // one-pixel columns costs far more than it saves.
 void fillTranslucent(QPainter& p, const QRectF& r, const QColor& color)
 {
+    if (!(r.height() > 0) || !(r.width() > 0))
+        return;
     const double sy = std::fabs(p.deviceTransform().m22());
     const double band = std::max(1.0, std::floor(90 / std::max(sy, 1e-3)));
     for (double y = r.top(); y < r.bottom(); y += band)
         p.fillRect(QRectF(r.left(), y, r.width(), std::min(band, r.bottom() - y)), color);
 }
 
+constexpr double kReadoutPadX = 10;
+constexpr double kReadoutPadY = 6;
+constexpr double kReadoutRowGap = 2;
+constexpr double kReadoutHeaderGap = 5;
+constexpr double kReadoutDotIndent = 12; // 6px dot + 6px gap
+
 // The readout box beside the cursor line at x: right of it, or left of it
 // where it would pass the plot's right edge.
-QRectF readoutBox(const QFontMetrics& fm, const QStringList& rows, double x, const QRectF& plot)
+QRectF readoutBox(const QFont& baseFont, const QStringList& rows, double x, const QRectF& plot)
 {
+    QFont headerFont = baseFont;
+    headerFont.setWeight(QFont::DemiBold);
+    const QFontMetrics hfm(headerFont);
+    const QFontMetrics fm(baseFont);
     double bw = 0;
-    for (const auto& r : rows)
-        bw = std::max<double>(bw, fm.horizontalAdvance(r));
-    bw += 16;
-    const double bh = rows.size() * fm.height() + 10;
+    for (qsizetype i = 0; i < rows.size(); ++i) {
+        if (i == 0)
+            bw = std::max<double>(bw, hfm.horizontalAdvance(rows[i]));
+        else
+            bw = std::max<double>(bw, kReadoutDotIndent + fm.horizontalAdvance(rows[i]));
+    }
+    bw += kReadoutPadX * 2;
+    const int nSeries = std::max<int>(0, static_cast<int>(rows.size()) - 1);
+    double bh = kReadoutPadY * 2 + (rows.isEmpty() ? 0.0 : hfm.height());
+    if (nSeries > 0)
+        bh += kReadoutHeaderGap + nSeries * fm.height() + (nSeries - 1) * kReadoutRowGap;
     double bx = x + 10;
     if (bx + bw > plot.right())
         bx = x - 10 - bw;
@@ -736,14 +790,13 @@ QRegion TimeChart::cursorFootprint() const
     const double x = plot.right() - (endTime() - m_history->time(*nearest)) / m_window * plot.width();
     if (!(x >= plot.left() - 1 && x <= plot.right() + 1))
         return {};
-    const QFontMetrics fm(font());
-    const QRectF box = readoutBox(fm, readoutText().split(QLatin1Char('\n')), x, plot);
+    const QRectF box = readoutBox(font(), readoutText().split(QLatin1Char('\n')), x, plot);
     return cursorRegion(x, box, plot) & rect();
 }
 
 QSize TimeChart::sizeHint() const
 {
-    return m_mode == Mode::Full ? QSize(520, 240) : QSize(180, 84);
+    return m_mode == Mode::Full ? QSize(520, 240) : QSize(180, 78);
 }
 
 QSize TimeChart::minimumSizeHint() const
@@ -753,8 +806,11 @@ QSize TimeChart::minimumSizeHint() const
     // Title, up to two legend rows, a plot with room for a few grid labels
     // and the time axis, in the current font.
     const QFontMetrics fm(font());
+    const QFontMetrics afm(scaledAxisFont(font()));
     const int legendRows = (m_series.empty() || !m_legendVisible) ? 0 : m_series.size() > 2 ? 2 : 1;
-    const int h = static_cast<int>(kMargin * 1.5) + (fm.height() + 2) * (1 + legendRows) + 6 + 5 * fm.height() + 4;
+    const int topGap = static_cast<int>(std::max(10.0, std::ceil(afm.height() * 0.55) + 4.0));
+    const int h = static_cast<int>(kPadYFull * 2) + (fm.height() + 2) * (1 + legendRows) + topGap
+        + 4 * fm.height() + afm.height() + 6;
     return QSize(260, std::max(150, h));
 }
 
@@ -1000,21 +1056,30 @@ QString TimeChart::axisLabel(double v, const Range& r) const
 TimeChart::Layout TimeChart::computeLayout(const QFontMetrics& fm) const
 {
     Layout l;
-    const QRectF area = QRectF(rect()).adjusted(kMargin, kMargin * 0.75, -kMargin, -kMargin * 0.75);
+    l.axisFont = scaledAxisFont(font());
+    const QFontMetrics afm(l.axisFont);
+    l.fmHeight = fm.height();
+    l.afmHeight = afm.height();
+    l.afmAvgCharWidth = afm.averageCharWidth();
     if (m_mode == Mode::Compact) {
-        l.header = QRectF(area.left(), area.top(), area.width(), fm.height());
-        l.plot = QRectF(area.left(), l.header.bottom() + 3, area.width(), area.bottom() - l.header.bottom() - 3);
+        const QRectF area = QRectF(rect()).adjusted(kPadXCompact, kPadYCompact, -kPadXCompact, -kPadYCompact);
+        l.header = QRectF(area.left(), area.top(), area.width(), l.fmHeight);
+        l.plot = QRectF(area.left(), l.header.bottom() + 4, area.width(), std::max(10.0, area.bottom() - l.header.bottom() - 4));
         return l;
     }
+    const QRectF area = QRectF(rect()).adjusted(kPadXFull, kPadYFull, -kPadXFull, -kPadYFull);
     // Title row, then legend rows that wrap to the widget width.
-    const double rowH = fm.height() + 2;
-    const double valueReserve = fm.horizontalAdvance(QStringLiteral("000 MiB/s"));
+    const double rowH = l.fmHeight + 2;
+    QFont bold = font();
+    bold.setWeight(QFont::DemiBold);
+    const QFontMetrics vfm(bold);
+    l.valueReserve = vfm.horizontalAdvance(unitValueReserve(m_unit));
     double x = 0;
     int rows = (m_series.empty() || !m_legendVisible) ? 0 : 1;
     for (const auto& cs : m_series) {
         if (rows == 0)
             break;
-        const double w = kSwatch + 6 + fm.horizontalAdvance(cs.label + QStringLiteral(": ")) + valueReserve + 16;
+        const double w = kSwatch + 6 + fm.horizontalAdvance(cs.label + QStringLiteral(": ")) + l.valueReserve + 14;
         if (x > 0 && x + w > area.width()) {
             ++rows;
             x = 0;
@@ -1030,20 +1095,24 @@ TimeChart::Layout TimeChart::computeLayout(const QFontMetrics& fm) const
     case ps::Unit::Bytes: widest = QStringLiteral("1000 MiB"); break;
     case ps::Unit::BytesPerSecond: widest = QStringLiteral("1000 MiB/s"); break;
     }
-    const double axisW = fm.horizontalAdvance(widest) + 8;
-    l.tickLabelWidth = fm.horizontalAdvance(QStringLiteral("\u221215 min"));
-    l.compoundLabelWidth = fm.horizontalAdvance(QStringLiteral("\u221214 min 45 s"));
-    const double top = l.header.bottom() + 6;
-    const double bottom = area.bottom() - fm.height() - 4;
+    const double axisW = afm.horizontalAdvance(widest) + 10;
+    l.tickLabelWidth = afm.horizontalAdvance(QStringLiteral("\u221215 min"));
+    l.compoundLabelWidth = afm.horizontalAdvance(QStringLiteral("\u221214 min 45 s"));
+    // Leave enough clearance above the plot for the centered top Y-axis tick label
+    // so it never touches the title or legend row above it.
+    const double topGap = std::max(10.0, std::ceil(l.afmHeight * 0.55) + 4.0);
+    const double top = l.header.bottom() + topGap;
+    const double bottom = area.bottom() - l.afmHeight - 6;
     l.plot = QRectF(area.left() + axisW, top, std::max(10.0, area.width() - axisW), std::max(10.0, bottom - top));
     return l;
 }
 
-const TimeChart::Layout& TimeChart::layout(const QFontMetrics& fm)
+const TimeChart::Layout& TimeChart::layout()
 {
     // Text measurement is not free (shaping), and frames between samples
     // would otherwise repeat it for an unchanged layout.
     if (!m_layoutValid || m_layoutSize != size()) {
+        const QFontMetrics fm(font());
         m_layoutCache = computeLayout(fm);
         m_layoutSize = size();
         m_layoutValid = true;
@@ -1055,7 +1124,7 @@ void TimeChart::paintEvent(QPaintEvent* event)
 {
     QPainter p(this);
     const QPalette pal = palette();
-    const PlotColors c = plotColors(pal, m_series);
+    const CachedColors& c = resolvedColors(pal);
     const bool dark = c.dark;
     const QColor& base = c.base;
     const QColor& text = c.text;
@@ -1068,18 +1137,22 @@ void TimeChart::paintEvent(QPaintEvent* event)
     const QRegion& dirtyRegion = event->region();
     auto needs = [&](const QRectF& r) { return dirtyRegion.intersects(r.toAlignedRect()); };
 
-    const QFontMetrics fm(font());
-    const Layout& l = layout(fm);
+    const Layout& l = layout();
     m_lastPlot = l.plot;
     ++m_paintCount;
     {
         // Everything but the plot, which is painted opaque below.
+        // Skip outer strips that do not intersect the dirty rect on partial scroll frames.
         const QRectF pl = l.plot;
         const double w = width(), h = height();
-        p.fillRect(QRectF(0, 0, w, pl.top()), base);
-        p.fillRect(QRectF(0, pl.bottom(), w, h - pl.bottom()), base);
-        p.fillRect(QRectF(0, pl.top(), pl.left(), pl.height()), base);
-        p.fillRect(QRectF(pl.right(), pl.top(), w - pl.right(), pl.height()), base);
+        if (dirty.top() < pl.top())
+            p.fillRect(QRectF(0, 0, w, pl.top()), base);
+        if (dirty.bottom() + 1 > pl.bottom())
+            p.fillRect(QRectF(0, pl.bottom(), w, h - pl.bottom()), base);
+        if (dirty.left() < pl.left())
+            p.fillRect(QRectF(0, pl.top(), pl.left(), pl.height()), base);
+        if (dirty.right() + 1 > pl.right())
+            p.fillRect(QRectF(pl.right(), pl.top(), w - pl.right(), pl.height()), base);
     }
 
     const bool haveData = m_history && !m_history->empty();
@@ -1135,8 +1208,9 @@ void TimeChart::paintEvent(QPaintEvent* event)
 
     // Header: title, notice and legend with current values.
     if (needs(l.header)) {
+        const QFontMetrics fm(font());
         QFont bold = font();
-        bold.setBold(true);
+        bold.setWeight(QFont::DemiBold);
         p.setFont(bold);
         p.setPen(text);
         const QFontMetrics bfm(bold);
@@ -1151,25 +1225,26 @@ void TimeChart::paintEvent(QPaintEvent* event)
             const double avail = l.header.width() - fm.horizontalAdvance(value) - 6;
             title = bfm.elidedText(title, Qt::ElideRight, static_cast<int>(std::max(0.0, avail)));
         }
-        p.drawText(QRectF(l.header.left(), l.header.top(), l.header.width(), fm.height() + 2),
+        p.drawText(QRectF(l.header.left(), l.header.top(), l.header.width(), l.fmHeight + 2),
                    Qt::AlignLeft | Qt::AlignVCenter, title);
         p.setFont(font());
         if (!m_notice.isEmpty()) {
             p.setPen(muted);
-            p.drawText(QRectF(l.header.left(), l.header.top(), l.header.width(), fm.height() + 2),
+            p.drawText(QRectF(l.header.left(), l.header.top(), l.header.width(), l.fmHeight + 2),
                        Qt::AlignRight | Qt::AlignVCenter, m_notice);
         }
 
         if (m_mode == Mode::Full && l.legendRows > 0) {
-            const double rowH = fm.height() + 2;
-            const double valueReserve = fm.horizontalAdvance(QStringLiteral("000 MiB/s"));
+            const double rowH = l.fmHeight + 2;
+            const double valueReserve = l.valueReserve;
             double x = 0;
             int row = 1;
             for (std::size_t si = 0; si < m_series.size(); ++si) {
                 const auto& cs = m_series[si];
                 const int visual = visualOf(cs, si);
                 const QString label = cs.label + QStringLiteral(": ");
-                const double w = kSwatch + 6 + fm.horizontalAdvance(label) + valueReserve + 16;
+                const double labelW = fm.horizontalAdvance(label);
+                const double w = kSwatch + 6 + labelW + valueReserve + 14;
                 if (x > 0 && x + w > l.header.width()) {
                     ++row;
                     x = 0;
@@ -1180,19 +1255,18 @@ void TimeChart::paintEvent(QPaintEvent* event)
                 if (cs.fill) {
                     QColor swatchFill = color;
                     swatchFill.setAlphaF(dark ? 0.30f : 0.24f);
-                    p.fillRect(QRectF(l.header.left() + x, cy, kSwatch, rowH / 2 - 1), swatchFill);
+                    p.fillRect(QRectF(l.header.left() + x, cy, kSwatch, std::min(4.0, rowH / 2 - 1)), swatchFill);
                 }
-                QPen pen(color, 2.2, styleOf(cs, visual), Qt::FlatCap);
+                QPen pen(color, 2.0, styleOf(cs, visual), Qt::FlatCap);
                 p.setPen(pen);
                 p.drawLine(QPointF(l.header.left() + x, cy), QPointF(l.header.left() + x + kSwatch, cy));
-                p.setPen(text);
+                p.setPen(muted);
                 const double lx = l.header.left() + x + kSwatch + 6;
-                p.drawText(QRectF(lx, y, w, rowH), Qt::AlignLeft | Qt::AlignVCenter, label);
+                p.drawText(QRectF(lx, y, labelW + 2, rowH), Qt::AlignLeft | Qt::AlignVCenter, label);
                 const double v = inWindow ? m_history->latestValue(cs.key) : ps::kNaN;
-                QFont vf = font();
-                vf.setBold(true);
-                p.setFont(vf);
-                p.drawText(QRectF(lx + fm.horizontalAdvance(label), y, valueReserve + 16, rowH),
+                p.setFont(bold);
+                p.setPen(text);
+                p.drawText(QRectF(lx + labelW, y, valueReserve + 14, rowH),
                            Qt::AlignLeft | Qt::AlignVCenter, formatValue(v));
                 p.setFont(font());
                 x += w;
@@ -1209,18 +1283,36 @@ void TimeChart::paintEvent(QPaintEvent* event)
 
     // Horizontal grid: its rows belong to the opaque plot background, which is
     // painted with the data below; the labels are outside the plot.
-    const int maxLines = m_mode == Mode::Full ? static_cast<int>(plot.height() / (fm.height() * 1.2)) + 1 : 0;
-    const std::vector<double> gridVals = gridValues(range.lo, range.hi, range.step, m_simple, maxLines);
-    std::vector<double> gridYs;
-    gridYs.reserve(gridVals.size());
-    for (double v : gridVals) {
-        const double y = std::round(yOf(v));
-        gridYs.push_back(y);
-        const QRectF labelRect(0, y + 0.5 - fm.height() / 2.0, plot.left() - 6, fm.height());
-        if (m_mode == Mode::Full && needs(labelRect)) {
-            p.setPen(muted);
-            p.drawText(labelRect, Qt::AlignRight | Qt::AlignVCenter, axisLabel(v, range));
+    const int maxLines = m_mode == Mode::Full ? static_cast<int>(plot.height() / (l.afmHeight * 1.35)) + 1 : 3;
+    if (!m_gridCacheValid || m_gridCacheLo != range.lo || m_gridCacheHi != range.hi || m_gridCacheStep != range.step
+        || m_gridCacheSimple != m_simple || m_gridCacheMaxLines != maxLines || m_gridCacheTop != plot.top()
+        || m_gridCacheHeight != plot.height()) {
+        m_gridValsCache = gridValues(range.lo, range.hi, range.step, m_simple, maxLines);
+        m_gridYsCache.clear();
+        m_gridYsCache.reserve(m_gridValsCache.size());
+        for (double v : m_gridValsCache)
+            m_gridYsCache.push_back(std::round(yOf(v)));
+        m_gridCacheLo = range.lo;
+        m_gridCacheHi = range.hi;
+        m_gridCacheStep = range.step;
+        m_gridCacheSimple = m_simple;
+        m_gridCacheMaxLines = maxLines;
+        m_gridCacheTop = plot.top();
+        m_gridCacheHeight = plot.height();
+        m_gridCacheValid = true;
+    }
+    const std::vector<double>& gridVals = m_gridValsCache;
+    const std::vector<double>& gridYs = m_gridYsCache;
+    if (m_mode == Mode::Full && dirty.left() < plot.left()) {
+        p.setFont(l.axisFont);
+        p.setPen(muted);
+        for (std::size_t i = 0; i < gridVals.size(); ++i) {
+            const double y = gridYs[i];
+            const QRectF labelRect(0, y + 0.5 - l.afmHeight / 2.0, plot.left() - 8, l.afmHeight);
+            if (needs(labelRect))
+                p.drawText(labelRect, Qt::AlignRight | Qt::AlignVCenter, axisLabel(gridVals[i], range));
         }
+        p.setFont(font());
     }
 
     m_paintedLayer = false;
@@ -1269,13 +1361,15 @@ void TimeChart::paintEvent(QPaintEvent* event)
                         blit(r);
                     }
                 } else {
-                    blit(target);
+                    const QRect r = device.mapRect(QRectF(dirty)).toAlignedRect();
+                    blit(r);
                 }
                 p.restore();
             }
             // Past the reveal point the plot shows only its background.
             if (right < g.right)
-                paintPlotBase(p, plot, (right - g.ox) / g.sx, plot.right(), gridYs, c);
+                paintPlotBase(p, plot, (right - g.ox) / g.sx, plot.right(), gridYs, c.plotBg, c.gridOpaque,
+                              c.frameOpaque);
             m_paintedKey = key;
             m_paintedLayer = true;
             plotPainted = true;
@@ -1293,7 +1387,7 @@ void TimeChart::paintEvent(QPaintEvent* event)
             }
         } else {
             // Rotated or sheared paint devices: draw the data directly.
-            paintPlotBase(p, plot, plot.left(), plot.right(), gridYs, c);
+            paintPlotBase(p, plot, plot.left(), plot.right(), gridYs, c.plotBg, c.gridOpaque, c.frameOpaque);
             plotPainted = true;
             QRectF clip = plot.adjusted(0, 0, 0, 1);
             QRectF area = plot;
@@ -1308,12 +1402,18 @@ void TimeChart::paintEvent(QPaintEvent* event)
         }
     }
     if (!plotPainted)
-        paintPlotBase(p, plot, plot.left(), plot.right(), gridYs, c);
+        paintPlotBase(p, plot, plot.left(), plot.right(), gridYs, c.plotBg, c.gridOpaque, c.frameOpaque);
 
     // Lines fixed on screen go over the data, translucent: the time grid (at
     // fixed ages relative to now, so the data scrolls under it) and the side
-    // frame lines.
+    // frame lines. Clamp the vertical draw span to the dirty rect to avoid
+    // unnecessary fillRect calls on banded scroll repaints.
     p.setRenderHint(QPainter::Antialiasing, false);
+    const double vTop = std::max(plot.top() + 1, static_cast<double>(dirty.top()) - 1);
+    const double vBot = std::min(plot.bottom() - 1, static_cast<double>(dirty.bottom()) + 2);
+    const double vHeight = vBot - vTop;
+    const double dLeft = static_cast<double>(dirty.left()) - 1;
+    const double dRight = static_cast<double>(dirty.right()) + 2;
     if (m_mode == Mode::Full) {
         static const std::array<double, 10> steps = {5, 10, 15, 30, 60, 120, 180, 300, 600, 900};
         const double gap = l.tickLabelWidth * (m_simple ? 1.6 : 0.6);
@@ -1326,33 +1426,44 @@ void TimeChart::paintEvent(QPaintEvent* event)
                 break;
             }
         }
-        const bool labelRow = needs(QRectF(0, plot.bottom() + 3, width(), fm.height()));
+        const bool labelRow = needs(QRectF(0, plot.bottom() + 4, width(), l.afmHeight));
+        std::optional<QFontMetrics> afmOpt;
+        if (labelRow) {
+            afmOpt.emplace(l.axisFont);
+            p.setFont(l.axisFont);
+            p.setPen(muted);
+        }
         double nextLabelRight = std::numeric_limits<double>::infinity();
         for (double ago = 0; ago <= m_window + 1e-6; ago += step) {
             const double x = std::round(plot.right() - ago / m_window * plot.width());
             // Not over the side frame lines.
-            if (std::fabs(x - plot.left()) >= 0.5 && std::fabs(x - (plot.right() - 1)) >= 0.5)
-                fillTranslucent(p, QRectF(x, plot.top() + 1, 1, plot.height() - 2), c.grid);
+            if (vHeight > 0 && x >= dLeft && x <= dRight
+                && std::fabs(x - plot.left()) >= 0.5 && std::fabs(x - (plot.right() - 1)) >= 0.5)
+                fillTranslucent(p, QRectF(x, vTop, 1, vHeight), c.grid);
             if (!labelRow)
                 continue;
             const QString label = relTime(ago);
-            const double w = fm.horizontalAdvance(label);
+            const double w = afmOpt->horizontalAdvance(label);
             double lx = x + 0.5 - w / 2;
             lx = std::clamp(lx, plot.left(), plot.right() - w);
             // Labels are laid out right to left; one that would touch the
             // label to its right (an edge label pushed inwards) is left out.
-            if (lx + w + 2 * fm.averageCharWidth() > nextLabelRight)
+            if (lx + w + 2 * l.afmAvgCharWidth > nextLabelRight)
                 continue;
             nextLabelRight = lx;
-            const QRectF labelRect(lx, plot.bottom() + 3, w + 2, fm.height());
-            if (needs(labelRect)) {
-                p.setPen(muted);
+            const QRectF labelRect(lx, plot.bottom() + 4, w + 2, l.afmHeight);
+            if (needs(labelRect))
                 p.drawText(labelRect, Qt::AlignLeft | Qt::AlignTop, label);
-            }
         }
+        if (labelRow)
+            p.setFont(font());
     }
-    fillTranslucent(p, QRectF(plot.left(), plot.top() + 1, 1, plot.height() - 2), frame);
-    fillTranslucent(p, QRectF(plot.right() - 1, plot.top() + 1, 1, plot.height() - 2), frame);
+    if (vHeight > 0) {
+        if (plot.left() >= dLeft && plot.left() <= dRight)
+            fillTranslucent(p, QRectF(plot.left(), vTop, 1, vHeight), frame);
+        if (plot.right() - 1 >= dLeft && plot.right() - 1 <= dRight)
+            fillTranslucent(p, QRectF(plot.right() - 1, vTop, 1, vHeight), frame);
+    }
 
     if (painted == 0) {
         p.setPen(muted);
@@ -1382,15 +1493,44 @@ void TimeChart::paintEvent(QPaintEvent* event)
                 p.drawEllipse(QPointF(x, yOf(v)), 3.5, 3.5);
             }
             const QStringList rows = readoutText().split(QLatin1Char('\n'));
-            const QRectF box = readoutBox(fm, rows, x, plot);
+            const QRectF box = readoutBox(font(), rows, x, plot);
             p.setPen(QPen(frame, 1));
             p.setBrush(pal.color(QPalette::ToolTipBase));
-            p.drawRoundedRect(box, 4, 4);
-            p.setPen(pal.color(QPalette::ToolTipText));
-            double ty = box.top() + 5;
-            for (const auto& r : rows) {
-                p.drawText(QRectF(box.left() + 8, ty, box.width(), fm.height()), Qt::AlignLeft | Qt::AlignVCenter, r);
-                ty += fm.height();
+            p.drawRoundedRect(box, 6, 6);
+
+            QFont headerFont = font();
+            headerFont.setWeight(QFont::DemiBold);
+            const QFontMetrics hfm(headerFont);
+            const QColor tipText = pal.color(QPalette::ToolTipText);
+            double ty = box.top() + kReadoutPadY;
+            if (!rows.isEmpty()) {
+                p.setFont(headerFont);
+                p.setPen(tipText);
+                p.drawText(QRectF(box.left() + kReadoutPadX, ty, box.width() - kReadoutPadX * 2, hfm.height()),
+                           Qt::AlignLeft | Qt::AlignVCenter, rows.first());
+                ty += hfm.height();
+            }
+            if (rows.size() > 1) {
+                QColor sep = tipText;
+                sep.setAlphaF(0.16f);
+                p.setRenderHint(QPainter::Antialiasing, false);
+                p.fillRect(QRectF(box.left() + kReadoutPadX, ty + 2, box.width() - kReadoutPadX * 2, 1), sep);
+                p.setRenderHint(QPainter::Antialiasing, true);
+                ty += kReadoutHeaderGap;
+                p.setFont(font());
+                for (qsizetype ri = 1; ri < rows.size(); ++ri) {
+                    const std::size_t si = static_cast<std::size_t>(ri - 1);
+                    if (si < m_series.size()) {
+                        p.setPen(Qt::NoPen);
+                        p.setBrush(seriesColor(visualOf(m_series[si], si), pal));
+                        p.drawEllipse(QPointF(box.left() + kReadoutPadX + 3.0, ty + l.fmHeight / 2.0), 3.0, 3.0);
+                    }
+                    p.setPen(tipText);
+                    p.drawText(QRectF(box.left() + kReadoutPadX + kReadoutDotIndent, ty,
+                                      box.width() - kReadoutPadX * 2 - kReadoutDotIndent, l.fmHeight),
+                               Qt::AlignLeft | Qt::AlignVCenter, rows[ri]);
+                    ty += l.fmHeight + kReadoutRowGap;
+                }
             }
             drawnCursor = cursorRegion(x, box, plot) & rect();
         }
@@ -1398,6 +1538,19 @@ void TimeChart::paintEvent(QPaintEvent* event)
     // The screen now shows the cursor where it was drawn, and wherever an
     // earlier one was that this paint did not cover.
     m_paintedCursor = (m_paintedCursor - event->region()) + drawnCursor;
+
+    // Subtle 1px opaque outer card border on compact tiles (CoreGrid cards).
+    // Full charts keep the left axis strip pure Base so short-chart Y-axis
+    // label clearance stays crisp and uninterrupted.
+    const int w = width(), h = height();
+    if (m_mode == Mode::Compact && w > 2 && h > 2
+        && (dirty.left() <= 0 || dirty.top() <= 0 || dirty.right() >= w - 1 || dirty.bottom() >= h - 1)) {
+        p.setRenderHint(QPainter::Antialiasing, false);
+        p.fillRect(0, 0, w, 1, c.cardBorder);
+        p.fillRect(0, h - 1, w, 1, c.cardBorder);
+        p.fillRect(0, 1, 1, h - 2, c.cardBorder);
+        p.fillRect(w - 1, 1, 1, h - 2, c.cardBorder);
+    }
 
     if (hasFocus() && !QRectF(rect()).adjusted(3, 3, -3, -3).contains(dirty)) {
         p.setRenderHint(QPainter::Antialiasing, false);
@@ -1529,10 +1682,147 @@ void TimeChart::paintData(QPainter& p, const QRectF& plot, double lo, double hi,
     }
 }
 
+void TimeChart::buildPreparedData(DataLayer& g, std::size_t fromIndex, const QRectF& area, const QRectF& lineClip,
+                                  PreparedData& out) const
+{
+    out.gaps.clear();
+    out.series.clear();
+    out.filledCount = 0;
+    out.valid = true;
+    if (!m_history || m_history->empty())
+        return;
+    const std::size_t last = m_history->size() - 1;
+    if (fromIndex > last)
+        return;
+    const QRectF& plot = g.plot;
+    const double lo = g.lo, hi = g.hi, tEnd = g.end;
+    auto yOf = [&](double v) { return plot.bottom() - (v * 0.5 - lo * 0.5) / (hi * 0.5 - lo * 0.5) * plot.height(); };
+    auto xOf = [&](double t) { return plot.right() - (tEnd - t) / m_window * plot.width(); };
+    const QRectF band(area.left(), plot.top(), area.width(), plot.height());
+
+    for (std::size_t i = std::max<std::size_t>(fromIndex, 1); i <= last; ++i) {
+        if (m_history->continuous(i))
+            continue;
+        const double x0 = xOf(m_history->time(i - 1));
+        const double x1 = xOf(m_history->time(i));
+        if (x1 - x0 >= 2) {
+            const QRectF shade = QRectF(x0, plot.top(), x1 - x0, plot.height()).intersected(band);
+            if (!shade.isEmpty())
+                out.gaps.push_back(shade);
+        }
+    }
+
+    const double yLimit = 1e7 * std::max(1.0, plot.height());
+    const double quantum = m_window / 16;
+    const double baseValue = m_unit == ps::Unit::Celsius ? lo : std::clamp(0.0, lo, hi);
+    const double yBase = yOf(baseValue);
+    const double width = m_mode == Mode::Full ? 1.7 : 1.3;
+
+    out.series.resize(m_series.size());
+    for (std::size_t si = 0; si < m_series.size(); ++si) {
+        const auto& cs = m_series[si];
+        PreparedSeries& psOut = out.series[si];
+        psOut.visual = visualOf(cs, si);
+        psOut.style = styleOf(cs, psOut.visual);
+        psOut.fill = cs.fill;
+        const auto* s = m_history->find(cs.key);
+        if (!s)
+            continue;
+        out.filledCount += cs.fill ? 1 : 0;
+        const bool dashed = psOut.style != Qt::SolidLine;
+        QPolygonF runPts;
+        std::vector<char> runAnchors;
+        auto finishRun = [&] {
+            if (runPts.isEmpty())
+                return;
+            if (runPts.size() == 1) {
+                if (band.contains(runPts.front()))
+                    psOut.dots.push_back(runPts.front());
+            } else {
+                if (cs.fill && band.width() > 0) {
+                    QPolygonF shape = runPts;
+                    shape.append(QPointF(runPts.back().x(), yBase));
+                    shape.append(QPointF(runPts.front().x(), yBase));
+                    shape = clipPolygon(shape, band);
+                    if (shape.size() >= 3)
+                        psOut.areas.push_back(std::move(shape));
+                }
+                appendTraceLines(runPts, runAnchors, width, psOut.style, lineClip, psOut.lines);
+            }
+            runPts.clear();
+            runAnchors.clear();
+        };
+        for (std::size_t i = fromIndex; i <= last; ++i) {
+            if (i > fromIndex && !m_history->continuous(i))
+                finishRun();
+            const double v = m_history->value(*s, i);
+            const double y = ps::isValid(v) ? yOf(v) : ps::kNaN;
+            if (std::isnan(y)) {
+                finishRun();
+                continue;
+            }
+            const double t = m_history->time(i);
+            runPts.append(QPointF(xOf(t), std::clamp(y, plot.top() - yLimit, plot.bottom() + yLimit)));
+            if (dashed)
+                runAnchors.push_back(i > 0 && std::floor(t / quantum) != std::floor(m_history->time(i - 1) / quantum));
+        }
+        finishRun();
+    }
+}
+
+void TimeChart::paintPreparedData(QPainter& p, const PreparedData& prep, const QPalette& pal) const
+{
+    const bool dark = isDarkPalette(pal);
+    if (!prep.gaps.empty()) {
+        p.setRenderHint(QPainter::Antialiasing, false);
+        QColor gapColor = pal.color(QPalette::Text);
+        gapColor.setAlphaF(0.06f);
+        for (const QRectF& shade : prep.gaps)
+            p.fillRect(shade, gapColor);
+    }
+    const double areaAlpha = (dark ? 0.26 : 0.20) / std::sqrt(static_cast<double>(std::clamp(prep.filledCount, 1, 4)));
+    p.setRenderHint(QPainter::Antialiasing, false);
+    p.setPen(Qt::NoPen);
+    for (const auto& s : prep.series) {
+        if (!s.fill || s.areas.empty())
+            continue;
+        QColor c = seriesColor(s.visual, pal);
+        c.setAlphaF(static_cast<float>(areaAlpha));
+        p.setBrush(c);
+        for (const QPolygonF& shape : s.areas)
+            p.drawPolygon(shape);
+    }
+    const double width = m_mode == Mode::Full ? 1.7 : 1.3;
+    for (const auto& s : prep.series) {
+        if (s.dots.empty() && s.lines.isEmpty())
+            continue;
+        const QColor c = seriesColor(s.visual, pal);
+        if (!s.dots.empty()) {
+            p.setRenderHint(QPainter::Antialiasing, true);
+            p.setPen(Qt::NoPen);
+            p.setBrush(c);
+            for (const QPointF& pt : s.dots)
+                p.drawEllipse(pt, 2.0, 2.0);
+        }
+        if (!s.lines.isEmpty() && s.style != Qt::NoPen) {
+            const bool solid = s.style == Qt::SolidLine || s.style == Qt::CustomDashLine;
+            p.setRenderHint(QPainter::Antialiasing, true);
+            p.setPen(QPen(c, width, Qt::SolidLine, solid ? Qt::SquareCap : Qt::FlatCap));
+            p.setBrush(Qt::NoBrush);
+            p.drawLines(s.lines.constData(), static_cast<int>(s.lines.size()));
+        }
+    }
+}
+
 void TimeChart::invalidateLayer()
 {
     m_layer.valid = false;
+    m_layer.prepared.valid = false;
+    m_layer.patchPrepared.valid = false;
+    m_layer.canPatch.clear();
     m_statsValid = false;
+    m_colorsCache.valid = false;
+    m_gridCacheValid = false;
 }
 
 long long TimeChart::layerKey(double tEnd) const
@@ -1572,10 +1862,12 @@ bool TimeChart::prepareLayer(const QTransform& device, const QRectF& plot, const
     if (!(pxPerSecond > 0) || !std::isfinite(tEnd))
         return false;
     DataLayer& g = m_layer;
-    const bool same = g.valid && g.sx == sx && g.sy == sy && g.ox == ox && g.oy == oy && g.plot == plot &&
-                      g.lo == range.lo && g.hi == range.hi && g.window == m_window && g.history == m_history &&
-                      g.samples == m_history->totalSamples() && g.size == m_history->size() &&
-                      g.latest == m_history->latestTime() && g.gridYs == gridYs;
+    const qint64 palKey = palette().cacheKey();
+    const bool sameStatic = g.valid && g.sx == sx && g.sy == sy && g.ox == ox && g.oy == oy && g.plot == plot
+        && g.lo == range.lo && g.hi == range.hi && g.window == m_window && g.history == m_history
+        && g.gridYs == gridYs && g.paletteKey == palKey;
+    const bool same = sameStatic && g.samples == m_history->totalSamples() && g.size == m_history->size()
+        && g.latest == m_history->latestTime();
     // The same content for another axis end or first sample: the rows it
     // draws from are recomputed (a sample that left the window no longer
     // reaches the plot), while the band and edges keep what the screen may
@@ -1605,6 +1897,99 @@ bool TimeChart::prepareLayer(const QTransform& device, const QRectF& plot, const
     const int top = static_cast<int>(std::lround(t)), bottom = static_cast<int>(std::lround(b));
     if (right <= left || bottom <= top)
         return false;
+    const int newWidth = right - left + std::clamp(static_cast<int>(std::ceil(pxPerSecond * 3)) + 8, 16, 1024);
+    const int newPhases = (m_mode == Mode::Compact || pxPerSecond * 4 >= 50) ? 4 : 8;
+
+    // Incremental shift-and-patch: when only the view time rolled past the
+    // right buffer margin or new samples were appended to the same history
+    // with identical geometry/scale/range/palette, anchor the new layer's end
+    // at an exact integer pixel shift from the old layer so every already-drawn
+    // phase image can be shifted with memmove and only the newly exposed right
+    // strip rasterized.
+    bool incremental = false;
+    bool pureScroll = false;
+    int shiftPx = 0;
+    int dirtyLeft = 0;
+    double anchoredEnd = tEnd;
+    std::size_t patchFrom = start;
+    if (sameStatic && newWidth == g.width && newPhases == g.phases && tEnd >= g.end) {
+        const double deltaPxF = (tEnd - g.end) * pxPerSecond;
+        if (std::isfinite(deltaPxF) && deltaPxF >= 0.0 && deltaPxF < newWidth - 16) {
+            shiftPx = static_cast<int>(std::floor(deltaPxF));
+            anchoredEnd = g.end + static_cast<double>(shiftPx) / pxPerSecond;
+            if (same && shiftPx > 0) {
+                const double latestDev = (plot.right() - (anchoredEnd - g.latest) / m_window * plot.width()) * sx + ox
+                    - left;
+                if (latestDev < newWidth - shiftPx - 4) {
+                    incremental = true;
+                    pureScroll = true;
+                    dirtyLeft = newWidth - shiftPx;
+                }
+            } else if (!same && m_history->totalSamples() > g.samples && m_history->latestTime() > g.latest) {
+                const uint64_t added = m_history->totalSamples() - g.samples;
+                if (added < m_history->size()) {
+                    const std::size_t prevIdx = m_history->size() - 1 - static_cast<std::size_t>(added);
+                    if (prevIdx >= start && m_history->time(prevIdx) == g.latest) {
+                        bool anyDashed = false;
+                        for (std::size_t si = 0; si < m_series.size(); ++si)
+                            if (styleOf(m_series[si], visualOf(m_series[si], si)) != Qt::SolidLine)
+                                anyDashed = true;
+                        const double quantum = m_window / 16.0;
+                        // Dashed runs anchor at fixed quantum boundaries: as long as
+                        // start did not change or at least two quanta span start..prevIdx,
+                        // dropping an off-screen left sample never alters visible dashes.
+                        const bool dashSafe = !anyDashed || start == g.start
+                            || (m_history->time(prevIdx) - m_history->time(start) >= 2.0 * quantum);
+                        if (dashSafe) {
+                            const double prevDev = (plot.right() - (anchoredEnd - g.latest) / m_window * plot.width())
+                                * sx + ox - left;
+                            const int pad = static_cast<int>(std::ceil(4.0 * sx)) + 2;
+                            dirtyLeft = std::clamp(static_cast<int>(std::floor(prevDev)) - pad, 0, newWidth);
+                            if (shiftPx > 0)
+                                dirtyLeft = std::min(dirtyLeft, newWidth - shiftPx);
+                            if (dirtyLeft > 16) {
+                                // Walk patchFrom back past dirtyLeft and, for dashed series,
+                                // to an anchor boundary so dash offsets match a full draw.
+                                patchFrom = prevIdx;
+                                const double dirtyLogX = (left + dirtyLeft - 2 - ox) / sx;
+                                const double dirtyTime = anchoredEnd - (plot.right() - dirtyLogX) / plot.width() * m_window;
+                                while (patchFrom > start && m_history->time(patchFrom) >= dirtyTime)
+                                    --patchFrom;
+                                if (anyDashed) {
+                                    while (patchFrom > start
+                                           && std::floor(m_history->time(patchFrom) / quantum)
+                                               == std::floor(m_history->time(patchFrom - 1) / quantum))
+                                        --patchFrom;
+                                }
+                                // Keep one predecessor before patchFrom if needed for run continuity.
+                                if (patchFrom > start)
+                                    --patchFrom;
+                                incremental = true;
+                                pureScroll = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (incremental) {
+        g.canPatch = g.drawn;
+        g.patchShiftPx = shiftPx;
+        g.patchDirtyLeft = dirtyLeft;
+        g.patchPrevLatest = g.latest;
+        g.patchFromIndex = patchFrom;
+        g.patchPureScroll = pureScroll;
+    } else {
+        g.canPatch.assign(static_cast<std::size_t>(newPhases), 0);
+        g.patchShiftPx = 0;
+        g.patchDirtyLeft = 0;
+        g.patchPrevLatest = ps::kNaN;
+        g.patchFromIndex = start;
+        g.patchPureScroll = false;
+    }
+
     g.sx = sx;
     g.sy = sy;
     g.ox = ox;
@@ -1614,15 +1999,10 @@ bool TimeChart::prepareLayer(const QTransform& device, const QRectF& plot, const
     g.right = right;
     g.top = top;
     g.bottom = bottom;
-    // Room to scroll for about three seconds before the images are redrawn
-    // (a new sample redraws them anyway).
-    g.width = right - left + std::clamp(static_cast<int>(std::ceil(pxPerSecond * 3)) + 8, 16, 1024);
+    g.width = newWidth;
     g.pxPerSecond = pxPerSecond;
-    // Quarter-pixel steps when the plot moves fast enough for them to give
-    // about 60 positions a second, eighths when it moves slower. Small
-    // multiples step in quarter pixels.
-    g.phases = (m_mode == Mode::Compact || pxPerSecond * 4 >= 50) ? 4 : 8;
-    g.end = tEnd;
+    g.phases = newPhases;
+    g.end = incremental ? anchoredEnd : tEnd;
     g.start = start;
     g.lo = range.lo;
     g.hi = range.hi;
@@ -1632,6 +2012,9 @@ bool TimeChart::prepareLayer(const QTransform& device, const QRectF& plot, const
     g.size = m_history->size();
     g.latest = m_history->latestTime();
     g.gridYs = gridYs;
+    g.paletteKey = palKey;
+    g.prepared.valid = false;
+    g.patchPrepared.valid = false;
     if (same) {
         merge(dataExtent(plot, range.lo, range.hi, tEnd, start));
     } else {
@@ -1733,25 +2116,64 @@ TimeChart::Extent TimeChart::dataExtent(const QRectF& plot, double lo, double hi
 
 void TimeChart::drawLayerPhase(int phase)
 {
-    const PlotColors colors = plotColors(palette(), m_series);
+    const QPalette pal = palette();
+    const CachedColors& colors = resolvedColors(pal);
     DataLayer& g = m_layer;
-    QImage& image = g.images[static_cast<std::size_t>(phase)];
+    const auto pidx = static_cast<std::size_t>(phase);
+    QImage& image = g.images[pidx];
     const QSize size(g.width, g.bottom - g.top);
+    const bool patch = pidx < g.canPatch.size() && g.canPatch[pidx] && image.size() == size && !image.isNull();
     if (image.size() != size)
         image = QImage(size, QImage::Format_RGB32);
-    g.drawn[static_cast<std::size_t>(phase)] = 1;
+    g.drawn[pidx] = 1;
+    if (pidx < g.canPatch.size())
+        g.canPatch[pidx] = 0;
     if (image.isNull())
         return;
+
+    const double shift = static_cast<double>(phase) / g.phases;
+    if (patch) {
+        if (g.patchShiftPx > 0) {
+            const std::size_t copyBytes = static_cast<std::size_t>(g.width - g.patchShiftPx) * sizeof(QRgb);
+            for (int y = 0; y < image.height(); ++y) {
+                auto* row = reinterpret_cast<QRgb*>(image.scanLine(y));
+                std::memmove(row, row + g.patchShiftPx, copyBytes);
+            }
+        }
+        const int dl = std::clamp(g.patchDirtyLeft, 0, g.width);
+        if (dl < g.width) {
+            QPainter q(&image);
+            q.setClipRect(QRect(dl, 0, g.width - dl, image.height()));
+            q.fillRect(QRect(dl, 0, g.width - dl, image.height()), colors.base);
+            q.setTransform(QTransform(g.sx, 0, 0, g.sy, g.ox - g.left + shift, g.oy - g.top));
+            const double x0 = (g.left + dl - 1.0 - g.ox) / g.sx - 1.0;
+            const double x1 = (g.left + g.width - g.ox) / g.sx + 1.0;
+            paintPlotBase(q, g.plot, x0, x1, g.gridYs, colors.plotBg, colors.gridOpaque, colors.frameOpaque);
+            if (!g.patchPureScroll) {
+                if (!g.patchPrepared.valid) {
+                    const QRectF patchArea(x0, g.plot.top(), x1 - x0, g.plot.height());
+                    buildPreparedData(g, g.patchFromIndex, patchArea, patchArea.adjusted(-2, -2, 2, 2),
+                                      g.patchPrepared);
+                }
+                paintPreparedData(q, g.patchPrepared, pal);
+            }
+        }
+        return;
+    }
+
     image.fill(colors.base);
     QPainter q(&image);
-    const double shift = static_cast<double>(phase) / g.phases;
     q.setTransform(QTransform(g.sx, 0, 0, g.sy, g.ox - g.left + shift, g.oy - g.top));
-    // The widget-coordinate span of the image, a little beyond its edges.
-    const double x0 = (g.left - shift - g.ox) / g.sx - 1;
-    const double x1 = (g.left + g.width - shift - g.ox) / g.sx + 1;
+    // Common widget-coordinate span covering all sub-pixel phases, so
+    // prepared geometry (clipped areas and dashed stroke batches) is built
+    // once and reused across all 4-8 phases.
+    const double x0 = (g.left - 1.0 - g.ox) / g.sx - 1.0;
+    const double x1 = (g.left + g.width - g.ox) / g.sx + 1.0;
     const QRectF area(x0, g.plot.top(), x1 - x0, g.plot.height());
-    paintPlotBase(q, g.plot, x0, x1, g.gridYs, colors);
-    paintData(q, g.plot, g.lo, g.hi, g.end, g.start, area, area.adjusted(-2, -2, 2, 2));
+    paintPlotBase(q, g.plot, x0, x1, g.gridYs, colors.plotBg, colors.gridOpaque, colors.frameOpaque);
+    if (!g.prepared.valid)
+        buildPreparedData(g, g.start, area, area.adjusted(-2, -2, 2, 2), g.prepared);
+    paintPreparedData(q, g.prepared, pal);
 }
 
 void TimeChart::mouseMoveEvent(QMouseEvent* event)

@@ -6,6 +6,8 @@
 
 #include <QAbstractButton>
 #include <QColor>
+#include <QFont>
+#include <QImage>
 #include <QPalette>
 #include <string>
 #include <utility>
@@ -59,9 +61,51 @@ public:
 protected:
     void paintEvent(QPaintEvent* event) override;
     void changeEvent(QEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
 
 private:
+    struct SparkLayer {
+        std::vector<QImage> images;
+        std::vector<char> drawn;
+        int phases = 4;
+        double sx = 0, sy = 0, ox = 0, oy = 0;
+        QRectF spark;
+        int left = 0, right = 0, top = 0, bottom = 0;
+        int width = 0;
+        double pxPerSecond = 0;
+        double end = 0;
+        double lo = 0, hi = 1;
+        double seconds = 0;
+        const ps::History* history = nullptr;
+        uint64_t samples = 0;
+        std::size_t size = 0;
+        double latest = 0;
+        qint64 paletteKey = 0;
+        bool selected = false;
+        bool stale = false;
+        bool dark = false;
+        bool moving = false;
+        bool valid = false;
+    };
+    struct LayoutCache {
+        QSize size;
+        QFont baseFont;
+        QFont valueDrawFont;
+        QFont smallFont;
+        QRect titleRect, valueRect, detailRect;
+        QRectF sparkRect;
+        QString titleElided, valueElided, detailElided;
+        bool sparkBesideValue = true;
+        bool hasSpark = false;
+        bool valid = false;
+    };
     void updateAccessibleText();
+    void invalidateLayout();
+    void invalidateSparkLayer();
+    void ensureLayout() const;
+    long long sparkLayerKey(double tEnd) const;
+    bool sparkLayerCovers(long long key) const;
     QRect sparkUpdateRect() const;
     QColor selectedTextColor(const QStyleOptionViewItem& opt, QPalette::ColorGroup group) const;
 
@@ -79,13 +123,35 @@ private:
     std::vector<std::pair<int, Qt::PenStyle>> m_visuals;
     // What the last paint showed.
     mutable QRectF m_sparkRect;
+    mutable LayoutCache m_layout;
+    mutable QImage m_panelCache;
+    mutable QSize m_panelSize;
+    mutable qreal m_panelDpr = 0;
+    mutable const QStyle* m_panelStyle = nullptr;
+    mutable qint64 m_panelPaletteKey = 0;
+    mutable unsigned m_panelState = 0;
+    mutable bool m_panelValid = false;
     mutable const QStyle* m_contrastStyle = nullptr;
     mutable qint64 m_contrastPaletteKey = 0;
     mutable QPalette::ColorGroup m_contrastGroup = QPalette::Active;
     mutable bool m_contrastDown = false;
+    mutable bool m_contrastFocused = false;
     mutable bool m_contrastValid = false;
     mutable QColor m_contrastColor;
+    mutable QColor m_contrastBg;
+    mutable bool m_rangeValid = false;
+    mutable const ps::History* m_rangeHistory = nullptr;
+    mutable uint64_t m_rangeSamples = 0;
+    mutable std::size_t m_rangeSize = 0;
+    mutable double m_rangeLatest = ps::kNaN;
+    mutable std::size_t m_rangeFirst = 0;
+    mutable double m_rangeLo = 0;
+    mutable double m_rangeHi = 1;
+    mutable SparkLayer m_sparkLayer;
     double m_paintedEnd = ps::kNaN;
     std::size_t m_paintedFirst = 0;
+    long long m_paintedSparkKey = 0;
+    bool m_paintedSparkLayer = false;
+    bool m_paintedMoving = false;
     int m_paintCount = 0;
 };

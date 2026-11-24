@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 class QAction;
@@ -320,6 +321,7 @@ private:
 
     // Fact labels by page, keyed by a stable id.
     std::vector<std::pair<std::string, QLabel*>> m_facts;
+    std::unordered_map<std::string, QLabel*> m_factMap;
     std::vector<FactGrid*> m_factGrids;
     QLabel* fact(const std::string& id) const;
 
