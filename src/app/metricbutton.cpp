@@ -191,6 +191,16 @@ QRect MetricButton::sparkUpdateRect() const
     return m_sparkRect.adjusted(-2, -2, 2, 2).toAlignedRect().intersected(rect());
 }
 
+double MetricButton::axisEndTime(double tNow) const
+{
+    if (m_history && !m_history->empty() && m_seconds > 0
+        && m_history->totalSamples() == m_history->size()
+        && tNow < m_history->time(0) + m_seconds) {
+        return m_history->time(0) + m_seconds;
+    }
+    return tNow;
+}
+
 void MetricButton::advanceView(double time)
 {
     if (!std::isfinite(time))
@@ -202,8 +212,9 @@ void MetricButton::advanceView(double time)
         update();
         return;
     }
-    const double tEnd = std::max(m_viewEnd, m_history->latestTime());
-    const std::size_t first = m_history->lowerBound(tEnd - m_seconds);
+    const double tNow = std::max(m_viewEnd, m_history->latestTime());
+    const double tEnd = axisEndTime(tNow);
+    const std::size_t first = m_history->lowerBound(tNow - m_seconds);
     if (first != m_paintedFirst) {
         update(sparkUpdateRect());
         return;
@@ -520,10 +531,10 @@ void MetricButton::paintEvent(QPaintEvent* event)
     const std::size_t nSeries = std::min<std::size_t>(m_keys.size(), 2);
     for (std::size_t i = 0; i < nSeries; ++i)
         series[i] = m_history->find(m_keys[i]);
-    const double tEnd = std::isfinite(m_viewEnd) ? std::max(m_viewEnd, m_history->latestTime())
+    const double tNow = std::isfinite(m_viewEnd) ? std::max(m_viewEnd, m_history->latestTime())
                                                   : m_history->latestTime();
-    const double tStart = tEnd - m_seconds;
-    const std::size_t first = m_history->lowerBound(tStart);
+    const double tEnd = axisEndTime(tNow);
+    const std::size_t first = m_history->lowerBound(tNow - m_seconds);
     const std::size_t n = m_history->size();
     m_paintedEnd = tEnd;
     m_paintedFirst = first;

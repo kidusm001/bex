@@ -483,6 +483,7 @@ private Q_SLOTS:
     void metricButtonKeepsContrastOnTranslucentSelection();
     void firstRunSensorsIncludeHottest();
     void aboutDialogIsNonBlockingAndClosesOnShutdown();
+    void chartAndSparklineFillFromLeftThenScroll();
 };
 
 void TestUi::initTestCase()
@@ -2535,7 +2536,7 @@ void TestUi::chartWithoutSamplesInWindow()
         (void)chart.grab();
         QCOMPARE(chart.lastPaintedPoints(), 0);
         chart.setWindowSeconds(900);
-        QCOMPARE(chart.readoutText(), QStringLiteral("62 s ago\n") + line(10));
+        QCOMPARE(chart.readoutText(), QStringLiteral("61 s ago\n") + line(20));
         QTest::keyClick(&chart, Qt::Key_Escape);
         QCOMPARE(chart.readoutText(), QString());
 
@@ -3889,9 +3890,14 @@ void TestUi::bandFramesMatchFullRepaint()
         }
     };
 
-    // A young history (its first samples are inside the window) of two
-    // overlapping filled series near 85 %; the lower one has a hole.
+    // A full-window history whose first valid samples start inside the window
+    // (preceded by an unavailable sample at t=975 so the window is scrolling):
+    // two overlapping filled series near 85 %; the lower one has a hole.
     ps::History history(400, 1e9);
+    QVERIFY(history.beginSample(975, false));
+    history.set("a", "A", ps::Unit::Percent, ps::kNaN);
+    history.set("b", "B", ps::Unit::Percent, ps::kNaN);
+    history.endSample();
     auto add = [&](int i, bool continuous = true) {
         QVERIFY(history.beginSample(1000 + i, continuous && !history.empty()));
         const bool hole = i == 20 || i == 21;
@@ -3994,6 +4000,9 @@ void TestUi::bandFramesMatchFullRepaint()
 
     // Temperatures below zero, filled down to the plot bottom (-10 °C).
     ps::History temps(400, 1e9);
+    QVERIFY(temps.beginSample(985, false));
+    temps.set("t", "Probe", ps::Unit::Celsius, ps::kNaN);
+    temps.endSample();
     for (int i = 0; i <= 50; ++i) {
         QVERIFY(temps.beginSample(1000 + i, i > 0));
         temps.set("t", "Probe", ps::Unit::Celsius, -2 + 0.3 * (i % 3));
@@ -4284,6 +4293,8 @@ void TestUi::navSparklineClipsMeasuredGeometry()
             };
             if (withBefore)
                 add(5, c.before, true);
+            else
+                add(5, ps::kNaN, true);
             add(10, c.first, c.continuous);
             for (int i = 0; i < 5; ++i)
                 add(11 + i, (celsius ? 50 : 0) + (i % 2 ? 1 : 0.5), true);
@@ -5052,6 +5063,139 @@ void TestUi::aboutDialogIsNonBlockingAndClosesOnShutdown()
     QVERIFY(w.shutdown(2000));
     QVERIFY(!box->isVisible());
     w.close();
+}
+
+void TestUi::chartAndSparklineFillFromLeftThenScroll()
+{
+    // On a fresh history shorter than the window, both TimeChart and
+    // MetricButton start drawing at the left edge and grow rightward; once
+    // the elapsed span reaches the window, they transition smoothly to
+    // leftward scrolling with pixel-exact partial repaints.
+    auto add = [](ps::History& h, double t, double v) {
+        QVERIFY(h.beginSample(t, !h.empty()));
+        h.set("s", "Load", ps::Unit::Percent, v);
+        h.endSample();
+    };
+    ps::History h(200, 1e9);
+    for (int i = 0; i <= 10; ++i)
+        add(h, 100 + i, 60.0);
+
+    QPalette pal = QApplication::palette();
+    pal.setColor(QPalette::Window, QColor(0xf4, 0xf4, 0xf6));
+    pal.setColor(QPalette::Base, QColor(0xff, 0xff, 0xff));
+    pal.setColor(QPalette::Text, QColor(0x18, 0x18, 0x20));
+    pal.setColor(QPalette::WindowText, QColor(0x18, 0x18, 0x20));
+
+    // 1. TimeChart draws 10 s of a 60 s window on the left sixth, not the right.
+    TimeChart chart(QStringLiteral("Load"), ps::Unit::Percent);
+    chart.setPalette(pal);
+    chart.setHistory(&h);
+    chart.setSeries({{"s", QStringLiteral("Load"), 0, true}});
+    chart.setFixedRange(0, 100);
+    chart.setWindowSeconds(60);
+    chart.setRevealEnabled(true);
+    chart.resize(640, 300);
+    chart.setViewEnd(110);
+    chart.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&chart));
+    QCoreApplication::processEvents();
+
+    const QColor sc = seriesColor(0, pal);
+    auto nearSeries = [&](QRgb px) {
+        return std::abs(qRed(px) - sc.red()) + std::abs(qGreen(px) - sc.green()) + std::abs(qBlue(px) - sc.blue()) < 60;
+    };
+    {
+        const QImage img = chart.grab().toImage().convertToFormat(QImage::Format_RGB32);
+        const QRectF plot = chart.plotArea();
+        const int yLine = static_cast<int>(std::lround(plot.bottom() - 0.6 * plot.height()));
+        int leftHits = 0, rightHits = 0;
+        for (int dy = -2; dy <= 2; ++dy) {
+            for (int x = static_cast<int>(plot.left()) + 4; x < static_cast<int>(plot.left() + plot.width() * 0.14); ++x)
+                leftHits += nearSeries(img.pixel(x, yLine + dy));
+            for (int x = static_cast<int>(plot.left() + plot.width() * 0.5); x < static_cast<int>(plot.right()) - 4; ++x)
+                rightHits += nearSeries(img.pixel(x, yLine + dy));
+        }
+        QVERIFY2(leftHits > 20, qPrintable(QStringLiteral("expected trace on left of plot, got %1 px").arg(leftHits)));
+        QVERIFY2(rightHits == 0, qPrintable(QStringLiteral("expected empty right half while filling, got %1 px").arg(rightHits)));
+    }
+
+    // 2. MetricButton sparkline also starts on the left and leaves the right half clear.
+    {
+        MetricButton btn(QStringLiteral("CPU"));
+        btn.setPalette(pal);
+        btn.setValueText(QStringLiteral("60 %"));
+        btn.setSparkline(&h, {"s"}, 100, 60);
+        btn.setSparklineVisuals({{0, Qt::SolidLine}});
+        btn.setViewEnd(110);
+        btn.resize(240, btn.sizeHint().height());
+        const QImage img = btn.grab().toImage().convertToFormat(QImage::Format_RGB32);
+        const QRectF sp = btn.sparklineArea();
+        const int yMid = static_cast<int>(std::lround(sp.bottom() - 0.6 * sp.height()));
+        int leftHits = 0, rightHits = 0;
+        for (int dy = -2; dy <= 2; ++dy) {
+            for (int x = static_cast<int>(sp.left()) + 1; x < static_cast<int>(sp.left() + sp.width() * 0.16); ++x)
+                leftHits += nearSeries(img.pixel(x, yMid + dy));
+            for (int x = static_cast<int>(sp.left() + sp.width() * 0.5); x < static_cast<int>(sp.right()) - 1; ++x)
+                rightHits += nearSeries(img.pixel(x, yMid + dy));
+        }
+        QVERIFY2(leftHits > 4, qPrintable(QStringLiteral("expected sparkline on left, got %1 px").arg(leftHits)));
+        QVERIFY2(rightHits == 0, qPrintable(QStringLiteral("expected empty right half in sparkline, got %1 px").arg(rightHits)));
+    }
+
+    // 3. New samples grow rightward with reveal + incremental layer patching,
+    //    and stationary frames between samples skip redundant repaints.
+    auto checkExact = [&](const char* when) {
+        QCoreApplication::processEvents();
+        QCoreApplication::processEvents();
+        const QImage shown = chart.screen()->grabWindow(chart.winId()).toImage().convertToFormat(QImage::Format_RGB32);
+        const QImage full = chart.grab().toImage().convertToFormat(QImage::Format_RGB32);
+        QCOMPARE(shown.size(), full.size());
+        int differ = 0;
+        for (int y = 0; y < full.height(); ++y)
+            for (int x = 0; x < full.width(); ++x)
+                differ += shown.pixel(x, y) != full.pixel(x, y);
+        QVERIFY2(differ == 0, qPrintable(QStringLiteral("%1: %2 pixels differ from full repaint").arg(QLatin1String(when)).arg(differ)));
+    };
+    add(h, 111, 80.0);
+    chart.refresh();
+    for (int f = 1; f <= 25; ++f) {
+        chart.advanceView(111 + f / 60.0);
+        QCoreApplication::processEvents();
+    }
+    checkExact("after reveal during fill");
+    const int paintsAfterReveal = chart.paintCount();
+    for (int f = 26; f <= 50; ++f) {
+        chart.advanceView(111 + f / 60.0);
+        QCoreApplication::processEvents();
+    }
+    QCOMPARE(chart.paintCount(), paintsAfterReveal);
+
+    // Cursor age still updates while filling even though the trace is stationary.
+    chart.setCursorTime(111);
+    QCoreApplication::processEvents();
+    chart.advanceView(112.5);
+    QCoreApplication::processEvents();
+    QVERIFY2(chart.readoutText().startsWith(QStringLiteral("1.5 s ago")), qPrintable(chart.readoutText()));
+    checkExact("cursor age update while filling");
+    chart.clearCursor();
+    QCoreApplication::processEvents();
+
+    // 4. Fill to 60 s and cross into leftward scrolling: labels flip and scroll repaints match.
+    for (int t = 112; t <= 160; ++t)
+        add(h, t, 40.0 + (t % 20));
+    chart.refresh();
+    chart.advanceView(159.9);
+    QCoreApplication::processEvents();
+    checkExact("just before full window");
+    const int paintsBeforeScroll = chart.paintCount();
+    for (int f = 0; f <= 40; ++f) {
+        chart.advanceView(160.0 + f / 60.0);
+        QCoreApplication::processEvents();
+    }
+    QVERIFY2(chart.paintCount() - paintsBeforeScroll >= 25,
+             qPrintable(QStringLiteral("expected smooth scroll paints after filling, got %1")
+                            .arg(chart.paintCount() - paintsBeforeScroll)));
+    checkExact("after transitioning to left scroll");
 }
 
 int main(int argc, char** argv)

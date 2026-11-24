@@ -104,6 +104,7 @@ private:
     void invalidateLayout();
     void invalidateSparkLayer();
     void ensureLayout() const;
+    double axisEndTime(double tNow) const;
     long long sparkLayerKey(double tEnd) const;
     bool sparkLayerCovers(long long key) const;
     QRect sparkUpdateRect() const;

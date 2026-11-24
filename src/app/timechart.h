@@ -263,6 +263,13 @@ private:
     QString axisLabel(double value, const Range& range) const;
     QString formatValue(double value) const;
     double endTime() const;
+    // True while the history has not yet accumulated a full window (and has not
+    // evicted older samples), so the plot anchors at the left edge and fills
+    // left-to-right before transitioning to leftward scrolling.
+    bool isFillingFromLeft() const;
+    // Timestamp mapped to the right edge of the plot: firstSample + m_window
+    // while filling from the left, then endTime() once the window is full.
+    double axisEndTime() const;
     std::size_t firstVisibleIndex() const;
     // Whether any retained sample lies inside the window. With the axis
     // ending at the current time, all of them can be older than the window.
@@ -325,6 +332,8 @@ private:
     std::size_t m_paintedFirst = 0;
     bool m_paintedInWindow = false;
     bool m_paintedMoving = false; // anything drawn scrolls with the view
+    bool m_paintedFilling = false;
+    QString m_paintedReadout;
     long long m_paintedKey = 0;
     bool m_paintedLayer = false;
     double m_paintedReveal = 1;

@@ -138,6 +138,18 @@ QString relTime(double secondsAgo)
     return QStringLiteral("\u2212%1 s").arg(s);
 }
 
+QString elapsedTime(double seconds)
+{
+    const long s = std::lround(seconds);
+    if (s == 0)
+        return QStringLiteral("0 s");
+    if (s % 60 == 0)
+        return QStringLiteral("%1 min").arg(s / 60);
+    if (s > 60)
+        return QStringLiteral("%1 min %2 s").arg(s / 60).arg(s % 60);
+    return QStringLiteral("%1 s").arg(s);
+}
+
 } // namespace
 
 QPolygonF clipPolygon(const QPolygonF& polygon, const QRectF& r)
@@ -704,7 +716,7 @@ QRegion TimeChart::plotUpdateRegion() const
     // may be on screen where it was for any axis end the content was painted
     // for, so the columns span from its position then to where it is now.
     const QRectF plot = m_lastPlot;
-    const double end = endTime();
+    const double end = axisEndTime();
     const double early = std::min(m_sweepFrom, end), late = std::max(m_sweepTo, end);
     auto xAt = [&](double t, double axisEnd) { return plot.right() - (axisEnd - t) / m_window * plot.width(); };
     QRegion region(QRectF(plot.left() - 1, e.bandTop, plot.width() + 2, e.bandBottom - e.bandTop).toAlignedRect());
@@ -720,7 +732,7 @@ QRegion TimeChart::plotUpdateRegion() const
     for (const auto& edge : e.edges)
         column(xAt(edge.time, late), xAt(edge.time, early), edge.full);
     if (std::isfinite(m_revealTo))
-        column(xAt(m_revealFrom, late), plot.right() + 1, true);
+        column(xAt(m_revealFrom, late), std::min(plot.right() + 1, xAt(m_revealTo, early) + 3), true);
     region &= rows;
     // Each rectangle of a region costs about as much as copying this many
     // device pixels (clipping and blit setup), so a region only pays off
@@ -746,9 +758,11 @@ void TimeChart::advanceView(double time)
     }
     const bool inWindow = hasVisibleSamples();
     const std::size_t first = inWindow ? firstVisibleIndex() : 0;
-    // A sample entering or leaving the window can change the value range,
-    // the legend values or the empty message: repaint everything then.
-    if (inWindow != m_paintedInWindow || first != m_paintedFirst) {
+    const bool filling = isFillingFromLeft();
+    // A sample entering or leaving the window, or transitioning from
+    // fill-from-left to scrolling, can change the value range, time axis
+    // labels, legend values or empty message: repaint everything then.
+    if (inWindow != m_paintedInWindow || first != m_paintedFirst || filling != m_paintedFilling) {
         update();
         return;
     }
@@ -759,14 +773,24 @@ void TimeChart::advanceView(double time)
     const bool revealing = isRevealing() || m_paintedReveal < 1;
     if (!m_paintedMoving && !cursor && !revealing)
         return; // nothing drawn scrolls (for example no valid values)
+    const double tAxisEnd = axisEndTime();
     if (!revealing) {
         bool moved;
         if (m_paintedLayer && m_layer.valid)
-            moved = layerKey(endTime()) != m_paintedKey;
+            moved = layerKey(tAxisEnd) != m_paintedKey;
         else
-            moved = std::fabs(endTime() - m_paintedEnd) / m_window * m_lastPlot.width() * devicePixelRatioF() >= 0.125;
-        if (!moved)
+            moved = std::fabs(tAxisEnd - m_paintedEnd) / m_window * m_lastPlot.width() * devicePixelRatioF() >= 0.125;
+        if (!moved) {
+            // While filling from the left the trace stays anchored, but an
+            // active readout's age ("N.N s ago") advances with endTime().
+            if (cursor && readoutText() != m_paintedReadout) {
+                QRegion region = m_paintedCursor;
+                region += cursorFootprint();
+                if (!region.isEmpty())
+                    update(region);
+            }
             return;
+        }
     }
     // The readout moves with its sample, over the plot and possibly past it.
     if (cursor) {
@@ -787,7 +811,7 @@ QRegion TimeChart::cursorFootprint() const
     if (!nearest)
         return {};
     const QRectF plot = m_lastPlot;
-    const double x = plot.right() - (endTime() - m_history->time(*nearest)) / m_window * plot.width();
+    const double x = plot.right() - (axisEndTime() - m_history->time(*nearest)) / m_window * plot.width();
     if (!(x >= plot.left() - 1 && x <= plot.right() + 1))
         return {};
     const QRectF box = readoutBox(font(), readoutText().split(QLatin1Char('\n')), x, plot);
@@ -827,6 +851,25 @@ double TimeChart::endTime() const
     return std::isfinite(latest) ? std::max(m_viewEnd, latest) : m_viewEnd;
 }
 
+bool TimeChart::isFillingFromLeft() const
+{
+    if (!(m_window > 0))
+        return false;
+    if (!m_history || m_history->empty())
+        return true;
+    if (m_history->totalSamples() != m_history->size())
+        return false;
+    return endTime() < m_history->time(0) + m_window;
+}
+
+double TimeChart::axisEndTime() const
+{
+    const double now = endTime();
+    if (m_history && !m_history->empty() && isFillingFromLeft())
+        return m_history->time(0) + m_window;
+    return now;
+}
+
 std::size_t TimeChart::firstVisibleIndex() const
 {
     if (!m_history || m_history->empty())
@@ -854,7 +897,7 @@ std::optional<std::size_t> TimeChart::nearestIndex(double time) const
 double TimeChart::cursorTime() const
 {
     if (m_cursorFollowsMouse && m_lastPlot.width() > 0)
-        return endTime() - (m_lastPlot.right() - m_mouseX) / m_lastPlot.width() * m_window;
+        return axisEndTime() - (m_lastPlot.right() - m_mouseX) / m_lastPlot.width() * m_window;
     return m_cursorTime;
 }
 
@@ -1159,12 +1202,14 @@ void TimeChart::paintEvent(QPaintEvent* event)
     const std::size_t first = haveData ? firstVisibleIndex() : 0;
     const std::size_t last = haveData ? m_history->size() - 1 : 0;
     const std::size_t start = (haveData && first > 0) ? first - 1 : first;
-    const double tEnd = endTime();
+    const bool filling = isFillingFromLeft();
+    const double tEnd = axisEndTime();
     // No sample in the window: no line, no current value and no readout.
     const bool inWindow = haveData && first <= last;
     m_paintedEnd = tEnd;
     m_paintedFirst = inWindow ? first : 0;
     m_paintedInWindow = inWindow;
+    m_paintedFilling = filling;
 
     // Valid points in the window, whether anything drawn (points or outage
     // shading) scrolls with the view, and the vertical range. Cached across
@@ -1433,27 +1478,52 @@ void TimeChart::paintEvent(QPaintEvent* event)
             p.setFont(l.axisFont);
             p.setPen(muted);
         }
-        double nextLabelRight = std::numeric_limits<double>::infinity();
-        for (double ago = 0; ago <= m_window + 1e-6; ago += step) {
-            const double x = std::round(plot.right() - ago / m_window * plot.width());
-            // Not over the side frame lines.
-            if (vHeight > 0 && x >= dLeft && x <= dRight
-                && std::fabs(x - plot.left()) >= 0.5 && std::fabs(x - (plot.right() - 1)) >= 0.5)
-                fillTranslucent(p, QRectF(x, vTop, 1, vHeight), c.grid);
-            if (!labelRow)
-                continue;
-            const QString label = relTime(ago);
-            const double w = afmOpt->horizontalAdvance(label);
-            double lx = x + 0.5 - w / 2;
-            lx = std::clamp(lx, plot.left(), plot.right() - w);
-            // Labels are laid out right to left; one that would touch the
-            // label to its right (an edge label pushed inwards) is left out.
-            if (lx + w + 2 * l.afmAvgCharWidth > nextLabelRight)
-                continue;
-            nextLabelRight = lx;
-            const QRectF labelRect(lx, plot.bottom() + 4, w + 2, l.afmHeight);
-            if (needs(labelRect))
-                p.drawText(labelRect, Qt::AlignLeft | Qt::AlignTop, label);
+        if (filling) {
+            double prevLabelRight = -std::numeric_limits<double>::infinity();
+            for (double elapsed = 0; elapsed <= m_window + 1e-6; elapsed += step) {
+                const double x = std::round(plot.left() + elapsed / m_window * plot.width());
+                // Not over the side frame lines.
+                if (vHeight > 0 && x >= dLeft && x <= dRight
+                    && std::fabs(x - plot.left()) >= 0.5 && std::fabs(x - (plot.right() - 1)) >= 0.5)
+                    fillTranslucent(p, QRectF(x, vTop, 1, vHeight), c.grid);
+                if (!labelRow)
+                    continue;
+                const QString label = elapsedTime(elapsed);
+                const double w = afmOpt->horizontalAdvance(label);
+                double lx = x + 0.5 - w / 2;
+                lx = std::clamp(lx, plot.left(), plot.right() - w);
+                // Labels are laid out left to right; one that would touch the
+                // label to its left (an edge label pushed inwards) is left out.
+                if (lx < prevLabelRight + 2 * l.afmAvgCharWidth)
+                    continue;
+                prevLabelRight = lx + w;
+                const QRectF labelRect(lx, plot.bottom() + 4, w + 2, l.afmHeight);
+                if (needs(labelRect))
+                    p.drawText(labelRect, Qt::AlignLeft | Qt::AlignTop, label);
+            }
+        } else {
+            double nextLabelRight = std::numeric_limits<double>::infinity();
+            for (double ago = 0; ago <= m_window + 1e-6; ago += step) {
+                const double x = std::round(plot.right() - ago / m_window * plot.width());
+                // Not over the side frame lines.
+                if (vHeight > 0 && x >= dLeft && x <= dRight
+                    && std::fabs(x - plot.left()) >= 0.5 && std::fabs(x - (plot.right() - 1)) >= 0.5)
+                    fillTranslucent(p, QRectF(x, vTop, 1, vHeight), c.grid);
+                if (!labelRow)
+                    continue;
+                const QString label = relTime(ago);
+                const double w = afmOpt->horizontalAdvance(label);
+                double lx = x + 0.5 - w / 2;
+                lx = std::clamp(lx, plot.left(), plot.right() - w);
+                // Labels are laid out right to left; one that would touch the
+                // label to its right (an edge label pushed inwards) is left out.
+                if (lx + w + 2 * l.afmAvgCharWidth > nextLabelRight)
+                    continue;
+                nextLabelRight = lx;
+                const QRectF labelRect(lx, plot.bottom() + 4, w + 2, l.afmHeight);
+                if (needs(labelRect))
+                    p.drawText(labelRect, Qt::AlignLeft | Qt::AlignTop, label);
+            }
         }
         if (labelRow)
             p.setFont(font());
@@ -1492,7 +1562,8 @@ void TimeChart::paintEvent(QPaintEvent* event)
                 p.setBrush(seriesColor(visualOf(m_series[si], si), pal));
                 p.drawEllipse(QPointF(x, yOf(v)), 3.5, 3.5);
             }
-            const QStringList rows = readoutText().split(QLatin1Char('\n'));
+            const QString readout = readoutText();
+            const QStringList rows = readout.split(QLatin1Char('\n'));
             const QRectF box = readoutBox(font(), rows, x, plot);
             p.setPen(QPen(frame, 1));
             p.setBrush(pal.color(QPalette::ToolTipBase));
@@ -1538,6 +1609,7 @@ void TimeChart::paintEvent(QPaintEvent* event)
     // The screen now shows the cursor where it was drawn, and wherever an
     // earlier one was that this paint did not cover.
     m_paintedCursor = (m_paintedCursor - event->region()) + drawnCursor;
+    m_paintedReadout = drawnCursor.isEmpty() ? QString() : readoutText();
 
     // Subtle 1px opaque outer card border on compact tiles (CoreGrid cards).
     // Full charts keep the left axis strip pure Base so short-chart Y-axis

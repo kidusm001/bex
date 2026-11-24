@@ -1212,21 +1212,21 @@ void TestCouncil::compactChartAccessibleText()
 void TestCouncil::compactChartAnnouncesAtDataCadenceOnly()
 {
     ps::History h;
-    for (int i = 0; i <= 10; ++i)
-        addCoreSample(h, 100 + i, 10 + i);
+    for (int i = 0; i <= 60; ++i)
+        addCoreSample(h, 100 + i, 10 + (i % 11));
     TimeChart c(QStringLiteral("CPU 0"), ps::Unit::Percent);
     c.setMode(TimeChart::Mode::Compact);
     c.setFixedRange(0, 100);
     c.setWindowSeconds(60);
     c.setHistory(&h);
     c.setSeries({ChartSeries {ps::keys::core(0), QStringLiteral("CPU 0"), 0}});
-    c.setViewEnd(110);
+    c.setViewEnd(160);
     c.refresh();
     c.resize(220, 90);
     c.show();
     QVERIFY(QTest::qWaitForWindowExposed(&c));
     QTest::qWait(30);
-    QCOMPARE(descriptionOf(&c), QStringLiteral("CPU 0 20.0 %"));
+    QCOMPARE(descriptionOf(&c), QStringLiteral("CPU 0 15.0 %"));
 
     AccessibleLog log;
     if (!log.observable())
@@ -1234,7 +1234,7 @@ void TestCouncil::compactChartAnnouncesAtDataCadenceOnly()
     const int paintsBefore = c.paintCount();
     // Two seconds of 60 FPS frames between samples.
     for (int f = 1; f <= 120; ++f) {
-        c.advanceView(110 + f / 60.0 * 0.45); // stays within one sample interval
+        c.advanceView(160 + f / 60.0 * 0.45); // stays within one sample interval
         QCoreApplication::processEvents();
     }
     QTest::qWait(20);
@@ -1245,8 +1245,8 @@ void TestCouncil::compactChartAnnouncesAtDataCadenceOnly()
 
     // A new, different value: exactly one announcement.
     c.setRevealEnabled(true);
-    addCoreSample(h, 111, 55.0);
-    c.setViewEnd(111);
+    addCoreSample(h, 161, 55.0);
+    c.setViewEnd(161);
     c.refresh();
     QCOMPARE(descriptionOf(&c), QStringLiteral("CPU 0 55.0 %"));
     QCOMPARE(log.count(&c), 1);
@@ -1256,7 +1256,7 @@ void TestCouncil::compactChartAnnouncesAtDataCadenceOnly()
     // Frames during the reveal of that sample announce nothing either.
     const int revealPaints = c.paintCount();
     for (int f = 1; f <= 30; ++f) {
-        c.advanceView(111 + f / 60.0);
+        c.advanceView(161 + f / 60.0);
         QTest::qWait(5);
     }
     qInfo("reveal frames: %d paints", c.paintCount() - revealPaints);
