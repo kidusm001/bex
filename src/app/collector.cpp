@@ -117,7 +117,7 @@ void Collector::retryStart()
         if (m_started && !m_paused)
             activateWorker();
     } else if (m_started && !m_paused) {
-        m_retryTimer->start(std::min(30000, 1000 << (m_startFailures - 1)));
+        m_retryTimer->start(std::min(30000, static_cast<int>(1000u << (m_startFailures - 1))));
     }
 }
 
@@ -149,7 +149,7 @@ void Collector::start(int intervalMs)
         return; // setPaused(false) activates the worker later
     if (!m_thread->isRunning()) {
         if (!m_retryTimer->isActive())
-            m_retryTimer->start(std::min(30000, 1000 << std::max(0, m_startFailures - 1)));
+            m_retryTimer->start(std::min(30000, static_cast<int>(1000u << std::max(0, m_startFailures - 1))));
         return; // activated once a retry starts the thread
     }
     activateWorker();

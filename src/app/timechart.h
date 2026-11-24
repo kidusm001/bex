@@ -6,13 +6,16 @@
 #include "core/history.h"
 
 #include <QColor>
+#include <QFont>
 #include <QImage>
+#include <QLineF>
 #include <QPointF>
 #include <QPolygonF>
 #include <QRectF>
 #include <QRegion>
 #include <QString>
 #include <QTransform>
+#include <QVector>
 #include <QWidget>
 #include <cstdint>
 #include <optional>
@@ -149,9 +152,41 @@ private:
     struct Layout {
         QRectF plot;
         QRectF header;
+        QFont axisFont;
+        int fmHeight = 0;
+        int afmHeight = 0;
+        double afmAvgCharWidth = 0;
         int legendRows = 0;
+        double valueReserve = 0;
         double tickLabelWidth = 0; // widest whole-minute relative-time label
         double compoundLabelWidth = 0; // widest "minutes and seconds" label
+    };
+    struct CachedColors {
+        qint64 paletteKey = 0;
+        int firstVisual = -2;
+        bool valid = false;
+        bool dark = false;
+        QColor base, text, muted;
+        QColor frame;       // translucent text
+        QColor plotBg;
+        QColor grid;        // translucent accent, for lines drawn over the data
+        QColor gridOpaque;  // the same over the plot background
+        QColor frameOpaque; // frame over the plot background
+        QColor cardBorder;  // subtle opaque outer card perimeter
+    };
+    struct PreparedSeries {
+        int visual = 0;
+        Qt::PenStyle style = Qt::SolidLine;
+        bool fill = false;
+        std::vector<QPolygonF> areas;
+        std::vector<QPointF> dots;
+        QVector<QLineF> lines;
+    };
+    struct PreparedData {
+        std::vector<QRectF> gaps;
+        std::vector<PreparedSeries> series;
+        int filledCount = 0;
+        bool valid = false;
     };
     // The plot (background, horizontal grid, top and bottom frame lines and
     // the data: outage shading, areas and lines) rasterized on an opaque
@@ -178,6 +213,18 @@ private:
     struct DataLayer {
         std::vector<QImage> images; // per phase, allocated when first used
         std::vector<char> drawn;
+        // For incremental shift-and-patch of already-drawn phase images when
+        // scrolling past the buffer margin or appending new samples without
+        // changing geometry, scale, range, or palette.
+        std::vector<char> canPatch;
+        int patchShiftPx = 0;
+        int patchDirtyLeft = 0; // device x relative to left (g.width if pure scroll of empty right)
+        double patchPrevLatest = ps::kNaN;
+        std::size_t patchFromIndex = 0;
+        bool patchPureScroll = false;
+
+        PreparedData prepared;
+        PreparedData patchPrepared;
         int phases = 0;
         // Paint-device transform (scale and offset), logical plot and its
         // device-pixel bounds; the image adds a scrolling margin on the right.
@@ -198,19 +245,31 @@ private:
         Extent extent;
         std::size_t extentStart = 0; // first history index extent was computed from
         uint64_t content = 0; // serial of what the images show
+        qint64 paletteKey = 0;
         bool valid = false;
     };
 
+    const CachedColors& resolvedColors(const QPalette& pal) const;
     Layout computeLayout(const QFontMetrics& fm) const;
-    const Layout& layout(const QFontMetrics& fm);
+    const Layout& layout();
     // Draws outage shading, areas and lines for samples start..last with the
     // axis ending at tEnd. Areas are clipped to area, lines to lineClip.
     void paintData(QPainter& painter, const QRectF& plot, double lo, double hi, double tEnd, std::size_t start,
                    const QRectF& area, const QRectF& lineClip) const;
+    void buildPreparedData(DataLayer& g, std::size_t fromIndex, const QRectF& area, const QRectF& lineClip,
+                           PreparedData& out) const;
+    void paintPreparedData(QPainter& painter, const PreparedData& prep, const QPalette& pal) const;
     Range computeRange(std::size_t first, std::size_t last) const;
     QString axisLabel(double value, const Range& range) const;
     QString formatValue(double value) const;
     double endTime() const;
+    // True while the history has not yet accumulated a full window (and has not
+    // evicted older samples), so the plot anchors at the left edge and fills
+    // left-to-right before transitioning to leftward scrolling.
+    bool isFillingFromLeft() const;
+    // Timestamp mapped to the right edge of the plot: firstSample + m_window
+    // while filling from the left, then endTime() once the window is full.
+    double axisEndTime() const;
     std::size_t firstVisibleIndex() const;
     // Whether any retained sample lies inside the window. With the axis
     // ending at the current time, all of them can be older than the window.
@@ -273,6 +332,8 @@ private:
     std::size_t m_paintedFirst = 0;
     bool m_paintedInWindow = false;
     bool m_paintedMoving = false; // anything drawn scrolls with the view
+    bool m_paintedFilling = false;
+    QString m_paintedReadout;
     long long m_paintedKey = 0;
     bool m_paintedLayer = false;
     double m_paintedReveal = 1;
@@ -288,6 +349,27 @@ private:
     Layout m_layoutCache;
     QSize m_layoutSize;
     bool m_layoutValid = false;
+
+    mutable CachedColors m_colorsCache;
+    mutable bool m_gridCacheValid = false;
+    mutable double m_gridCacheLo = 0, m_gridCacheHi = 0, m_gridCacheStep = 0;
+    mutable double m_gridCacheTop = 0, m_gridCacheHeight = 0;
+    mutable bool m_gridCacheSimple = false;
+    mutable int m_gridCacheMaxLines = 0;
+    mutable std::vector<double> m_gridValsCache;
+    mutable std::vector<double> m_gridYsCache;
+
+    // Cached per-window sample stats and range to avoid re-scanning history on
+    // every 60 Hz scroll frame when the history and visible window start are unchanged.
+    bool m_statsValid = false;
+    const ps::History* m_statsHistory = nullptr;
+    uint64_t m_statsSamples = 0;
+    std::size_t m_statsSize = 0;
+    double m_statsLatest = ps::kNaN;
+    std::size_t m_statsFirst = 0;
+    int m_statsPainted = 0;
+    bool m_statsMoving = false;
+    Range m_statsRange;
 
     bool m_revealEnabled = false;
     double m_seenLatest = ps::kNaN; // newest sample time already known

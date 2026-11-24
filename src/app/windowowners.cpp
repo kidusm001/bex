@@ -113,34 +113,50 @@ Query fail(Status status, QString detail)
     return q;
 }
 
+// Reads all of dirfd-relative `rel` up to cap bytes. False on read error or
+// if the file exceeds cap (a prefix is never mistaken for the whole file).
+bool readAllSmall(int dirfd, const char* rel, std::string& out, std::size_t cap)
+{
+    out.clear();
+    const Fd f(::openat(dirfd, rel, O_RDONLY | O_CLOEXEC | O_NOCTTY));
+    if (f.fd < 0)
+        return false;
+    char buf[4096];
+    for (;;) {
+        const std::size_t want = std::min(sizeof buf, cap + 1 - out.size());
+        const ssize_t n = ::read(f.fd, buf, want);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (n == 0)
+            return true;
+        out.append(buf, static_cast<std::size_t>(n));
+        if (out.size() > cap)
+            return false;
+    }
+}
+
 // Whether `pid` (as seen through procRoot) lives in procRoot's own PID
 // namespace: its NSpid line then has exactly one entry. Kernels without
 // NSpid (before 4.1) cannot tell; the process is then taken as local.
+// A status file larger than 64 KiB fails closed rather than trusting a prefix.
 bool sameNamespace(const std::string& procRoot, int pid)
 {
+    constexpr std::size_t kStatusCap = 64 * 1024;
     const Fd dir(::open(procRoot.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC));
     if (dir.fd < 0)
         return false;
-    char buf[4097];
+    std::string text;
     const std::string rel = std::to_string(pid) + "/status";
-    const ssize_t n = readSmall(dir.fd, rel.c_str(), buf, sizeof buf - 1);
-    if (n <= 0)
+    if (!readAllSmall(dir.fd, rel.c_str(), text, kStatusCap) || text.empty())
         return false;
-    const std::string_view text(buf, static_cast<std::size_t>(n));
-    const auto at = text.find("\nNSpid:");
-    if (at == std::string_view::npos)
-        return true;
-    auto line = text.substr(at + 7);
-    line = line.substr(0, line.find('\n'));
-    int fields = 0;
-    bool inField = false;
-    for (const char c : line) {
-        const bool space = c == ' ' || c == '\t';
-        if (!space && !inField)
-            ++fields;
-        inField = !space;
+    for (auto line : ps::parse::splitLines(text)) {
+        if (line.size() >= 6 && line.substr(0, 6) == "NSpid:")
+            return ps::parse::splitWhitespace(line.substr(6)).size() == 1;
     }
-    return fields == 1;
+    return true;
 }
 
 } // namespace
@@ -323,7 +339,7 @@ Query queryHyprland(const std::string& socketPath, const Limits& limits, int can
 
     const Fd sock(::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
     if (sock.fd < 0)
-        return fail(Status::Failed, QStringLiteral("Could not create a socket (%1)").arg(QString::fromLocal8Bit(std::strerror(errno))));
+        return fail(Status::Failed, QStringLiteral("Could not create a socket (%1)").arg(qt_error_string(errno)));
 
     const auto connectError = [](int err) {
         switch (err) {
@@ -335,7 +351,7 @@ Query queryHyprland(const std::string& socketPath, const Limits& limits, int can
         case EPERM: return fail(Status::PermissionDenied, QStringLiteral("Permission denied on Hyprland's IPC socket"));
         default:
             return fail(Status::Failed,
-                        QStringLiteral("Could not connect to Hyprland (%1)").arg(QString::fromLocal8Bit(std::strerror(err))));
+                        QStringLiteral("Could not connect to Hyprland (%1)").arg(qt_error_string(err)));
         }
     };
     const QString busy = QStringLiteral("Hyprland is busy: it did not accept the connection within %1 ms").arg(limits.deadlineMs);
@@ -383,7 +399,7 @@ Query queryHyprland(const std::string& socketPath, const Limits& limits, int can
         if (::getpeername(sock.fd, reinterpret_cast<sockaddr*>(&peer), &peerLen) != 0)
             return errno == ENOTCONN ? fail(Status::Timeout, busy)
                                      : fail(Status::Failed, QStringLiteral("Could not confirm the connection to Hyprland (%1)")
-                                                                .arg(QString::fromLocal8Bit(std::strerror(errno))));
+                                                                .arg(qt_error_string(errno)));
     }
 
     // Only this user's compositor, in this PID namespace, is believed.
@@ -451,7 +467,7 @@ Query queryHyprland(const std::string& socketPath, const Limits& limits, int can
             return reply.isEmpty() ? fail(Status::Disconnected, QStringLiteral("Hyprland reset the connection"))
                                    : fail(Status::Truncated, QStringLiteral("Hyprland's reply ended early"));
         return fail(Status::Failed,
-                    QStringLiteral("Reading Hyprland's reply failed (%1)").arg(QString::fromLocal8Bit(std::strerror(errno))));
+                    QStringLiteral("Reading Hyprland's reply failed (%1)").arg(qt_error_string(errno)));
     }
     return parseHyprlandClients(reply, limits);
 }
@@ -470,10 +486,20 @@ public:
     {
         const auto deadline = SteadyClock::now() + std::chrono::milliseconds(std::max(1, limits.deadlineMs));
         if (!m_conn) {
-            if (Query q = connect(display, cancelFd, deadline, procRoot); q.status != Status::Ok) {
+            if (Query q = openConnection(display, procRoot); q.status != Status::Ok) {
                 disconnect();
                 return q;
             }
+        }
+        if (!m_ready) {
+            if (Query q = prepare(cancelFd, deadline); q.status != Status::Ok) {
+                // Keep the connection on timeout: reconnecting would block in
+                // xcb_connect() while the server is still stalled.
+                if (q.status != Status::Timeout)
+                    disconnect();
+                return q;
+            }
+            m_ready = true;
         }
         Query q = list(limits, cancelFd, deadline);
         // A late server keeps its connection: reconnecting would block in
@@ -519,8 +545,7 @@ private:
         }
     }
 
-    Query connect(const std::string& display, int cancelFd, SteadyClock::time_point deadline,
-                  const std::string& procRoot)
+    Query openConnection(const std::string& display, const std::string& procRoot)
     {
         int screen = 0;
         // xcb_connect() itself may block on an unresponsive server; the probe
@@ -548,7 +573,11 @@ private:
         if (!it.rem)
             return fail(Status::Failed, QStringLiteral("The X display has no such screen"));
         m_root = it.data->root;
+        return fail(Status::Ok, {});
+    }
 
+    Query prepare(int cancelFd, SteadyClock::time_point deadline)
+    {
         static constexpr char kClientList[] = "_NET_CLIENT_LIST";
         static constexpr char kXRes[] = "X-Resource";
         const auto atomCookie = xcb_intern_atom(m_conn, 1, sizeof kClientList - 1, kClientList);
@@ -562,14 +591,19 @@ private:
         xcb_flush(m_conn);
         xcb_intern_atom_reply_t* atom = nullptr;
         if (Status s = await(atomCookie.sequence, &atom, cancelFd, deadline); s != Status::Ok) {
+            if (s == Status::Timeout)
+                xcb_discard_reply(m_conn, atomCookie.sequence);
             xcb_discard_reply(m_conn, extCookie.sequence);
             return statusQuery(s, QStringLiteral("atoms"));
         }
         m_clientList = atom->atom;
         std::free(atom);
         xcb_query_extension_reply_t* ext = nullptr;
-        if (Status s = await(extCookie.sequence, &ext, cancelFd, deadline); s != Status::Ok)
+        if (Status s = await(extCookie.sequence, &ext, cancelFd, deadline); s != Status::Ok) {
+            if (s == Status::Timeout)
+                xcb_discard_reply(m_conn, extCookie.sequence);
             return statusQuery(s, QStringLiteral("extensions"));
+        }
         const bool hasRes = ext->present;
         std::free(ext);
         if (!hasRes)
@@ -581,8 +615,11 @@ private:
         xcb_flush(m_conn);
         xcb_res_query_version_reply_t* res = nullptr;
         const Status rs = await(resCookie.sequence, &res, cancelFd, deadline);
-        if (rs == Status::Timeout || rs == Status::Cancelled || rs == Status::Disconnected)
+        if (rs == Status::Timeout || rs == Status::Cancelled || rs == Status::Disconnected) {
+            if (rs == Status::Timeout)
+                xcb_discard_reply(m_conn, resCookie.sequence);
             return statusQuery(rs, QStringLiteral("XRes"));
+        }
         const bool resOk = res && (res->server_major > 1 || (res->server_major == 1 && res->server_minor >= 2));
         std::free(res);
         if (!resOk)
@@ -661,11 +698,13 @@ private:
         if (m_conn)
             xcb_disconnect(m_conn);
         m_conn = nullptr;
+        m_ready = false;
     }
 
     xcb_connection_t* m_conn = nullptr;
     xcb_window_t m_root = 0;
     xcb_atom_t m_clientList = XCB_ATOM_NONE;
+    bool m_ready = false;
 };
 #else
 class X11Client {};
@@ -943,7 +982,7 @@ void WindowProbe::retryStart()
         return;
     }
     reportStartFailure();
-    m_retryTimer->start(std::min(30000, 1000 << (m_startFailures - 1)));
+    m_retryTimer->start(std::min(30000, static_cast<int>(1000u << (m_startFailures - 1))));
 }
 
 void WindowProbe::activateWorker()
@@ -995,7 +1034,7 @@ void WindowProbe::start(bool visible)
     if (!m_thread->isRunning()) {
         reportStartFailure();
         if (!m_retryTimer->isActive())
-            m_retryTimer->start(std::min(30000, 1000 << std::max(0, m_startFailures - 1)));
+            m_retryTimer->start(std::min(30000, static_cast<int>(1000u << std::max(0, m_startFailures - 1))));
         return;
     }
     activateWorker();

@@ -207,6 +207,7 @@ Result importLegacy(const QString& legacyPath, const QString& newPath)
             return {Outcome::NewSettingsExist, 0, {}};
         return failure(legacyPath, QStringLiteral("%1 cannot be created (%2)").arg(shown(newPath), qt_error_string(err)));
     }
+    temp.setAutoRemove(false);
 
     const auto count = static_cast<int>(values.size());
     return {Outcome::Imported, count,

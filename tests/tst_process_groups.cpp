@@ -66,6 +66,17 @@ using windows::Status;
 
 namespace {
 
+// Unix domain sockets have a 108-byte sun_path limit. When $TMPDIR is long
+// (sandboxes, CI), a default QTemporaryDir path can exceed it once a Hyprland
+// socket suffix is appended; place socket test directories under /tmp then.
+QString shortSocketTempTemplate()
+{
+    const QString tmp = QDir::tempPath();
+    if (QFile::encodeName(tmp).size() <= 40)
+        return tmp + QStringLiteral("/bex-pg-XXXXXX");
+    return QStringLiteral("/tmp/bex-pg-XXXXXX");
+}
+
 ps::ProcessInfo proc(int pid, uint64_t start, const char* name, double cpu, double rss = 1e6, bool kernel = false)
 {
     ps::ProcessInfo p;
@@ -477,6 +488,7 @@ private Q_SLOTS:
     void hyprlandSocketQueryIsBounded();
     void hyprlandSocketQueryCancels();
     void hyprlandSocketUnreachable();
+    void hyprlandNamespaceCheckHandlesLargeStatus();
     void resolveOwnersPinsIdentity();
     void hyprlandFullBacklogIsBusyNotAnotherUser();
     void probeRetriesAfterFullBacklog();
@@ -762,7 +774,7 @@ void TestProcessGroups::hyprlandSocketQueryIsBounded()
     QFETCH(QList<int>, statuses);
     QFETCH(QList<int>, pids);
     QFETCH(bool, waitsForDeadline);
-    QTemporaryDir dir;
+    QTemporaryDir dir(shortSocketTempTemplate());
     const QString path = dir.filePath(QStringLiteral(".socket.sock"));
     FakeSocketServer server(path, FakeSocketServer::Mode(mode), reply);
     QVERIFY(server.ok());
@@ -786,7 +798,7 @@ void TestProcessGroups::hyprlandSocketQueryIsBounded()
 
 void TestProcessGroups::hyprlandSocketQueryCancels()
 {
-    QTemporaryDir dir;
+    QTemporaryDir dir(shortSocketTempTemplate());
     const QString path = dir.filePath(QStringLiteral(".socket.sock"));
     FakeSocketServer server(path, FakeSocketServer::Mode::Silent);
     QVERIFY(server.ok());
@@ -812,7 +824,7 @@ void TestProcessGroups::hyprlandSocketQueryCancels()
 
 void TestProcessGroups::hyprlandSocketUnreachable()
 {
-    QTemporaryDir dir;
+    QTemporaryDir dir(shortSocketTempTemplate());
     windows::Limits limits;
     limits.deadlineMs = 300;
     // No socket at all.
@@ -850,6 +862,67 @@ void TestProcessGroups::hyprlandSocketUnreachable()
     q = windows::queryHyprland(file.toStdString(), limits, -1);
     QVERIFY2(q.status != Status::Ok, windows::statusId(q.status));
     QVERIFY(q.pids.empty());
+}
+
+void TestProcessGroups::hyprlandNamespaceCheckHandlesLargeStatus()
+{
+    QTemporaryDir dir(shortSocketTempTemplate());
+    const QByteArray reply = "[{\"pid\":" + QByteArray::number(::getpid()) + "}]";
+    windows::Limits limits;
+    limits.deadlineMs = 500;
+    const int self = int(::getpid());
+
+    // A status file longer than 4 KiB where NSpid lists two namespaces must be
+    // rejected as OtherNamespace, not silently accepted due to truncation.
+    {
+        QTemporaryDir procA;
+        QVERIFY(QDir(procA.path()).mkpath(QString::number(self)));
+        QFile f(procA.filePath(QString::number(self) + QStringLiteral("/status")));
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write("Name:\ttest\nGroups:\t");
+        f.write(QByteArray(5000, '1'));
+        f.write("\nNSpid:\t1000\t" + QByteArray::number(self) + "\n");
+        f.close();
+        const QString path = dir.filePath(QStringLiteral("a.sock"));
+        FakeSocketServer server(path, FakeSocketServer::Mode::Reply, reply);
+        QVERIFY(server.ok());
+        const windows::Query q = windows::queryHyprland(path.toStdString(), limits, -1, procA.path().toStdString());
+        QCOMPARE(windows::statusId(q.status), windows::statusId(Status::OtherNamespace));
+    }
+
+    // Same >4 KiB status file with a single NSpid entry succeeds.
+    {
+        QTemporaryDir procB;
+        QVERIFY(QDir(procB.path()).mkpath(QString::number(self)));
+        QFile f(procB.filePath(QString::number(self) + QStringLiteral("/status")));
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write("Name:\ttest\nGroups:\t");
+        f.write(QByteArray(5000, '1'));
+        f.write("\nNSpid:\t" + QByteArray::number(self) + "\n");
+        f.close();
+        const QString path = dir.filePath(QStringLiteral("b.sock"));
+        FakeSocketServer server(path, FakeSocketServer::Mode::Reply, reply);
+        QVERIFY(server.ok());
+        const windows::Query q = windows::queryHyprland(path.toStdString(), limits, -1, procB.path().toStdString());
+        QCOMPARE(windows::statusId(q.status), windows::statusId(Status::Ok));
+    }
+
+    // Oversized (>64 KiB) status file fails closed rather than trusting a prefix.
+    {
+        QTemporaryDir procC;
+        QVERIFY(QDir(procC.path()).mkpath(QString::number(self)));
+        QFile f(procC.filePath(QString::number(self) + QStringLiteral("/status")));
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write("Name:\ttest\nGroups:\t");
+        f.write(QByteArray(70 * 1024, '1'));
+        f.write("\n");
+        f.close();
+        const QString path = dir.filePath(QStringLiteral("c.sock"));
+        FakeSocketServer server(path, FakeSocketServer::Mode::Reply, reply);
+        QVERIFY(server.ok());
+        const windows::Query q = windows::queryHyprland(path.toStdString(), limits, -1, procC.path().toStdString());
+        QCOMPARE(windows::statusId(q.status), windows::statusId(Status::OtherNamespace));
+    }
 }
 
 void TestProcessGroups::resolveOwnersPinsIdentity()
@@ -1476,7 +1549,7 @@ struct Answerer {
 
 void TestProcessGroups::hyprlandFullBacklogIsBusyNotAnotherUser()
 {
-    QTemporaryDir dir;
+    QTemporaryDir dir(shortSocketTempTemplate());
     FullBacklog backlog(dir.filePath(QStringLiteral("hypr.sock")));
     QVERIFY2(backlog.full, qPrintable(backlog.problem));
     windows::Limits limits;
@@ -1508,7 +1581,7 @@ void TestProcessGroups::probeRetriesAfterFullBacklog()
 {
     // The real Hyprland backend (no injected query) at a test socket. Only
     // this test process's own PID and /proc entries are involved.
-    QTemporaryDir run;
+    QTemporaryDir run(shortSocketTempTemplate());
     const windows::Environment env = hyprEnv(run.path(), "backlogsig");
     const windows::Selection sel = windows::selectBackend(env, false);
     QCOMPARE(windows::statusId(sel.status), windows::statusId(Status::Ok));
