@@ -1767,9 +1767,14 @@ void TimeChart::buildPreparedData(DataLayer& g, std::size_t fromIndex, const QRe
     if (fromIndex > last)
         return;
     const QRectF& plot = g.plot;
-    const double lo = g.lo, hi = g.hi, tEnd = g.end;
+    const double lo = g.lo, hi = g.hi;
     auto yOf = [&](double v) { return plot.bottom() - (v * 0.5 - lo * 0.5) / (hi * 0.5 - lo * 0.5) * plot.height(); };
-    auto xOf = [&](double t) { return plot.right() - (tEnd - t) / m_window * plot.width(); };
+    // Subtract originEnd first so large CLOCK_BOOTTIME values cancel before
+    // scaling, then apply the exact integer shift from incremental patches.
+    auto xOf = [&](double t) {
+        return plot.right() - (g.originEnd - t) / m_window * plot.width()
+            - static_cast<double>(g.originShiftPx) / g.sx;
+    };
     const QRectF band(area.left(), plot.top(), area.width(), plot.height());
 
     for (std::size_t i = std::max<std::size_t>(fromIndex, 1); i <= last; ++i) {
@@ -1900,7 +1905,8 @@ void TimeChart::invalidateLayer()
 long long TimeChart::layerKey(double tEnd) const
 {
     const DataLayer& g = m_layer;
-    const double key = std::round((g.left - (tEnd - g.end) * g.pxPerSecond) * g.phases);
+    const double shiftedPx = (tEnd - g.originEnd) * g.pxPerSecond - static_cast<double>(g.originShiftPx);
+    const double key = std::round((g.left - shiftedPx) * g.phases);
     if (!std::isfinite(key) || std::fabs(key) > 1e15)
         return std::numeric_limits<long long>::min();
     return static_cast<long long>(key);
@@ -1982,16 +1988,22 @@ bool TimeChart::prepareLayer(const QTransform& device, const QRectF& plot, const
     bool pureScroll = false;
     int shiftPx = 0;
     int dirtyLeft = 0;
+    long long newOriginShiftPx = 0;
     double anchoredEnd = tEnd;
     std::size_t patchFrom = start;
-    if (sameStatic && newWidth == g.width && newPhases == g.phases && tEnd >= g.end) {
-        const double deltaPxF = (tEnd - g.end) * pxPerSecond;
+    if (sameStatic && newWidth == g.width && newPhases == g.phases) {
+        const double deltaPxF = (tEnd - g.originEnd) * pxPerSecond - static_cast<double>(g.originShiftPx);
         if (std::isfinite(deltaPxF) && deltaPxF >= 0.0 && deltaPxF < newWidth - 16) {
             shiftPx = static_cast<int>(std::floor(deltaPxF));
-            anchoredEnd = g.end + static_cast<double>(shiftPx) / pxPerSecond;
+            newOriginShiftPx = g.originShiftPx + shiftPx;
+            anchoredEnd = g.originEnd + static_cast<double>(newOriginShiftPx) / pxPerSecond;
+            auto devX = [&](double ts) {
+                const double logX = plot.right() - (g.originEnd - ts) / m_window * plot.width()
+                    - static_cast<double>(newOriginShiftPx) / sx;
+                return logX * sx + ox - left;
+            };
             if (same && shiftPx > 0) {
-                const double latestDev = (plot.right() - (anchoredEnd - g.latest) / m_window * plot.width()) * sx + ox
-                    - left;
+                const double latestDev = devX(g.latest);
                 if (latestDev < newWidth - shiftPx - 4) {
                     incremental = true;
                     pureScroll = true;
@@ -2013,8 +2025,7 @@ bool TimeChart::prepareLayer(const QTransform& device, const QRectF& plot, const
                         const bool dashSafe = !anyDashed || start == g.start
                             || (m_history->time(prevIdx) - m_history->time(start) >= 2.0 * quantum);
                         if (dashSafe) {
-                            const double prevDev = (plot.right() - (anchoredEnd - g.latest) / m_window * plot.width())
-                                * sx + ox - left;
+                            const double prevDev = devX(g.latest);
                             const int pad = static_cast<int>(std::ceil(4.0 * sx)) + 2;
                             dirtyLeft = std::clamp(static_cast<int>(std::floor(prevDev)) - pad, 0, newWidth);
                             if (shiftPx > 0)
@@ -2024,7 +2035,9 @@ bool TimeChart::prepareLayer(const QTransform& device, const QRectF& plot, const
                                 // to an anchor boundary so dash offsets match a full draw.
                                 patchFrom = prevIdx;
                                 const double dirtyLogX = (left + dirtyLeft - 2 - ox) / sx;
-                                const double dirtyTime = anchoredEnd - (plot.right() - dirtyLogX) / plot.width() * m_window;
+                                const double dirtyTime = g.originEnd
+                                    + (static_cast<double>(newOriginShiftPx) / sx - (plot.right() - dirtyLogX))
+                                        / plot.width() * m_window;
                                 while (patchFrom > start && m_history->time(patchFrom) >= dirtyTime)
                                     --patchFrom;
                                 if (anyDashed) {
@@ -2074,7 +2087,14 @@ bool TimeChart::prepareLayer(const QTransform& device, const QRectF& plot, const
     g.width = newWidth;
     g.pxPerSecond = pxPerSecond;
     g.phases = newPhases;
-    g.end = incremental ? anchoredEnd : tEnd;
+    if (incremental) {
+        g.originShiftPx = newOriginShiftPx;
+        g.end = anchoredEnd;
+    } else {
+        g.originEnd = tEnd;
+        g.originShiftPx = 0;
+        g.end = tEnd;
+    }
     g.start = start;
     g.lo = range.lo;
     g.hi = range.hi;

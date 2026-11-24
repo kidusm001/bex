@@ -2,11 +2,15 @@
 <component type="desktop-application">
   <id>io.github.kidusm001.bex</id>
   <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
   <name>bex</name>
   <summary>Live Linux performance monitor</summary>
   <developer id="io.github.kidusm001">
     <name>Kidus Mesfin</name>
   </developer>
+  <url type="homepage">https://github.com/kidusm001/bex</url>
+  <url type="bugtracker">https://github.com/kidusm001/bex/issues</url>
+  <url type="vcs-browser">https://github.com/kidusm001/bex</url>
   <description>
     <p>
       bex shows total and per-core CPU utilization, memory and swap,

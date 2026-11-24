@@ -179,7 +179,7 @@ if(BEX_BUILD_TESTS)
         target_link_libraries(${name} PRIVATE bex_ui Qt6::Test)
         add_test(NAME ${name} COMMAND ${name})
         set_tests_properties(${name} PROPERTIES
-            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;BEX_ARTIFACT_DIR=${BEX_ARTIFACT_DIR};QT_LOGGING_RULES=qt.qpa.*=false"
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;BEX_ARTIFACT_DIR=${BEX_ARTIFACT_DIR};QT_LOGGING_RULES=qt.qpa.*=false;FONTCONFIG_FILE=${CMAKE_CURRENT_SOURCE_DIR}/tests/fonts-grayscale.conf"
             TIMEOUT 120)
     endfunction()
 
