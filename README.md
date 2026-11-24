@@ -27,25 +27,25 @@ libxcb for telling apps apart on X11).
 ## Install
 
 Pre-built packages and checksums (`SHA256SUMS.txt`) are published on the
-[GitHub Releases](https://github.com/kidusm001/bex/releases) page:
+[GitHub Releases](https://github.com/kidusm001/bex/releases) page, and native
+`pacman`, `dnf`, and `apt` repositories are hosted at
+<https://kidusm001.github.io/bex/>:
 
 - **Any Linux distro (AppImage)**: download `bex-<version>-x86_64.AppImage`,
   make it executable (`chmod +x`), and run it.
-- **Arch Linux (AUR)**:
+- **Arch Linux**: add the hosted `pacman` repo from
+  <https://kidusm001.github.io/bex/> (or install the `.pkg.tar.zst` asset via
+  `sudo pacman -U ./bex-*.pkg.tar.zst`).
+- **Fedora**:
   ```sh
-  yay -S bex
-  ```
-  (or download the `.pkg.tar.zst` asset and run `sudo pacman -U ./bex-*.pkg.tar.zst`).
-- **Fedora (Copr)**:
-  ```sh
-  sudo dnf copr enable kidusm001/bex
+  sudo dnf config-manager addrepo --from-repofile=https://kidusm001.github.io/bex/rpm/bex.repo
   sudo dnf install bex
   ```
   (or download the `.rpm` asset and run `sudo dnf install ./bex-*.x86_64.rpm`).
 - **Ubuntu 24.04+ / Debian 12**: download the matching `.deb` asset from GitHub
   Releases (`noble` for Ubuntu 24.04+/Mint 22+, `bookworm` for Debian 12) and
-  install it with `sudo apt install ./bex_*.deb`, or follow the APT repository
-  instructions at <https://kidusm001.github.io/bex/>.
+  install it with `sudo apt install ./bex_*.deb`, or add the APT repository from
+  <https://kidusm001.github.io/bex/>.
 - **NixOS / Nix**:
   ```sh
   nix run github:kidusm001/bex

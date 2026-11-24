@@ -18,11 +18,11 @@
      - `bex-X.Y.Z-x86_64.AppImage` (universal Linux x86_64)
      - `SHA256SUMS.txt`
   4. Publishes all assets to **GitHub Releases**.
-  5. Publishes the updated `PKGBUILD` + `.SRCINFO` to the **Arch AUR**.
-  6. Submits the `.src.rpm` to **Fedora Copr**.
-  7. Updates the **Debian/Ubuntu APT repository** on the `gh-pages` branch.
+  5. Publishes self-hosted **Arch (`pacman`)**, **Fedora (`dnf`)**, and **Debian/Ubuntu (`apt`)** repositories + landing page to the `gh-pages` branch — **zero external accounts required**.
+  6. *(Optional)* Publishes the updated `PKGBUILD` + `.SRCINFO` to the **Arch AUR** when `AUR_SSH_PRIVATE_KEY` is configured.
+  7. *(Optional)* Submits the `.src.rpm` to **Fedora Copr** when `COPR_CONFIG` is configured.
 
-Jobs whose external credentials are not configured yet (`AUR_SSH_PRIVATE_KEY`, `COPR_CONFIG`, `APT_GPG_PRIVATE_KEY`) skip cleanly with a notice so GitHub Releases always succeed out of the box.
+GitHub Releases and the self-hosted `gh-pages` repositories (`pacman`, `dnf`, `apt`) work completely automatically with zero external accounts or secrets. Optional AUR/Copr jobs skip cleanly until their secrets are added.
 
 ## Cutting a Release
 

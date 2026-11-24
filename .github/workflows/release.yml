@@ -102,7 +102,7 @@ jobs:
       - name: Build & run tests
         run: |
           cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_TYPE=Debug \
             -DBEX_WERROR=ON \
             -DBEX_X11=ON \
             -DBEX_BUILD_TESTS=ON
@@ -195,6 +195,7 @@ jobs:
         run: |
           dnf install -y \
             cmake \
+            createrepo_c \
             desktop-file-utils \
             gcc-c++ \
             libxcb-devel \
@@ -204,11 +205,16 @@ jobs:
             rpm-build \
             tar
 
-      - name: Build .rpm and .src.rpm
+      - name: Build .rpm, .src.rpm, and DNF repo metadata
+        env:
+          REPO: ${{ github.repository }}
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
           RPM_VERSION="${{ needs.prepare.outputs.rpm_version }}"
-          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS} work out
+          OWNER="${REPO%%/*}"
+          NAME="${REPO#*/}"
+          PAGES_URL="https://${OWNER}.github.io/${NAME}"
+          mkdir -p "$HOME"/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS} work out rpm-repo
           cp "src/bex-${VERSION}.tar.gz" "$HOME/rpmbuild/SOURCES/bex-${VERSION}.tar.gz"
           tar -xzf "src/bex-${VERSION}.tar.gz" -C work "bex-${VERSION}/packaging/rpm/bex.spec"
           sed -E \
@@ -219,12 +225,26 @@ jobs:
           rpmbuild -ba "$HOME/rpmbuild/SPECS/bex.spec"
           cp "$HOME"/rpmbuild/RPMS/x86_64/bex-*.rpm out/
           cp "$HOME"/rpmbuild/SRPMS/bex-*.src.rpm out/
-          ls -lh out/
+          cp "$HOME"/rpmbuild/RPMS/x86_64/bex-[0-9]*.rpm rpm-repo/
+          createrepo_c rpm-repo/
+          cat > rpm-repo/bex.repo <<EOF
+          [bex]
+          name=bex - Native Linux Performance Monitor
+          baseurl=${PAGES_URL}/rpm/
+          enabled=1
+          gpgcheck=0
+          EOF
+          ls -lh out/ rpm-repo/
 
       - uses: actions/upload-artifact@v4
         with:
           name: rpm-fedora
           path: out/*.rpm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-repo
+          path: rpm-repo/
 
   build-arch:
     name: Build Arch Package & AUR Metadata
@@ -272,12 +292,27 @@ jobs:
           su - builder -c "cd '${WORK}' && makepkg --printsrcinfo > .SRCINFO && makepkg --noconfirm"
           cp "${WORK}"/bex-[0-9]*.pkg.tar.zst out/
           cp "${WORK}/PKGBUILD" "${WORK}/.SRCINFO" aur/
-          ls -lh out/ aur/
+          mkdir -p arch-repo/x86_64
+          cp "${WORK}"/bex-[0-9]*.pkg.tar.zst arch-repo/x86_64/
+          (
+            cd arch-repo/x86_64
+            repo-add bex.db.tar.gz bex-[0-9]*.pkg.tar.zst
+            # Replace symlinks with regular files so GitHub Pages serves them reliably.
+            rm -f bex.db bex.files
+            cp bex.db.tar.gz bex.db
+            cp bex.files.tar.gz bex.files
+          )
+          ls -lh out/ aur/ arch-repo/x86_64/
 
       - uses: actions/upload-artifact@v4
         with:
           name: arch-pkg
           path: out/*.pkg.tar.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-repo
+          path: arch-repo/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -340,7 +375,11 @@ jobs:
       - name: Assemble release assets & checksums
         run: |
           mkdir -p release-assets
-          find artifacts -maxdepth 2 -type f ! -name 'PKGBUILD' ! -name '.SRCINFO' -exec cp {} release-assets/ \;
+          for dir in source-tarball deb-noble deb-bookworm rpm-fedora arch-pkg appimage; do
+            if [ -d "artifacts/${dir}" ]; then
+              cp "artifacts/${dir}"/* release-assets/
+            fi
+          done
           (
             cd release-assets
             sha256sum * > SHA256SUMS.txt
@@ -362,9 +401,10 @@ jobs:
             - **Ubuntu 24.04+ / Mint 22+ / Pop!_OS**: `sudo apt install ./bex_${{ needs.prepare.outputs.version }}-1_noble_amd64.deb`
             - **Debian 12**: `sudo apt install ./bex_${{ needs.prepare.outputs.version }}-1_bookworm_amd64.deb`
             - **Fedora**: `sudo dnf install ./bex-*.x86_64.rpm`
-            - **Arch Linux**: `yay -S bex` (AUR) or `sudo pacman -U ./bex-*.pkg.tar.zst`
+            - **Arch Linux**: `sudo pacman -U ./bex-*.pkg.tar.zst`
             - **NixOS / Nix**: `nix run github:${{ github.repository }}/${{ needs.prepare.outputs.tag }}`
 
+            Native `apt`, `pacman`, and `dnf` repositories (for automatic updates) are also hosted at `https://kidusm001.github.io/bex/`.
             Verify integrity with `sha256sum -c SHA256SUMS.txt`.
           files: release-assets/*
 
@@ -439,8 +479,8 @@ jobs:
           SRPM="$(ls rpm/*.src.rpm | head -n1)"
           copr-cli build --nowait "${COPR_PROJECT}" "${SRPM}"
 
-  publish-apt:
-    name: Publish APT Repository (gh-pages)
+  publish-repos:
+    name: Publish Self-Hosted Repos (APT + Arch + DNF on gh-pages)
     needs: [prepare, github-release]
     if: needs.prepare.outputs.prerelease == 'false'
     runs-on: ubuntu-24.04
@@ -451,12 +491,24 @@ jobs:
           pattern: deb-*
           path: debs
 
+      - name: Download Arch pacman repository
+        uses: actions/download-artifact@v4
+        with:
+          name: arch-repo
+          path: arch-repo
+
+      - name: Download Fedora DNF repository
+        uses: actions/download-artifact@v4
+        with:
+          name: rpm-repo
+          path: rpm-repo
+
       - name: Install APT repository tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends apt-utils dpkg-dev gnupg
 
-      - name: Build and push gh-pages APT repository
+      - name: Build and push gh-pages multi-distro repositories
         env:
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
@@ -481,6 +533,17 @@ jobs:
             )
           fi
 
+          # 1. Arch Linux pacman repo
+          rm -rf site/arch
+          mkdir -p site/arch
+          cp -a arch-repo/* site/arch/
+
+          # 2. Fedora DNF/RPM repo
+          rm -rf site/rpm
+          mkdir -p site/rpm
+          cp -a rpm-repo/* site/rpm/
+
+          # 3. Debian/Ubuntu APT repo
           mkdir -p site/apt/pool/main/b/bex
           cp debs/deb-noble/*.deb site/apt/pool/main/b/bex/
           cp debs/deb-bookworm/*.deb site/apt/pool/main/b/bex/
@@ -498,7 +561,6 @@ jobs:
 
           for SUITE in noble bookworm; do
             mkdir -p "site/apt/dists/${SUITE}/main/binary-amd64"
-            # Index only packages matching this suite so noble/bookworm deps stay clean.
             TMP_POOL="$(mktemp -d)"
             mkdir -p "${TMP_POOL}/pool/main/b/bex"
             cp site/apt/pool/main/b/bex/*_"${SUITE}"_amd64.deb "${TMP_POOL}/pool/main/b/bex/"
@@ -553,7 +615,7 @@ jobs:
             <meta name="viewport" content="width=device-width,initial-scale=1">
             <title>bex — Linux Performance Monitor</title>
             <style>
-              body { font-family: system-ui, -apple-system, sans-serif; max-width: 780px; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.6; color: #1f2328; }
+              body { font-family: system-ui, -apple-system, sans-serif; max-width: 820px; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.6; color: #1f2328; }
               @media (prefers-color-scheme: dark) { body { background: #161821; color: #dce0ec; } pre { background: #222536; } a { color: #8ec8ff; } }
               pre { background: #f3f4f6; padding: 0.9rem 1rem; border-radius: 8px; overflow-x: auto; }
               code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.92em; }
@@ -565,12 +627,27 @@ jobs:
             <h1>bex v${VERSION}</h1>
             <p class="sub">Native Linux performance monitor built with C++20 and Qt 6.</p>
             <p><a href="https://github.com/${REPO}/releases/latest">GitHub Releases (AppImage, .deb, .rpm, Arch, source)</a> &middot; <a href="https://github.com/${REPO}">Source Code</a></p>
-            <h2>Debian 12 (bookworm) / Ubuntu 24.04 (noble) APT Repository</h2>
+
+            <h2>Arch Linux (pacman repo)</h2>
+            <p>Add to <code>/etc/pacman.conf</code>:</p>
+            <pre><code>[bex]
+          SigLevel = Optional TrustAll
+          Server = ${PAGES_URL}/arch/\$arch</code></pre>
+            <p>Then install:</p>
+            <pre><code>sudo pacman -Sy bex</code></pre>
+
+            <h2>Fedora (dnf repo)</h2>
+            <pre><code>sudo dnf config-manager addrepo --from-repofile=${PAGES_URL}/rpm/bex.repo
+          sudo dnf install bex</code></pre>
+
+            <h2>Debian 12 (bookworm) / Ubuntu 24.04 (noble) (apt repo)</h2>
             <pre><code>${APT_CMD}</code></pre>
-            <h2>Arch Linux (AUR)</h2>
-            <pre><code>yay -S bex</code></pre>
-            <h2>Fedora (Copr)</h2>
-            <pre><code>sudo dnf copr enable ${OWNER}/bex &amp;&amp; sudo dnf install bex</code></pre>
+
+            <h2>Any Linux Distro (AppImage)</h2>
+            <pre><code>curl -fsSLO https://github.com/${REPO}/releases/latest/download/bex-${VERSION}-x86_64.AppImage
+          chmod +x bex-${VERSION}-x86_64.AppImage
+          ./bex-${VERSION}-x86_64.AppImage</code></pre>
+
             <h2>NixOS / Nix</h2>
             <pre><code>nix run github:${REPO}</code></pre>
           </body>
@@ -581,8 +658,8 @@ jobs:
           cd site
           git add -A
           if git diff --cached --quiet; then
-            echo "APT repository already up to date."
+            echo "Repositories already up to date."
             exit 0
           fi
-          git commit -m "chore(apt): publish bex v${VERSION}"
+          git commit -m "chore(repos): publish bex v${VERSION} (apt, arch, rpm)"
           git push origin gh-pages
