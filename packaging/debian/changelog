@@ -1,0 +1,5 @@
+bex (1.0.0-1) unstable; urgency=medium
+
+  * Initial Debian/Ubuntu package for bex.
+
+ -- Kidus Mesfin <kidusmesfin27@gmail.com>  Tue, 24 Nov 2026 00:00:00 +0000

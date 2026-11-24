@@ -1,0 +1,583 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v1.0.0); defaults to current ref'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare Release & Source Tarball
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      rpm_version: ${{ steps.meta.outputs.rpm_version }}
+      tarball_sha256: ${{ steps.tarball.outputs.sha256 }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and verify version
+        id: meta
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "${TAG}" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "${TAG}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-.*)?$ ]]; then
+            echo "Release tag '${TAG}' must match vX.Y.Z or vX.Y.Z-prerelease" >&2
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          BASE_VERSION="${BASH_REMATCH[1]}"
+          PRERELEASE="false"
+          if [ -n "${BASH_REMATCH[2]}" ]; then
+            PRERELEASE="true"
+          fi
+          CMAKE_VER="$(sed -nE 's/^[[:space:]]*VERSION[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt | head -n1)"
+          if [ "${CMAKE_VER}" != "${BASE_VERSION}" ]; then
+            echo "Version mismatch: tag is ${TAG} (base ${BASE_VERSION}) but CMakeLists.txt has VERSION ${CMAKE_VER}" >&2
+            exit 1
+          fi
+          RPM_VERSION="${VERSION//-/\~}"
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "rpm_version=${RPM_VERSION}"
+            echo "prerelease=${PRERELEASE}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Create deterministic source tarball
+        id: tarball
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="bex-${VERSION}/" -o "dist/bex-${VERSION}.tar.gz" HEAD
+          SHA="$(sha256sum "dist/bex-${VERSION}.tar.gz" | awk '{print $1}')"
+          echo "sha256=${SHA}" >> "${GITHUB_OUTPUT}"
+          echo "Created dist/bex-${VERSION}.tar.gz (sha256: ${SHA})"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-tarball
+          path: dist/bex-*.tar.gz
+
+  test-gate:
+    name: Release Test Gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            appstream \
+            build-essential \
+            cmake \
+            desktop-file-utils \
+            libxcb-res0-dev \
+            libxcb1-dev \
+            ninja-build \
+            pkg-config \
+            qt6-base-dev
+
+      - name: Build & run tests
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBEX_WERROR=ON \
+            -DBEX_X11=ON \
+            -DBEX_BUILD_TESTS=ON
+          cmake --build build -j"$(nproc)"
+          ctest --test-dir build --output-on-failure -LE slow -j"$(nproc)"
+          PS_GU_CHILD=1 PS_GU_APP="$PWD/build/bex" QT_QPA_PLATFORM=offscreen ./build/tst_graph_upgrade
+          appstreamcli validate --pedantic --no-net data/io.github.kidusm001.bex.metainfo.xml
+
+  build-deb:
+    name: Build .deb (${{ matrix.codename }})
+    needs: [prepare, test-gate]
+    runs-on: ubuntu-24.04
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - codename: noble
+            image: ubuntu:24.04
+          - codename: bookworm
+            image: debian:bookworm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: source-tarball
+          path: src
+
+      - name: Install Debian packaging dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            debhelper \
+            dpkg-dev \
+            libxcb-res0-dev \
+            libxcb1-dev \
+            ninja-build \
+            pkg-config \
+            qt6-base-dev
+
+      - name: Build .deb
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          CODENAME="${{ matrix.codename }}"
+          mkdir -p work out
+          tar -xzf "src/bex-${VERSION}.tar.gz" -C work
+          cd "work/bex-${VERSION}"
+          cp -r packaging/debian debian
+          chmod +x debian/rules
+          # Ensure changelog top entry matches the tagged release version.
+          DEB_VER="${VERSION//-/\~}-1"
+          if ! head -n 1 debian/changelog | grep -q "(${DEB_VER})"; then
+            DATE_RFC2822="$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S +0000')"
+            {
+              echo "bex (${DEB_VER}) ${CODENAME}; urgency=medium"
+              echo ""
+              echo "  * Release v${VERSION}."
+              echo ""
+              echo " -- Kidus Mesfin <kidusmesfin27@gmail.com>  ${DATE_RFC2822}"
+              echo ""
+              cat debian/changelog
+            } > debian/changelog.new
+            mv debian/changelog.new debian/changelog
+          fi
+          dpkg-buildpackage -us -uc -b
+          mv ../bex_*_amd64.deb "${GITHUB_WORKSPACE}/out/bex_${VERSION}-1_${CODENAME}_amd64.deb"
+          dpkg-deb --info "${GITHUB_WORKSPACE}/out/bex_${VERSION}-1_${CODENAME}_amd64.deb"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.codename }}
+          path: out/*.deb
+
+  build-rpm:
+    name: Build .rpm (Fedora 41)
+    needs: [prepare, test-gate]
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:41
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: source-tarball
+          path: src
+
+      - name: Install RPM packaging dependencies
+        run: |
+          dnf install -y \
+            cmake \
+            desktop-file-utils \
+            gcc-c++ \
+            libxcb-devel \
+            ninja-build \
+            pkgconf-pkg-config \
+            qt6-qtbase-devel \
+            rpm-build
+
+      - name: Build .rpm and .src.rpm
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          RPM_VERSION="${{ needs.prepare.outputs.rpm_version }}"
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS} work out
+          cp "src/bex-${VERSION}.tar.gz" "$HOME/rpmbuild/SOURCES/bex-${VERSION}.tar.gz"
+          tar -xzf "src/bex-${VERSION}.tar.gz" -C work "bex-${VERSION}/packaging/rpm/bex.spec"
+          sed -E \
+            -e "s/^(Version:[[:space:]]+).*/\1${RPM_VERSION}/" \
+            -e "s|%\{name\}-%\{version\}\.tar\.gz|bex-${VERSION}.tar.gz|g" \
+            -e "s|%autosetup -n %\{name\}-%\{version\}|%autosetup -n bex-${VERSION}|" \
+            "work/bex-${VERSION}/packaging/rpm/bex.spec" > "$HOME/rpmbuild/SPECS/bex.spec"
+          rpmbuild -ba "$HOME/rpmbuild/SPECS/bex.spec"
+          cp "$HOME"/rpmbuild/RPMS/x86_64/bex-*.rpm out/
+          cp "$HOME"/rpmbuild/SRPMS/bex-*.src.rpm out/
+          ls -lh out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-fedora
+          path: out/*.rpm
+
+  build-arch:
+    name: Build Arch Package & AUR Metadata
+    needs: [prepare, test-gate]
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:base-devel
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: source-tarball
+          path: src
+
+      - name: Install Arch build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            cmake \
+            hicolor-icon-theme \
+            libxcb \
+            ninja \
+            pkgconf \
+            qt6-base
+
+      - name: Build .pkg.tar.zst and generate .SRCINFO
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          SHA="${{ needs.prepare.outputs.tarball_sha256 }}"
+          PKGVER="${VERSION//-/.}"
+          useradd -m builder
+          WORK=/tmp/arch-release
+          mkdir -p "${WORK}" out aur
+          cp "src/bex-${VERSION}.tar.gz" "${WORK}/bex-${VERSION}.tar.gz"
+          tar -xzf "src/bex-${VERSION}.tar.gz" -C "${WORK}" "bex-${VERSION}/packaging/aur/PKGBUILD"
+          sed -E \
+            -e "s/^pkgver=.*/pkgver=${PKGVER}/" \
+            -e "s/^pkgrel=.*/pkgrel=1/" \
+            -e "s/^sha256sums=.*/sha256sums=('${SHA}')/" \
+            -e "s|v\\\$\{pkgver\}/\\\$\{pkgname\}-\\\$\{pkgver\}\.tar\.gz|v${VERSION}/bex-${VERSION}.tar.gz|g" \
+            -e "s|\\\$\{pkgname\}-\\\$\{pkgver\}\.tar\.gz::|bex-${VERSION}.tar.gz::|g" \
+            -e "s|\"\\\$\{pkgname\}-\\\$\{pkgver\}\"|\"bex-${VERSION}\"|g" \
+            -e "s|\"\\\$\{pkgname\}-\\\$\{pkgver\}/LICENSE\"|\"bex-${VERSION}/LICENSE\"|g" \
+            "${WORK}/bex-${VERSION}/packaging/aur/PKGBUILD" > "${WORK}/PKGBUILD"
+          rm -rf "${WORK}/bex-${VERSION}"
+          chown -R builder:builder "${WORK}"
+          su - builder -c "cd '${WORK}' && makepkg --printsrcinfo > .SRCINFO && makepkg --noconfirm"
+          cp "${WORK}"/bex-[0-9]*.pkg.tar.zst out/
+          cp "${WORK}/PKGBUILD" "${WORK}/.SRCINFO" aur/
+          ls -lh out/ aur/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-pkg
+          path: out/*.pkg.tar.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aur-metadata
+          path: aur/
+
+  build-appimage:
+    name: Build Universal AppImage (x86_64)
+    needs: [prepare, test-gate]
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:bookworm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: source-tarball
+          path: src
+
+      - name: Install AppImage build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            file \
+            libxcb-res0-dev \
+            libxcb1-dev \
+            ninja-build \
+            pkg-config \
+            qt6-base-dev \
+            qt6-wayland
+
+      - name: Build AppImage
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          mkdir -p work out
+          tar -xzf "src/bex-${VERSION}.tar.gz" -C work
+          chmod +x "work/bex-${VERSION}/packaging/appimage/build-appimage.sh"
+          "work/bex-${VERSION}/packaging/appimage/build-appimage.sh" "${VERSION}" "$PWD/out"
+          ls -lh out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: out/*.AppImage
+
+  github-release:
+    name: Publish GitHub Release
+    needs: [prepare, build-deb, build-rpm, build-arch, build-appimage]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release assets & checksums
+        run: |
+          mkdir -p release-assets
+          find artifacts -maxdepth 2 -type f ! -name 'PKGBUILD' ! -name '.SRCINFO' -exec cp {} release-assets/ \;
+          (
+            cd release-assets
+            sha256sum * > SHA256SUMS.txt
+          )
+          ls -lh release-assets/
+          cat release-assets/SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: bex ${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          body: |
+            ## Downloads
+
+            - **Any Linux distro (AppImage)**: download `bex-${{ needs.prepare.outputs.version }}-x86_64.AppImage`, `chmod +x`, and run.
+            - **Ubuntu 24.04+ / Mint 22+ / Pop!_OS**: `sudo apt install ./bex_${{ needs.prepare.outputs.version }}-1_noble_amd64.deb`
+            - **Debian 12**: `sudo apt install ./bex_${{ needs.prepare.outputs.version }}-1_bookworm_amd64.deb`
+            - **Fedora**: `sudo dnf install ./bex-*.x86_64.rpm`
+            - **Arch Linux**: `yay -S bex` (AUR) or `sudo pacman -U ./bex-*.pkg.tar.zst`
+            - **NixOS / Nix**: `nix run github:${{ github.repository }}/${{ needs.prepare.outputs.tag }}`
+
+            Verify integrity with `sha256sum -c SHA256SUMS.txt`.
+          files: release-assets/*
+
+  publish-aur:
+    name: Publish to Arch AUR
+    needs: [prepare, github-release]
+    if: needs.prepare.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aur-metadata
+          path: aur
+
+      - name: Push PKGBUILD and .SRCINFO to AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_PACKAGE_NAME: ${{ vars.AUR_PACKAGE_NAME || 'bex' }}
+          AUR_COMMIT_NAME: ${{ vars.AUR_COMMIT_NAME || 'Kidus Mesfin' }}
+          AUR_COMMIT_EMAIL: ${{ vars.AUR_COMMIT_EMAIL || 'kidusmesfin27@gmail.com' }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if [ -z "${AUR_SSH_PRIVATE_KEY}" ]; then
+            echo "::notice::AUR_SSH_PRIVATE_KEY secret is not configured; skipping AUR publish. See docs/RELEASING.md."
+            exit 0
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${AUR_SSH_PRIVATE_KEY}" > ~/.ssh/aur_ed25519
+          chmod 600 ~/.ssh/aur_ed25519
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur_ed25519 -o IdentitiesOnly=yes"
+          git clone "ssh://aur@aur.archlinux.org/${AUR_PACKAGE_NAME}.git" aur-repo
+          cp aur/PKGBUILD aur/.SRCINFO aur-repo/
+          cd aur-repo
+          git config user.name "${AUR_COMMIT_NAME}"
+          git config user.email "${AUR_COMMIT_EMAIL}"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "AUR package already up to date for v${VERSION}"
+            exit 0
+          fi
+          git commit -m "Update to v${VERSION}"
+          git push origin master
+
+  publish-copr:
+    name: Submit Build to Fedora Copr
+    needs: [prepare, github-release]
+    if: needs.prepare.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:41
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rpm-fedora
+          path: rpm
+
+      - name: Trigger Fedora Copr build
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+          COPR_PROJECT: ${{ vars.COPR_PROJECT || 'kidusm001/bex' }}
+        run: |
+          if [ -z "${COPR_CONFIG}" ]; then
+            echo "::notice::COPR_CONFIG secret is not configured; skipping Fedora Copr publish. See docs/RELEASING.md."
+            exit 0
+          fi
+          dnf install -y copr-cli
+          mkdir -p ~/.config
+          printf '%s\n' "${COPR_CONFIG}" > ~/.config/copr
+          chmod 600 ~/.config/copr
+          SRPM="$(ls rpm/*.src.rpm | head -n1)"
+          copr-cli build --nowait "${COPR_PROJECT}" "${SRPM}"
+
+  publish-apt:
+    name: Publish APT Repository (gh-pages)
+    needs: [prepare, github-release]
+    if: needs.prepare.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download Debian/Ubuntu packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: debs
+
+      - name: Install APT repository tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils dpkg-dev gnupg
+
+      - name: Build and push gh-pages APT repository
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          OWNER="${REPO%%/*}"
+          NAME="${REPO#*/}"
+          PAGES_URL="https://${OWNER}.github.io/${NAME}"
+
+          git config --global user.name "Kidus Mesfin"
+          git config --global user.email "kidusmesfin27@gmail.com"
+
+          mkdir -p site
+          if git ls-remote --exit-code --heads "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${REPO}.git" gh-pages >/dev/null 2>&1; then
+            git clone --depth 1 --branch gh-pages "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${REPO}.git" site
+          else
+            (
+              cd site
+              git init -b gh-pages
+              git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${REPO}.git"
+            )
+          fi
+
+          mkdir -p site/apt/pool/main/b/bex
+          cp debs/deb-noble/*.deb site/apt/pool/main/b/bex/
+          cp debs/deb-bookworm/*.deb site/apt/pool/main/b/bex/
+
+          SIGNED="false"
+          if [ -n "${APT_GPG_PRIVATE_KEY}" ]; then
+            export GNUPGHOME="$(mktemp -d)"
+            chmod 700 "${GNUPGHOME}"
+            printf '%s\n' "${APT_GPG_PRIVATE_KEY}" | gpg --batch --import
+            KEY_ID="$(gpg --list-secret-keys --with-colons | awk -F: '$1 == "sec" {print $5; exit}')"
+            gpg --armor --export "${KEY_ID}" > site/apt/bex.gpg.asc
+            gpg --export "${KEY_ID}" > site/apt/bex.gpg
+            SIGNED="true"
+          fi
+
+          for SUITE in noble bookworm; do
+            mkdir -p "site/apt/dists/${SUITE}/main/binary-amd64"
+            # Index only packages matching this suite so noble/bookworm deps stay clean.
+            TMP_POOL="$(mktemp -d)"
+            mkdir -p "${TMP_POOL}/pool/main/b/bex"
+            cp site/apt/pool/main/b/bex/*_"${SUITE}"_amd64.deb "${TMP_POOL}/pool/main/b/bex/"
+            (
+              cd "${TMP_POOL}"
+              dpkg-scanpackages --multiversion pool/main > "${GITHUB_WORKSPACE}/site/apt/dists/${SUITE}/main/binary-amd64/Packages"
+            )
+            rm -rf "${TMP_POOL}"
+            gzip -k -f "site/apt/dists/${SUITE}/main/binary-amd64/Packages"
+
+            (
+              cd "site/apt/dists/${SUITE}"
+              apt-ftparchive \
+                -o APT::FTPArchive::Release::Origin="bex" \
+                -o APT::FTPArchive::Release::Label="bex" \
+                -o APT::FTPArchive::Release::Suite="${SUITE}" \
+                -o APT::FTPArchive::Release::Codename="${SUITE}" \
+                -o APT::FTPArchive::Release::Architectures="amd64" \
+                -o APT::FTPArchive::Release::Components="main" \
+                release . > Release
+              if [ "${SIGNED}" = "true" ]; then
+                GPG_OPTS=(--batch --yes --pinentry-mode loopback)
+                if [ -n "${APT_GPG_PASSPHRASE}" ]; then
+                  GPG_OPTS+=(--passphrase "${APT_GPG_PASSPHRASE}")
+                fi
+                gpg "${GPG_OPTS[@]}" --default-key "${KEY_ID}" -abs -o Release.gpg Release
+                gpg "${GPG_OPTS[@]}" --default-key "${KEY_ID}" --clearsign -o InRelease Release
+              fi
+            )
+          done
+
+          if [ "${SIGNED}" = "true" ]; then
+            APT_CMD=$(cat <<EOF
+          curl -fsSL ${PAGES_URL}/apt/bex.gpg | sudo tee /usr/share/keyrings/bex.gpg >/dev/null
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/bex.gpg] ${PAGES_URL}/apt \$(. /etc/os-release && echo \$VERSION_CODENAME) main" | sudo tee /etc/apt/sources.list.d/bex.list
+          sudo apt update &amp;&amp; sudo apt install bex
+          EOF
+            )
+          else
+            APT_CMD=$(cat <<EOF
+          echo "deb [arch=amd64 trusted=yes] ${PAGES_URL}/apt \$(. /etc/os-release && echo \$VERSION_CODENAME) main" | sudo tee /etc/apt/sources.list.d/bex.list
+          sudo apt update &amp;&amp; sudo apt install bex
+          EOF
+            )
+          fi
+
+          cat > site/index.html <<HTML
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1">
+            <title>bex — Linux Performance Monitor</title>
+            <style>
+              body { font-family: system-ui, -apple-system, sans-serif; max-width: 780px; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.6; color: #1f2328; }
+              @media (prefers-color-scheme: dark) { body { background: #161821; color: #dce0ec; } pre { background: #222536; } a { color: #8ec8ff; } }
+              pre { background: #f3f4f6; padding: 0.9rem 1rem; border-radius: 8px; overflow-x: auto; }
+              code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.92em; }
+              h1 { margin-bottom: 0.2rem; }
+              .sub { opacity: 0.75; margin-top: 0; }
+            </style>
+          </head>
+          <body>
+            <h1>bex v${VERSION}</h1>
+            <p class="sub">Native Linux performance monitor built with C++20 and Qt 6.</p>
+            <p><a href="https://github.com/${REPO}/releases/latest">GitHub Releases (AppImage, .deb, .rpm, Arch, source)</a> &middot; <a href="https://github.com/${REPO}">Source Code</a></p>
+            <h2>Debian 12 (bookworm) / Ubuntu 24.04 (noble) APT Repository</h2>
+            <pre><code>${APT_CMD}</code></pre>
+            <h2>Arch Linux (AUR)</h2>
+            <pre><code>yay -S bex</code></pre>
+            <h2>Fedora (Copr)</h2>
+            <pre><code>sudo dnf copr enable ${OWNER}/bex &amp;&amp; sudo dnf install bex</code></pre>
+            <h2>NixOS / Nix</h2>
+            <pre><code>nix run github:${REPO}</code></pre>
+          </body>
+          </html>
+          HTML
+
+          touch site/.nojekyll
+          cd site
+          git add -A
+          if git diff --cached --quiet; then
+            echo "APT repository already up to date."
+            exit 0
+          fi
+          git commit -m "chore(apt): publish bex v${VERSION}"
+          git push origin gh-pages

@@ -24,6 +24,36 @@ It reads `/proc` and `/sys` directly. It needs no root, no daemon, no helper
 processes, no network access and no dependencies beyond Qt (plus, optionally,
 libxcb for telling apps apart on X11).
 
+## Install
+
+Pre-built packages and checksums (`SHA256SUMS.txt`) are published on the
+[GitHub Releases](https://github.com/kidusm001/bex/releases) page:
+
+- **Any Linux distro (AppImage)**: download `bex-<version>-x86_64.AppImage`,
+  make it executable (`chmod +x`), and run it.
+- **Arch Linux (AUR)**:
+  ```sh
+  yay -S bex
+  ```
+  (or download the `.pkg.tar.zst` asset and run `sudo pacman -U ./bex-*.pkg.tar.zst`).
+- **Fedora (Copr)**:
+  ```sh
+  sudo dnf copr enable kidusm001/bex
+  sudo dnf install bex
+  ```
+  (or download the `.rpm` asset and run `sudo dnf install ./bex-*.x86_64.rpm`).
+- **Ubuntu 24.04+ / Debian 12**: download the matching `.deb` asset from GitHub
+  Releases (`noble` for Ubuntu 24.04+/Mint 22+, `bookworm` for Debian 12) and
+  install it with `sudo apt install ./bex_*.deb`, or follow the APT repository
+  instructions at <https://kidusm001.github.io/bex/>.
+- **NixOS / Nix**:
+  ```sh
+  nix run github:kidusm001/bex
+  ```
+
+See [docs/RELEASING.md](docs/RELEASING.md) for the CI/CD pipeline and release
+publishing instructions. Licensed under the [MIT License](LICENSE).
+
 ## Requirements
 
 - Linux. bex reads Linux-specific kernel interfaces, and configuring

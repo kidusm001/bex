@@ -1,0 +1,28 @@
+Source: bex
+Section: utils
+Priority: optional
+Maintainer: Kidus Mesfin <kidusmesfin27@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               cmake (>= 3.21),
+               ninja-build,
+               pkgconf | pkg-config,
+               qt6-base-dev (>= 6.4),
+               libxcb1-dev,
+               libxcb-res0-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/kidusm001/bex
+Vcs-Browser: https://github.com/kidusm001/bex
+Vcs-Git: https://github.com/kidusm001/bex.git
+Rules-Requires-Root: no
+
+Package: bex
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         hicolor-icon-theme
+Recommends: qt6-wayland
+Description: Native Linux performance monitor built with Qt 6
+ bex is a lightweight Qt 6 Widgets desktop performance monitor for Linux.
+ It reads /proc, /sys, and hwmon directly with no root privileges or helper
+ daemons, showing live graphs and readings for CPU, memory and swap, disks,
+ network interfaces, temperatures, and grouped processes.

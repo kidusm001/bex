@@ -1,0 +1,233 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gcc:
+    name: GCC Debug (-Werror + Tests + Metadata)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            appstream \
+            build-essential \
+            cmake \
+            desktop-file-utils \
+            libxcb-res0-dev \
+            libxcb1-dev \
+            ninja-build \
+            pkg-config \
+            qt6-base-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBEX_WERROR=ON \
+            -DBEX_X11=ON \
+            -DBEX_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Run test suites (fast)
+        run: ctest --test-dir build --output-on-failure -LE slow -j"$(nproc)"
+
+      - name: Validate staged install, desktop entry & AppStream metadata
+        run: |
+          DESTDIR="$PWD/stage" cmake --install build --prefix /usr
+          desktop-file-validate stage/usr/share/applications/io.github.kidusm001.bex.desktop
+          appstreamcli validate --pedantic --no-net stage/usr/share/metainfo/io.github.kidusm001.bex.metainfo.xml
+          RN_STAGE="$PWD/stage/usr" QT_QPA_PLATFORM=offscreen ./build/tst_rename_adversarial
+
+  clang-sanitizers:
+    name: Clang ASan + UBSan (-Werror)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            cmake \
+            libxcb-res0-dev \
+            libxcb1-dev \
+            ninja-build \
+            pkg-config \
+            qt6-base-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-asan -G Ninja \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBEX_WERROR=ON \
+            -DBEX_X11=ON \
+            -DBEX_SANITIZE="address;undefined" \
+            -DBEX_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build-asan -j"$(nproc)"
+
+      - name: Run test suites under ASan + UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build-asan --output-on-failure -LE slow -j"$(nproc)"
+
+  graph-upgrade:
+    name: Graph Upgrade Suite
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            libxcb-res0-dev \
+            libxcb1-dev \
+            ninja-build \
+            pkg-config \
+            qt6-base-dev
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBEX_WERROR=ON \
+            -DBEX_X11=ON \
+            -DBEX_BUILD_TESTS=ON
+          cmake --build build --target bex tst_graph_upgrade -j"$(nproc)"
+
+      - name: Run tst_graph_upgrade
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PS_GU_CHILD=1 PS_GU_APP="$PWD/build/bex" QT_QPA_PLATFORM=offscreen ./build/tst_graph_upgrade
+          else
+            ctest --test-dir build -R '^tst_graph_upgrade$' --output-on-failure
+          fi
+
+  package-deb:
+    name: Package check (.deb ${{ matrix.codename }})
+    runs-on: ubuntu-24.04
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - codename: noble
+            image: ubuntu:24.04
+          - codename: bookworm
+            image: debian:bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Debian packaging dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            debhelper \
+            devscripts \
+            dpkg-dev \
+            libxcb-res0-dev \
+            libxcb1-dev \
+            ninja-build \
+            pkg-config \
+            qt6-base-dev
+
+      - name: Build .deb package
+        run: |
+          cp -r packaging/debian debian
+          chmod +x debian/rules
+          dpkg-buildpackage -us -uc -b
+          dpkg-deb --info ../bex_*_amd64.deb
+          dpkg-deb --contents ../bex_*_amd64.deb
+
+  package-rpm:
+    name: Package check (.rpm Fedora)
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:41
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install RPM packaging dependencies
+        run: |
+          dnf install -y \
+            cmake \
+            desktop-file-utils \
+            gcc-c++ \
+            git-core \
+            libxcb-devel \
+            ninja-build \
+            pkgconf-pkg-config \
+            qt6-qtbase-devel \
+            rpm-build
+
+      - name: Build .rpm package
+        run: |
+          VERSION="$(sed -nE 's/^[[:space:]]*VERSION[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt | head -n1)"
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          git archive --format=tar.gz --prefix="bex-${VERSION}/" -o "$HOME/rpmbuild/SOURCES/bex-${VERSION}.tar.gz" HEAD
+          sed -E "s/^(Version:[[:space:]]+).*/\1${VERSION}/" packaging/rpm/bex.spec > "$HOME/rpmbuild/SPECS/bex.spec"
+          rpmbuild -ba "$HOME/rpmbuild/SPECS/bex.spec"
+          rpm -qlp "$HOME"/rpmbuild/RPMS/x86_64/bex-*.rpm
+
+  package-arch:
+    name: Package check (Arch PKGBUILD)
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Arch build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            cmake \
+            git \
+            hicolor-icon-theme \
+            libxcb \
+            ninja \
+            pkgconf \
+            qt6-base
+
+      - name: Build Arch package with makepkg
+        run: |
+          VERSION="$(sed -nE 's/^[[:space:]]*VERSION[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt | head -n1)"
+          useradd -m builder
+          WORK=/tmp/arch-pkg
+          mkdir -p "${WORK}"
+          git archive --format=tar.gz --prefix="bex-${VERSION}/" -o "${WORK}/bex-${VERSION}.tar.gz" HEAD
+          SHA="$(sha256sum "${WORK}/bex-${VERSION}.tar.gz" | awk '{print $1}')"
+          sed -E \
+            -e "s/^pkgver=.*/pkgver=${VERSION}/" \
+            -e "s/^sha256sums=.*/sha256sums=('${SHA}')/" \
+            packaging/aur/PKGBUILD > "${WORK}/PKGBUILD"
+          chown -R builder:builder "${WORK}"
+          su - builder -c "cd '${WORK}' && makepkg --printsrcinfo > .SRCINFO && makepkg --noconfirm"
+          ls -lh "${WORK}"/*.pkg.tar.zst
