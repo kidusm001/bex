@@ -8,7 +8,7 @@ WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
 export APPIMAGE_EXTRACT_AND_RUN=1
-export VERSION
+export LINUXDEPLOY_OUTPUT_VERSION="${VERSION}"
 export ARCH=x86_64
 
 echo "==> Building bex ${VERSION} for AppImage"
@@ -23,6 +23,16 @@ DESTDIR="${WORK_DIR}/AppDir" cmake --install "${WORK_DIR}/build"
 # AppImage requires a relative executable name in the desktop entry.
 DESKTOP_FILE="${WORK_DIR}/AppDir/usr/share/applications/io.github.kidusm001.bex.desktop"
 sed -i 's|^Exec=.*|Exec=bex|' "${DESKTOP_FILE}"
+
+# Render a 256x256 PNG icon so appimagetool generates a valid .DirIcon.
+SVG_ICON="${WORK_DIR}/AppDir/usr/share/icons/hicolor/scalable/apps/io.github.kidusm001.bex.svg"
+ICON_FILE="${SVG_ICON}"
+if command -v rsvg-convert >/dev/null 2>&1; then
+    PNG_DIR="${WORK_DIR}/AppDir/usr/share/icons/hicolor/256x256/apps"
+    mkdir -p "${PNG_DIR}"
+    rsvg-convert -w 256 -h 256 "${SVG_ICON}" -o "${PNG_DIR}/io.github.kidusm001.bex.png"
+    ICON_FILE="${PNG_DIR}/io.github.kidusm001.bex.png"
+fi
 
 # Fetch linuxdeploy + Qt plugin.
 TOOLS_DIR="${WORK_DIR}/tools"
@@ -39,8 +49,9 @@ elif command -v qmake6 >/dev/null 2>&1; then
     export QMAKE="$(command -v qmake6)"
 fi
 
-export EXTRA_QT_PLUGINS="platforms;platformthemes;wayland-decoration-client;wayland-graphics-integration-client;wayland-shell-integration;iconengines"
-export OUTPUT="${OUT_DIR}/bex-${VERSION}-x86_64.AppImage"
+export EXTRA_PLATFORM_PLUGINS="libqwayland-generic.so;libqwayland-egl.so;libqoffscreen.so"
+export EXTRA_QT_PLUGINS="platformthemes;wayland-decoration-client;wayland-graphics-integration-client;wayland-shell-integration;iconengines"
+export LDAI_OUTPUT="${OUT_DIR}/bex-${VERSION}-x86_64.AppImage"
 
 mkdir -p "${OUT_DIR}"
 (
@@ -48,12 +59,12 @@ mkdir -p "${OUT_DIR}"
     "${TOOLS_DIR}/linuxdeploy-x86_64.AppImage" \
         --appdir "${WORK_DIR}/AppDir" \
         --desktop-file "${DESKTOP_FILE}" \
-        --icon-file "${WORK_DIR}/AppDir/usr/share/icons/hicolor/scalable/apps/io.github.kidusm001.bex.svg" \
+        --icon-file "${ICON_FILE}" \
         --plugin qt \
         --output appimage
 )
 
-chmod +x "${OUTPUT}"
-echo "==> Smoke-testing ${OUTPUT}"
-QT_QPA_PLATFORM=offscreen "${OUTPUT}" --appimage-extract-and-run --version
-echo "==> Built ${OUTPUT}"
+chmod +x "${LDAI_OUTPUT}"
+echo "==> Smoke-testing ${LDAI_OUTPUT}"
+QT_QPA_PLATFORM=offscreen "${LDAI_OUTPUT}" --appimage-extract-and-run --version
+echo "==> Built ${LDAI_OUTPUT}"

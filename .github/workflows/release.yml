@@ -341,6 +341,7 @@ jobs:
             cmake \
             curl \
             file \
+            librsvg2-bin \
             libxcb-res0-dev \
             libxcb1-dev \
             ninja-build \
