@@ -13,6 +13,10 @@ concurrency:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   gcc:
     name: GCC Debug (-Werror + Tests + Metadata)
@@ -181,18 +185,19 @@ jobs:
             cmake \
             desktop-file-utils \
             gcc-c++ \
-            git-core \
             libxcb-devel \
             ninja-build \
             pkgconf-pkg-config \
             qt6-qtbase-devel \
-            rpm-build
+            rpm-build \
+            tar
 
       - name: Build .rpm package
         run: |
           VERSION="$(sed -nE 's/^[[:space:]]*VERSION[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt | head -n1)"
-          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-          git archive --format=tar.gz --prefix="bex-${VERSION}/" -o "$HOME/rpmbuild/SOURCES/bex-${VERSION}.tar.gz" HEAD
+          mkdir -p "$HOME"/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS} "/tmp/rpm-src/bex-${VERSION}"
+          cp -a CMakeLists.txt LICENSE README.md cmake data src "/tmp/rpm-src/bex-${VERSION}/"
+          tar -C /tmp/rpm-src -czf "$HOME/rpmbuild/SOURCES/bex-${VERSION}.tar.gz" "bex-${VERSION}"
           sed -E "s/^(Version:[[:space:]]+).*/\1${VERSION}/" packaging/rpm/bex.spec > "$HOME/rpmbuild/SPECS/bex.spec"
           rpmbuild -ba "$HOME/rpmbuild/SPECS/bex.spec"
           rpm -qlp "$HOME"/rpmbuild/RPMS/x86_64/bex-*.rpm
@@ -209,7 +214,6 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed \
             cmake \
-            git \
             hicolor-icon-theme \
             libxcb \
             ninja \
@@ -221,8 +225,9 @@ jobs:
           VERSION="$(sed -nE 's/^[[:space:]]*VERSION[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt | head -n1)"
           useradd -m builder
           WORK=/tmp/arch-pkg
-          mkdir -p "${WORK}"
-          git archive --format=tar.gz --prefix="bex-${VERSION}/" -o "${WORK}/bex-${VERSION}.tar.gz" HEAD
+          mkdir -p "${WORK}" "/tmp/arch-src/bex-${VERSION}"
+          cp -a CMakeLists.txt LICENSE README.md cmake data src "/tmp/arch-src/bex-${VERSION}/"
+          tar -C /tmp/arch-src -czf "${WORK}/bex-${VERSION}.tar.gz" "bex-${VERSION}"
           SHA="$(sha256sum "${WORK}/bex-${VERSION}.tar.gz" | awk '{print $1}')"
           sed -E \
             -e "s/^pkgver=.*/pkgver=${VERSION}/" \
@@ -230,4 +235,4 @@ jobs:
             packaging/aur/PKGBUILD > "${WORK}/PKGBUILD"
           chown -R builder:builder "${WORK}"
           su - builder -c "cd '${WORK}' && makepkg --printsrcinfo > .SRCINFO && makepkg --noconfirm"
-          ls -lh "${WORK}"/*.pkg.tar.zst
+          ls -lh "${WORK}"/bex-[0-9]*.pkg.tar.zst

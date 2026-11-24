@@ -15,6 +15,10 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   prepare:
     name: Prepare Release & Source Tarball
@@ -197,7 +201,8 @@ jobs:
             ninja-build \
             pkgconf-pkg-config \
             qt6-qtbase-devel \
-            rpm-build
+            rpm-build \
+            tar
 
       - name: Build .rpm and .src.rpm
         run: |
