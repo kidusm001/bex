@@ -108,7 +108,7 @@ jobs:
             -DBEX_BUILD_TESTS=ON
           cmake --build build -j"$(nproc)"
           ctest --test-dir build --output-on-failure -LE slow -j"$(nproc)"
-          PS_GU_CHILD=1 PS_GU_APP="$PWD/build/bex" QT_QPA_PLATFORM=offscreen ./build/tst_graph_upgrade
+          FONTCONFIG_FILE="$PWD/tests/fonts-grayscale.conf" PS_GU_CHILD=1 PS_GU_APP="$PWD/build/bex" QT_QPA_PLATFORM=offscreen ./build/tst_graph_upgrade
           appstreamcli validate --pedantic --no-net data/io.github.kidusm001.bex.metainfo.xml
 
   build-deb:

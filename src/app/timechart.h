@@ -234,6 +234,8 @@ private:
         int width = 0;
         double pxPerSecond = 0; // device pixels per second of history
         double end = 0;         // axis end the images are drawn for
+        double originEnd = 0;   // unshifted axis end when the layer started
+        long long originShiftPx = 0; // exact integer device pixels shifted since originEnd
         std::size_t start = 0;  // first history index drawn
         double lo = 0, hi = 0;  // value range drawn
         double window = 0;

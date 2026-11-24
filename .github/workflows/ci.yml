@@ -126,7 +126,7 @@ jobs:
       - name: Run tst_graph_upgrade
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            PS_GU_CHILD=1 PS_GU_APP="$PWD/build/bex" QT_QPA_PLATFORM=offscreen ./build/tst_graph_upgrade
+            FONTCONFIG_FILE="$PWD/tests/fonts-grayscale.conf" PS_GU_CHILD=1 PS_GU_APP="$PWD/build/bex" QT_QPA_PLATFORM=offscreen ./build/tst_graph_upgrade
           else
             ctest --test-dir build -R '^tst_graph_upgrade$' --output-on-failure
           fi
