@@ -1,0 +1,23 @@
+Architectures: amd64
+Codename: bookworm
+Components: main
+Date: Tue, 24 Nov 2026 13:38:00 +0000
+Label: bex
+Origin: bex
+Suite: bookworm
+MD5Sum:
+ afd36cddfb14fdd55f3bee39f5a20af8              134 Release
+ 821f1ef657f74416e552b018cc7accf7              997 main/binary-amd64/Packages
+ dbc5f220dc801f52591764054187d5f8              661 main/binary-amd64/Packages.gz
+SHA1:
+ 6fd6b9cd4995b43c467ecc17ad5f337406e70a67              134 Release
+ c0dfd3536652039f35c2c4f789551fc20e993c7c              997 main/binary-amd64/Packages
+ 19a9a26164ee38c95886ecf8db9f24fb6bacf491              661 main/binary-amd64/Packages.gz
+SHA256:
+ 69621c1fa1fda12495954237bfcd8f91ae0c4ffc243e486bcfe3b862ecc8b760              134 Release
+ 292fd10e2183c751f72e57192df4f098652af71ea1b1c328baf8f9ef0c37a13b              997 main/binary-amd64/Packages
+ 847e1eca798a78d21e70a8a967addf959c0083f335483fd2a10cf43c7310768f              661 main/binary-amd64/Packages.gz
+SHA512:
+ 62dbde820bb736e9f069d600a8cac5bac1c094060c6b8cf01b7677348e7ee0a64ae0bda25673c35fef53bf7be310ad4166de1d63d9b6a55b59f55b170979d764              134 Release
+ 8d8aa4cff240952b13d054181ca589a6ffd7708e753cf115a2f9c925cf33099cc9732c31fea46b035bc6982f2e9e4938ebcfe8173148b2d47f1c53c0981d9ee9              997 main/binary-amd64/Packages
+ 7d8001d8d7821a7d23a1e48d968382e550b576c0ae5401a8aa418c4e5f665ef8dd5f9a3cdc1f2fc2fa2a298dd315283548805b5e08f3c3924344f24e1916faf0              661 main/binary-amd64/Packages.gz

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>bex — Linux Performance Monitor</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; max-width: 820px; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.6; color: #1f2328; }
+    @media (prefers-color-scheme: dark) { body { background: #161821; color: #dce0ec; } pre { background: #222536; } a { color: #8ec8ff; } }
+    pre { background: #f3f4f6; padding: 0.9rem 1rem; border-radius: 8px; overflow-x: auto; }
+    code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.92em; }
+    h1 { margin-bottom: 0.2rem; }
+    .sub { opacity: 0.75; margin-top: 0; }
+  </style>
+</head>
+<body>
+  <h1>bex v1.0.0</h1>
+  <p class="sub">Native Linux performance monitor built with C++20 and Qt 6.</p>
+  <p><a href="https://github.com/kidusm001/bex/releases/latest">GitHub Releases (AppImage, .deb, .rpm, Arch, source)</a> &middot; <a href="https://github.com/kidusm001/bex">Source Code</a></p>
+
+  <h2>Arch Linux (pacman repo)</h2>
+  <p>Add to <code>/etc/pacman.conf</code>:</p>
+  <pre><code>[bex]
+SigLevel = Optional TrustAll
+Server = https://kidusm001.github.io/bex/arch/$arch</code></pre>
+  <p>Then install:</p>
+  <pre><code>sudo pacman -Sy bex</code></pre>
+
+  <h2>Fedora (dnf repo)</h2>
+  <pre><code>sudo dnf config-manager addrepo --from-repofile=https://kidusm001.github.io/bex/rpm/bex.repo
+sudo dnf install bex</code></pre>
+
+  <h2>Debian 12 (bookworm) / Ubuntu 24.04 (noble) (apt repo)</h2>
+  <pre><code>echo "deb [arch=amd64 trusted=yes] https://kidusm001.github.io/bex/apt $(. /etc/os-release && echo $VERSION_CODENAME) main" | sudo tee /etc/apt/sources.list.d/bex.list
+sudo apt update &amp;&amp; sudo apt install bex</code></pre>
+
+  <h2>Any Linux Distro (AppImage)</h2>
+  <pre><code>curl -fsSLO https://github.com/kidusm001/bex/releases/latest/download/bex-1.0.0-x86_64.AppImage
+chmod +x bex-1.0.0-x86_64.AppImage
+./bex-1.0.0-x86_64.AppImage</code></pre>
+
+  <h2>NixOS / Nix</h2>
+  <pre><code>nix run github:kidusm001/bex</code></pre>
+</body>
+</html>

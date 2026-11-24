@@ -1,0 +1,23 @@
+Architectures: amd64
+Codename: noble
+Components: main
+Date: Tue, 24 Nov 2026 13:38:00 +0000
+Label: bex
+Origin: bex
+Suite: noble
+MD5Sum:
+ 89d899c6015fdfde291d21914b1f7be3              128 Release
+ 363d80fa98d682c02d0416bac166a351             1005 main/binary-amd64/Packages
+ f43cf0ae9cef04b7aad8204defa9127c              664 main/binary-amd64/Packages.gz
+SHA1:
+ 842befd5311196c1c8ae0333b75803894b7a29c4              128 Release
+ 36fc1d1f99398862b0338b874d9da98e6d6f8160             1005 main/binary-amd64/Packages
+ 9c91df4583a253c9db883eee21aef9046047ba24              664 main/binary-amd64/Packages.gz
+SHA256:
+ b6c7435c70d74ee010a67bd78f1e1b10cc324cd80af7b4a3fd4a7b6676fe95ac              128 Release
+ ddb2977b101c37b1d5dc45e77acdc065e27747107811cc8e230b5948ca6e9a9c             1005 main/binary-amd64/Packages
+ eede6e4806e5c7e16bd5283cb755a99236b5b8f93d9a211c3af36d95f8099bea              664 main/binary-amd64/Packages.gz
+SHA512:
+ a10467cc93bfdb20fb7d095d14cd604a15d6c9e39042d9a419fbe15c9c5b62340f262e220f772b3fd93f80c9a961dfdd967e823843c21edbbeb4f3250b0c6b6c              128 Release
+ 325bc35739e5a35deb51560ebdf2614719ceac307e996b5b15e1f0552306ba7d2426878b0b41a084e36f8d1eb4f0a08ff7268569837afbb407305c55b5500e15             1005 main/binary-amd64/Packages
+ c796b4fedc8327144f18aaa84e59e9f50548869a9ae7af3fb3a263e2697a9b4c7c6a7d0cb7dabae547c78d4013a584241de74eb60970a262c9317287cdcb88b6              664 main/binary-amd64/Packages.gz

@@ -1,0 +1,5 @@
+[bex]
+name=bex - Native Linux Performance Monitor
+baseurl=https://kidusm001.github.io/bex/rpm/
+enabled=1
+gpgcheck=0
